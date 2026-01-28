@@ -1,0 +1,23 @@
+-- Inventory Table
+CREATE TABLE IF NOT EXISTS inventory (
+    item_id VARCHAR(50) PRIMARY KEY,
+    description VARCHAR(500),
+    tracking_number VARCHAR(100),
+    quantity INTEGER NOT NULL DEFAULT 1,
+    value DECIMAL(10,2)
+);
+
+-- NSI Items table
+CREATE TABLE IF NOT EXISTS nsi_items (
+    nsi_id serial PRIMARY KEY,
+    item_id VARCHAR(50),
+    disposition VARCHAR(20) NOT NULL DEFAULT 'RTV',
+    description VARCHAR(500),
+    vendor_id VARCHAR(50),
+    tracking_number VARCHAR(100),
+    quantity INTEGER NOT NULL DEFAULT 1,
+    value DECIMAL(10,2),
+    location_id decimal(5,0),
+    created_date TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    FOREIGN KEY (item_id) REFERENCES inventory(item_id)
+);
