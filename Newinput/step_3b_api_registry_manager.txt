@@ -1,0 +1,1198 @@
+"#!/usr/bin/env python3
+"""
+API Registry Management System
+=============================
+
+This program manages API registrations from application_config.json into PostgreSQL database.
+It handles API registry, ownership, review processes, and automatic version management.
+
+Features:
+- Insert API data from application_config.json
+- Check for existing APIs (by id and endpoint)
+- Handle conflicts with 4 options:
+  1. Request approval (creates review entry)
+  2. Continue using existing API
+  3. Continue with creating new API
+  4. Review pending requests (approve/reject)
+- Manage API ownership tracking
+- Automatic version increment based on database schema changes
+- Compare JSON/database_schema.json with nsi_app PostgreSQL database
+- Update application_config.json with new versions
+
+Usage:
+    python api_registry_manager.py [--config config_output/application_config.json]
+    python api_registry_manager.py --review-only
+    python api_registry_manager.py --stats-only
+
+Database Credentials (hardcoded):
+- API Registry DB: postgres/password@localhost:5432/api_registry
+- NSI App DB: postgres/password@localhost:5432/nsi_app
+"""
+
+import json
+import sys
+import argparse
+import logging
+from pathlib import Path
+from typing import Dict, List, Any, Optional, Tuple
+from datetime import datetime
+import psycopg2
+from psycopg2.extras import RealDictCursor
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+
+class APIRegistryManager:
+    """Manages API registration in PostgreSQL database"""
+    
+    def __init__(self):
+        """Initialize database connection"""
+        self.bulk_conflict_action = None  # Track bulk action choice for conflicts
+        self.db_config = {
+            "host": "localhost",
+            "port": 5432,
+            "database": "api_registry",
+            "username": "postgres",
+            "password": "password"
+        }
+        self.nsi_db_config = {
+            "host": "localhost",
+            "port": 5432,
+            "database": "nsi_app",
+            "username": "postgres",
+            "password": "password"
+        }
+        self.conn = None
+        self.nsi_conn = None
+        self.connect_to_db()
+    
+    def connect_to_db(self):
+        """Establish database connections"""
+        try:
+            # Connect to API registry database
+            self.conn = psycopg2.connect(
+                host=self.db_config['host'],
+                port=self.db_config['port'],
+                database=self.db_config['database'],
+                user=self.db_config['username'],
+                password=self.db_config['password']
+            )
+            self.conn.autocommit = False
+            logger.info("Connected to API registry database successfully")
+            
+            # Connect to NSI application database
+            self.nsi_conn = psycopg2.connect(
+                host=self.nsi_db_config['host'],
+                port=self.nsi_db_config['port'],
+                database=self.nsi_db_config['database'],
+                user=self.nsi_db_config['username'],
+                password=self.nsi_db_config['password']
+            )
+            self.nsi_conn.autocommit = False
+            logger.info("Connected to NSI application database successfully")
+        except Exception as e:
+            logger.error(f"Failed to connect to database: {e}")
+            sys.exit(1)
+    
+    def close_connection(self):
+        """Close database connections"""
+        if self.conn:
+            self.conn.close()
+            logger.info("API registry database connection closed")
+        if self.nsi_conn:
+            self.nsi_conn.close()
+            logger.info("NSI application database connection closed")
+    
+    def close_connections(self):
+        """Alias for close_connection for compatibility"""
+        self.close_connection()
+    
+    def load_application_config(self, config_file: str) -> Dict[str, Any]:
+        """Load application configuration from JSON file"""
+        try:
+            with open(config_file, 'r', encoding='utf-8') as f:
+                config = json.load(f)
+            logger.info(f"Loaded configuration from {config_file}")
+            return config
+        except FileNotFoundError:
+            logger.error(f"Configuration file not found: {config_file}")
+            sys.exit(1)
+        except json.JSONDecodeError as e:
+            logger.error(f"Invalid JSON in configuration file: {e}")
+            sys.exit(1)
+    
+    def check_existing_api(self, api_id: str, endpoint: str, method: str = None) -> Optional[Dict[str, Any]]:
+        """Check if API already exists - only true conflicts (same endpoint+method)"""
+        try:
+            with self.conn.cursor(cursor_factory=RealDictCursor) as cursor:
+                # Only check for true conflicts: same endpoint AND same method
+                # Different versions (v1 vs v2) are NOT conflicts
+                # Same API ID with different endpoints/versions are NOT conflicts
+                if method:
+                    logger.info(f"Checking for conflicts: {endpoint} ({method}) - API ID: {api_id}")
+                    
+                    cursor.execute("""
+                        SELECT ar.*, ao.user_id as current_owner
+                        FROM api_registry ar
+                        LEFT JOIN api_ownership ao ON ar.id = ao.api_id AND ao.is_current_owner = TRUE
+                        WHERE ar.endpoint = %s AND ar.method = %s AND ar.is_active = TRUE
+                    """, (endpoint, method))
+                    result = cursor.fetchone()
+                    
+                    if result:
+                        # This is a TRUE conflict - same endpoint AND method
+                        logger.info(f"TRUE CONFLICT detected:")
+                        logger.info(f"  Existing: {result['endpoint']} ({result['method']}) - ID: {result['id']}")
+                        logger.info(f"  New: {endpoint} ({method}) - ID: {api_id}")
+                        return dict(result)
+                    else:
+                        logger.info(f"No conflict found for {endpoint} ({method})")
+                
+                # If no method provided, don't check for conflicts
+                return None
+                
+        except Exception as e:
+            logger.error(f"Error checking existing API: {e}")
+            try:
+                self.conn.rollback()
+            except:
+                pass
+            return None
+    
+    def get_user_choice(self, existing_api: Dict[str, Any], new_api: Dict[str, Any]) -> int:
+        """Present options to user for handling API conflicts"""
+        print("\n" + "="*80)
+        print("API CONFLICT DETECTED")
+        print("="*80)
+        print(f"Existing API:")
+        print(f"  ID: {existing_api['id']}")
+        print(f"  Endpoint: {existing_api['endpoint']}")
+        print(f"  Method: {existing_api['method']}")
+        print(f"  Current Owner: {existing_api.get('current_owner', 'Unknown')}")
+        print(f"  Description: {existing_api.get('description', 'N/A')}")
+        
+        print(f"\nNew API:")
+        print(f"  ID: {new_api['id']}")
+        print(f"  Endpoint: {new_api['endpoint']}")
+        print(f"  Method: {new_api['method']}")
+        print(f"  Requested By: {new_api['user']}")
+        print(f"  Description: {new_api.get('description', 'N/A')}")
+        
+        print(f"\nOptions:")
+        print(f"  1. Request approval to take ownership")
+        print(f"  2. Continue using existing API (skip registration)")
+        print(f"  3. Continue with creating new API (override)")
+        print(f"  4. Review pending requests")
+        print(f"  5. Skip ALL remaining conflicting APIs")
+        print(f"  6. Override ALL remaining conflicting APIs")
+        
+        while True:
+            try:
+                choice = int(input("\nEnter your choice (1-6): "))
+                if 1 <= choice <= 6:
+                    return choice
+                else:
+                    print("Please enter a valid choice (1-6)")
+            except ValueError:
+                print("Please enter a valid number")
+    
+    def load_database_schema(self, schema_file: str = "JSON/database_schema.json") -> Dict[str, Any]:
+        """Load database schema from JSON file"""
+        try:
+            with open(schema_file, 'r', encoding='utf-8') as f:
+                schema = json.load(f)
+            logger.info(f"Loaded database schema from {schema_file}")
+            return schema
+        except FileNotFoundError:
+            logger.warning(f"Database schema file not found: {schema_file}")
+            return {"tables": []}
+        except json.JSONDecodeError as e:
+            logger.error(f"Invalid JSON in schema file: {e}")
+            return {"tables": []}
+    
+    def get_nsi_database_schema(self) -> Dict[str, Any]:
+        """Get current NSI database schema from PostgreSQL"""
+        try:
+            with self.nsi_conn.cursor(cursor_factory=RealDictCursor) as cursor:
+                # Get all tables and their columns with more detailed type information
+                cursor.execute("""
+                    SELECT 
+                        t.table_name,
+                        c.column_name,
+                        CASE 
+                            WHEN c.data_type = 'character varying' THEN 
+                                CASE WHEN c.character_maximum_length IS NOT NULL 
+                                     THEN 'VARCHAR(' || c.character_maximum_length || ')'
+                                     ELSE 'VARCHAR'
+                                END
+                            WHEN c.data_type = 'character' THEN 
+                                CASE WHEN c.character_maximum_length IS NOT NULL 
+                                     THEN 'CHAR(' || c.character_maximum_length || ')'
+                                     ELSE 'CHAR'
+                                END
+                            WHEN c.data_type = 'numeric' THEN
+                                CASE WHEN c.numeric_precision IS NOT NULL AND c.numeric_scale IS NOT NULL
+                                     THEN 'NUMERIC(' || c.numeric_precision || ',' || c.numeric_scale || ')'
+                                     ELSE 'NUMERIC'
+                                END
+                            ELSE UPPER(c.data_type)
+                        END as data_type,
+                        c.is_nullable,
+                        c.column_default,
+                        CASE WHEN pk.column_name IS NOT NULL THEN true ELSE false END as is_primary_key,
+                        c.character_maximum_length,
+                        c.numeric_precision,
+                        c.numeric_scale
+                    FROM information_schema.tables t
+                    JOIN information_schema.columns c ON t.table_name = c.table_name
+                    LEFT JOIN (
+                        SELECT ku.table_name, ku.column_name
+                        FROM information_schema.table_constraints tc
+                        JOIN information_schema.key_column_usage ku 
+                            ON tc.constraint_name = ku.constraint_name
+                        WHERE tc.constraint_type = 'PRIMARY KEY'
+                    ) pk ON c.table_name = pk.table_name AND c.column_name = pk.column_name
+                    WHERE t.table_schema = 'public'
+                    AND t.table_type = 'BASE TABLE'
+                    AND t.table_name NOT LIKE 'pg_%'
+                    AND t.table_name NOT LIKE 'information_schema%'
+                    ORDER BY t.table_name, c.ordinal_position
+                """)
+                
+                results = cursor.fetchall()
+                
+                # Organize data by table
+                tables = {}
+                for row in results:
+                    table_name = row['table_name']
+                    if table_name not in tables:
+                        tables[table_name] = {
+                            'name': table_name,
+                            'columns': []
+                        }
+                    
+                    # Normalize the data type using our function
+                    normalized_type = self.normalize_data_type(row['data_type'])
+                    
+                    tables[table_name]['columns'].append({
+                        'name': row['column_name'],
+                        'type': normalized_type,
+                        'nullable': row['is_nullable'] == 'YES',
+                        'default': row['column_default'],
+                        'primary_key': row['is_primary_key']
+                    })
+                
+                return {'tables': list(tables.values())}
+                
+        except Exception as e:
+            logger.error(f"Error getting NSI database schema: {e}")
+            return {'tables': []}
+    
+    def normalize_data_type(self, data_type: str) -> str:
+        """Normalize data types for comparison between JSON schema and PostgreSQL"""
+        if not data_type:
+            return ""
+        
+        # Convert to uppercase for comparison
+        data_type = data_type.upper().strip()
+        
+        # Normalize common PostgreSQL type variations
+        type_mappings = {
+            # Integer types
+            'CHARACTER VARYING': 'TEXT',
+            'BIGINT': 'INTEGER',
+            'INT8': 'INTEGER',
+            'INT4': 'INTEGER',
+            'INT2': 'INTEGER',
+            'SMALLINT': 'INTEGER',
+            'SERIAL': 'INTEGER',
+            'BIGSERIAL': 'INTEGER',
+            
+            # Timestamp types
+            'TIMESTAMP WITHOUT TIME ZONE': 'TIMESTAMP',
+            'TIMESTAMP WITH TIME ZONE': 'TIMESTAMP',
+            'TIMESTAMPTZ': 'TIMESTAMP',
+            
+            # Numeric types
+            'DECIMAL': 'NUMERIC',
+            'FLOAT': 'NUMERIC',
+            'FLOAT8': 'NUMERIC',
+            'FLOAT4': 'NUMERIC',
+            'DOUBLE PRECISION': 'NUMERIC',
+            'REAL': 'NUMERIC',
+            'MONEY': 'NUMERIC',
+            
+            # Text types
+            'JSONB': 'TEXT',
+            'JSON': 'TEXT',
+            'VARCHAR': 'TEXT',
+            'CHAR': 'TEXT',
+            'CHARACTER': 'TEXT',
+            'UUID': 'TEXT',
+            
+            # Boolean types
+            'BOOL': 'BOOLEAN'
+        }
+        
+        # Handle VARCHAR with length specifications
+        if data_type.startswith('VARCHAR(') or data_type.startswith('CHARACTER VARYING('):
+            return 'VARCHAR'
+        
+        # Handle other types with specifications
+        for pg_type, normalized_type in type_mappings.items():
+            if data_type.startswith(pg_type):
+                return normalized_type
+        
+        # Additional normalization for text-based types
+        result = type_mappings.get(data_type, data_type)
+        if result in ['VARCHAR', 'CHAR', 'CHARACTER', 'CHARACTER VARYING']:
+            result = 'TEXT'
+            
+        return result
+    
+    def compare_schemas(self, json_schema: Dict[str, Any], db_schema: Dict[str, Any]) -> bool:
+        """Compare JSON schema with database schema to detect changes"""
+        # If no json_schema provided, load from JSON/database_schema.json
+        if not json_schema or not json_schema.get('tables'):
+            try:
+                with open('JSON/database_schema.json', 'r', encoding='utf-8') as f:
+                    json_schema = json.load(f)
+                logger.info("Loaded schema from JSON/database_schema.json for comparison")
+            except Exception as e:
+                logger.error(f"Could not load JSON/database_schema.json: {e}")
+                return False
+        
+        json_tables = {table['name']: table for table in json_schema.get('tables', [])}
+        db_tables = {table['name']: table for table in db_schema.get('tables', [])}
+        
+        changes_detected = False
+        
+        logger.info(f"Comparing schemas - JSON tables: {len(json_tables)}, DB tables: {len(db_tables)}")
+        
+        # Check for new tables in JSON
+        for table_name in json_tables:
+            if table_name not in db_tables:
+                logger.info(f"New table in JSON: {table_name}")
+                changes_detected = True
+        
+        # Check for removed tables (in DB but not JSON)
+        for table_name in db_tables:
+            if table_name not in json_tables:
+                logger.info(f"Table removed from JSON: {table_name}")
+                changes_detected = True
+        
+        # Check for column differences in existing tables
+        for table_name in json_tables.keys() & db_tables.keys():
+            json_table = json_tables[table_name]
+            db_table = db_tables[table_name]
+            
+            json_columns = {col['name']: col for col in json_table.get('columns', [])}
+            db_columns = {col['name']: col for col in db_table.get('columns', [])}
+            
+            # Check for new columns in JSON
+            for col_name in json_columns:
+                if col_name not in db_columns:
+                    logger.info(f"New column in JSON: {table_name}.{col_name}")
+                    changes_detected = True
+            
+            # Check for removed columns (in DB but not JSON)
+            for col_name in db_columns:
+                if col_name not in json_columns:
+                    logger.info(f"Column removed from JSON: {table_name}.{col_name}")
+                    changes_detected = True
+            
+            # Check for type changes in existing columns
+            for col_name in json_columns.keys() & db_columns.keys():
+                json_col = json_columns[col_name]
+                db_col = db_columns[col_name]
+                
+                json_type = self.normalize_data_type(json_col.get('data_type', json_col.get('type', '')))
+                db_type = self.normalize_data_type(db_col.get('type', ''))
+                
+                if json_type and db_type and json_type != db_type:
+                    logger.info(f"Column type changed: {table_name}.{col_name} (JSON: {json_type} vs DB: {db_type})")
+                    changes_detected = True
+        
+        # Also check for tables that exist in JSON but not in DB (removed tables)
+        for table_name in json_tables:
+            if table_name not in db_tables:
+                logger.info(f"Table removed from database: {table_name}")
+                # Note: We don't treat removed tables as changes that require version increment
+                # since the API might still be valid
+        
+        if not changes_detected:
+            logger.info("✓ Schema comparison complete - no differences found")
+        
+        return changes_detected
+    
+    def increment_version(self, current_version: str) -> str:
+        """Increment version number (e.g., v1 -> v2)"""
+        if current_version.startswith('v'):
+            try:
+                version_num = int(current_version[1:])
+                return f"v{version_num + 1}"
+            except ValueError:
+                return "v2"
+        return "v2"
+    
+    def get_schema_changes_by_entity(self, config_file: str) -> List[str]:
+        """Get list of entities that have schema changes"""
+        try:
+            # Load the JSON database schema file (not application config)
+            schema_file = "JSON/database_schema.json"
+            logger.info(f"Comparing against schema file: {schema_file}")
+            
+            with open(schema_file, 'r', encoding='utf-8') as f:
+                json_schema = json.load(f)
+            
+            db_schema = self.get_nsi_database_schema()
+            
+            json_tables = {table['name']: table for table in json_schema.get('tables', [])}
+            db_tables = {table['name']: table for table in db_schema.get('tables', [])}
+            
+            logger.info(f"JSON schema has {len(json_tables)} tables: {list(json_tables.keys())}")
+            logger.info(f"DB schema has {len(db_tables)} tables: {list(db_tables.keys())}")
+            
+            affected_entities = set()
+            
+            # Check for new tables in JSON that don't exist in DB
+            for table_name in json_tables:
+                if table_name not in db_tables:
+                    logger.info(f"New table in JSON: {table_name}")
+                    affected_entities.add(table_name)
+            
+            # Check for tables that exist in DB but not in JSON (removed tables)
+            for table_name in db_tables:
+                if table_name not in json_tables:
+                    logger.info(f"Table removed from JSON: {table_name}")
+                    affected_entities.add(table_name)
+            
+            # Check tables that exist in both JSON and DB for column differences
+            for table_name in json_tables.keys() & db_tables.keys():
+                json_table = json_tables[table_name]
+                db_table = db_tables[table_name]
+                
+                json_columns = {col['name']: col for col in json_table.get('columns', [])}
+                db_columns = {col['name']: col for col in db_table.get('columns', [])}
+                
+                logger.info(f"Table {table_name}: JSON has {len(json_columns)} columns, DB has {len(db_columns)} columns")
+                logger.info(f"  JSON columns: {list(json_columns.keys())}")
+                logger.info(f"  DB columns: {list(db_columns.keys())}")
+                
+                table_changed = False
+                
+                # Check for new columns in JSON that don't exist in DB
+                for col_name in json_columns:
+                    if col_name not in db_columns:
+                        logger.info(f"🆕 New column detected in JSON: {table_name}.{col_name}")
+                        table_changed = True
+                
+                # Check for columns that exist in DB but not in JSON (removed columns)
+                for col_name in db_columns:
+                    if col_name not in json_columns:
+                        logger.info(f"❌ Column removed from JSON: {table_name}.{col_name}")
+                        table_changed = True
+                
+                # Check for type changes in existing columns
+                for col_name in json_columns.keys() & db_columns.keys():
+                    json_col = json_columns[col_name]
+                    db_col = db_columns[col_name]
+                    
+                    json_type = self.normalize_data_type(json_col.get('data_type', json_col.get('type', '')))
+                    db_type = self.normalize_data_type(db_col.get('type', ''))
+                    
+                    if json_type and db_type and json_type != db_type:
+                        logger.info(f"🔄 Column type changed: {table_name}.{col_name} (JSON: {json_type} vs DB: {db_type})")
+                        table_changed = True
+                
+                if table_changed:
+                    affected_entities.add(table_name)
+            
+            if not affected_entities:
+                logger.info("✓ No database schema differences detected - schemas are in sync")
+            
+            return list(affected_entities)
+        
+        except Exception as e:
+            logger.error(f"Error getting schema changes by entity: {e}")
+            return []
+    
+    def update_api_versions_for_entities(self, config_file: str, affected_entities: List[str], new_versions: Dict[str, str] = None):
+        """Update API versions only for specific entities that have schema changes"""
+        try:
+            with open(config_file, 'r', encoding='utf-8') as f:
+                config = json.load(f)
+            
+            # Determine new version for affected entities
+            if new_versions is None:
+                new_versions = {}
+                for entity in affected_entities:
+                    # Find current version for this entity
+                    current_version = 'v1'
+                    if 'apis' in config:
+                        for api in config['apis']:
+                            if api.get('entity') == entity:
+                                current_version = api.get('version', 'v1')
+                                break
+                    new_versions[entity] = self.increment_version(current_version)
+            
+            # Update APIs section
+            if 'apis' in config:
+                for api in config['apis']:
+                    # Only update APIs for entities present in new_versions
+                    if api.get('entity') in new_versions:
+                        new_version = new_versions[api.get('entity')]
+                        api['version'] = new_version
+                        if 'endpoint' in api:
+                            api['endpoint'] = self._update_endpoint_version(api['endpoint'], new_version)
+            
+            # Update screen_layouts section
+            if 'screen_layouts' in config:
+                for layout in config['screen_layouts']:
+                    # Update data_source fields
+                    if 'layout_sections' in layout:
+                        for section in layout['layout_sections']:
+                            if 'fields' in section:
+                                for field in section['fields']:
+                                    if 'data_source' in field and field['data_source']:
+                                        field['data_source'] = self._update_endpoint_version_for_entity(
+                                            field['data_source'], affected_entities, new_versions)
+                    
+                    # Update apis array in screen layouts
+                    if 'apis' in layout:
+                        for api in layout['apis']:
+                            if 'endpoint' in api:
+                                api['endpoint'] = self._update_endpoint_version_for_entity(
+                                    api['endpoint'], list(new_versions.keys()), new_versions)
+            
+            # Update api_specifications section
+            if 'api_specifications' in config:
+                for api_spec in config['api_specifications']:
+                    if 'endpoint' in api_spec:
+                        api_spec['endpoint'] = self._update_endpoint_version_for_entity(
+                            api_spec['endpoint'], list(new_versions.keys()), new_versions)
+            
+            # Save updated configuration
+            with open(config_file, 'w', encoding='utf-8') as f:
+                json.dump(config, f, indent=2, ensure_ascii=False)
+            
+            # Note: Skip auto-registration here - let normal process handle it
+            # This prevents phantom API conflicts from duplicate registrations
+            
+            logger.info(f"Updated API versions for entities: {', '.join(new_versions.keys())}")
+            logger.info(f"New versions: {new_versions}")
+            return new_versions
+        except Exception as e:
+            logger.error(f"Error updating API versions for entities: {e}")
+            return {}
+    
+    def update_api_versions_for_entities_old(self, config_file: str, affected_entities: List[str]):
+        """Update API versions only for specific entities that have schema changes (old version)"""
+        try:
+            with open(config_file, 'r', encoding='utf-8') as f:
+                config = json.load(f)
+            
+            # Determine new version for affected entities
+            new_versions = {}
+            for entity in affected_entities:
+                # Find current version for this entity
+                current_version = 'v1'
+                if 'apis' in config:
+                    for api in config['apis']:
+                        if api.get('entity') == entity:
+                            current_version = api.get('version', 'v1')
+                            break
+                new_versions[entity] = self.increment_version(current_version)
+            
+            # Update APIs section
+            if 'apis' in config:
+                for api in config['apis']:
+                    if api.get('entity') in affected_entities:
+                        new_version = new_versions[api.get('entity')]
+                        api['version'] = new_version
+                        
+                        # Update endpoint version
+                        if 'endpoint' in api:
+                            api['endpoint'] = self._update_endpoint_version(api['endpoint'], new_version)
+            
+            # Update screen_layouts section
+            if 'screen_layouts' in config:
+                for layout in config['screen_layouts']:
+                    # Update data_source fields
+                    if 'layout_sections' in layout:
+                        for section in layout['layout_sections']:
+                            if 'fields' in section:
+                                for field in section['fields']:
+                                    if 'data_source' in field and field['data_source']:
+                                        field['data_source'] = self._update_endpoint_version_for_entity(
+                                            field['data_source'], affected_entities, new_versions)
+                    
+                    # Update apis array in screen layouts
+                    if 'apis' in layout:
+                        for api in layout['apis']:
+                            if 'endpoint' in api:
+                                api['endpoint'] = self._update_endpoint_version_for_entity(
+                                    api['endpoint'], affected_entities, new_versions)
+            
+            # Update api_specifications section
+            if 'api_specifications' in config:
+                for api_spec in config['api_specifications']:
+                    if 'endpoint' in api_spec:
+                        api_spec['endpoint'] = self._update_endpoint_version_for_entity(
+                            api_spec['endpoint'], affected_entities, new_versions)
+            
+            # Save updated configuration
+            with open(config_file, 'w', encoding='utf-8') as f:
+                json.dump(config, f, indent=2, ensure_ascii=False)
+            
+            # Note: Skip auto-registration here - let normal process handle it
+            # This prevents phantom API conflicts from duplicate registrations
+            
+            logger.info(f"Updated API versions for entities: {', '.join(new_versions.keys())}")
+            logger.info(f"New versions: {new_versions}")
+        except Exception as e:
+            logger.error(f"Error updating API versions for entities: {e}")
+    
+    def _update_endpoint_version(self, endpoint: str, new_version: str) -> str:
+        """Update version in a single endpoint"""
+        if '/api/v' in endpoint:
+            parts = endpoint.split('/')
+            if len(parts) >= 3 and parts[2].startswith('v'):
+                parts[2] = new_version
+                return '/'.join(parts)
+        return endpoint
+    
+    def _update_endpoint_version_for_entity(self, endpoint: str, affected_entities: List[str], new_versions: Dict[str, str]) -> str:
+        """Update endpoint version only if it belongs to an affected entity"""
+        # Extract entity name from endpoint (e.g., /api/v1/inventory -> inventory)
+        if '/api/v' in endpoint:
+            parts = endpoint.split('/')
+            if len(parts) >= 4:
+                entity_name = parts[3].split('?')[0].split('{')[0]  # Handle query params and path params
+                if entity_name in affected_entities:
+                    parts[2] = new_versions[entity_name]
+                    return '/'.join(parts)
+        return endpoint
+    
+    def _register_new_version_apis(self, config: Dict[str, Any], affected_entities: List[str], new_versions: Dict[str, str]):
+        """Register new version APIs in the database"""
+        try:
+            if 'apis' not in config:
+                return
+            
+            for api in config['apis']:
+                if api.get('entity') in affected_entities:
+                    # Create new API entry with updated version
+                    new_api_data = api.copy()
+                    new_api_data['id'] = f"{api['id']}_{new_versions[api.get('entity')]}"
+                    
+                    # Insert into database
+                    if self.insert_api_registry(new_api_data):
+                        self.insert_api_ownership(
+                            new_api_data['id'], 
+                            new_api_data['endpoint'], 
+                            new_api_data.get('user', 'system')
+                        )
+                        logger.info(f"Registered new version API: {new_api_data['id']}")
+                    
+        except Exception as e:
+            logger.error(f"Error registering new version APIs: {e}")
+    
+    def update_application_config_version(self, config_file: str, new_version: str):
+        """Update version in application configuration file"""
+        try:
+            with open(config_file, 'r', encoding='utf-8') as f:
+                config = json.load(f)
+            
+            # Update metadata version
+            if 'metadata' in config:
+                config['metadata']['version'] = new_version
+            
+            # Update API endpoints with new version
+            if 'apis' in config:
+                for api in config['apis']:
+                    if 'endpoint' in api:
+                        # Replace version in endpoint
+                        parts = api['endpoint'].split('/')
+                        if len(parts) >= 3 and parts[2].startswith('v'):
+                            parts[2] = new_version
+                            api['endpoint'] = '/'.join(parts)
+                    if 'version' in api:
+                        api['version'] = new_version
+            
+            # Save updated configuration
+            with open(config_file, 'w', encoding='utf-8') as f:
+                json.dump(config, f, indent=2, ensure_ascii=False)
+            
+            logger.info(f"Updated application configuration version to {new_version}")
+            
+        except Exception as e:
+            logger.error(f"Error updating application configuration: {e}")
+    
+    def check_and_update_version(self, config_file: str) -> str:
+        """Check for schema changes and update version if needed"""
+        # Check for schema changes and get affected entities
+        affected_entities = self.get_schema_changes_by_entity(config_file)
+        if affected_entities:
+            logger.info(f"Database schema changes detected for entities: {', '.join(affected_entities)}")
+            # update_api_versions_for_entities returns a per-entity mapping
+            new_versions = self.update_api_versions_for_entities(config_file, affected_entities)
+            return new_versions  # may be empty dict on error
+        else:
+            logger.info("✓ No version increment needed - database schema is current")
+            return {}
+    
+    def show_review_menu(self):
+        """Show review management menu"""
+        while True:
+            print("\n" + "="*60)
+            print("API REVIEW MANAGEMENT")
+            print("="*60)
+            print("1. View pending reviews")
+            print("2. Approve a review")
+            print("3. Reject a review")
+            print("4. Back to main menu")
+            
+            try:
+                choice = int(input("\nEnter your choice (1-4): "))
+                
+                if choice == 1:
+                    self.show_pending_reviews()
+                elif choice == 2:
+                    self.approve_review()
+                elif choice == 3:
+                    self.reject_review()
+                elif choice == 4:
+                    break
+                else:
+                    print("Please enter a valid choice (1-4)")
+            except ValueError:
+                print("Please enter a valid number")
+    
+    def show_pending_reviews(self):
+        """Show all pending reviews"""
+        try:
+            with self.conn.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute("""
+                    SELECT id, api_id, endpoint, requested_by, current_owner, 
+                           description, requested_at, request_type
+                    FROM api_review 
+                    WHERE status = 'PENDING'
+                    ORDER BY requested_at DESC
+                """)
+                
+                reviews = cursor.fetchall()
+                
+                if not reviews:
+                    print("\nNo pending reviews found.")
+                    return
+                
+                print(f"\nPending Reviews ({len(reviews)}):")
+                print("-" * 80)
+                
+                for review in reviews:
+                    print(f"ID: {review['id']}")
+                    print(f"API ID: {review['api_id']}")
+                    print(f"Endpoint: {review['endpoint']}")
+                    print(f"Requested by: {review['requested_by']}")
+                    print(f"Current owner: {review['current_owner']}")
+                    print(f"Description: {review['description']}")
+                    print(f"Requested at: {review['requested_at']}")
+                    print(f"Type: {review['request_type']}")
+                    print("-" * 80)
+                    
+        except Exception as e:
+            logger.error(f"Error showing pending reviews: {e}")
+    
+    def approve_review(self):
+        """Approve a review request"""
+        try:
+            review_id = input("Enter review ID to approve: ").strip()
+            if not review_id:
+                print("Invalid review ID")
+                return
+            
+            reviewer = input("Enter reviewer name: ").strip() or "admin"
+            comments = input("Enter review comments (optional): ").strip()
+            
+            with self.conn.cursor(cursor_factory=RealDictCursor) as cursor:
+                # Get review details
+                cursor.execute("""
+                    SELECT api_id, endpoint, requested_by, current_owner
+                    FROM api_review 
+                    WHERE id = %s AND status = 'PENDING'
+                """, (review_id,))
+                
+                review = cursor.fetchone()
+                if not review:
+                    print("Review not found or already processed")
+                    return
+                
+                # Update review status
+                cursor.execute("""
+                    UPDATE api_review 
+                    SET status = 'APPROVED', reviewed_at = CURRENT_TIMESTAMP,
+                        reviewed_by = %s, review_comments = %s
+                    WHERE id = %s
+                """, (reviewer, comments, review_id))
+                
+                # Transfer ownership
+                cursor.execute("""
+                    UPDATE api_ownership 
+                    SET is_current_owner = FALSE 
+                    WHERE api_id = %s
+                """, (review['api_id'],))
+                
+                cursor.execute("""
+                    INSERT INTO api_ownership (api_id, endpoint, user_id, is_current_owner)
+                    VALUES (%s, %s, %s, TRUE)
+                """, (review['api_id'], review['endpoint'], review['requested_by']))
+                
+                # Update API registry owner
+                cursor.execute("""
+                    UPDATE api_registry 
+                    SET user_id = %s, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = %s
+                """, (review['requested_by'], review['api_id']))
+                
+                self.conn.commit()
+                print(f"✓ Review {review_id} approved successfully")
+                print(f"API {review['api_id']} ownership transferred to {review['requested_by']}")
+                
+        except Exception as e:
+            logger.error(f"Error approving review: {e}")
+            self.conn.rollback()
+    
+    def reject_review(self):
+        """Reject a review request"""
+        try:
+            review_id = input("Enter review ID to reject: ").strip()
+            if not review_id:
+                print("Invalid review ID")
+                return
+            
+            reviewer = input("Enter reviewer name: ").strip() or "admin"
+            comments = input("Enter rejection reason: ").strip() or "Request rejected"
+            
+            with self.conn.cursor() as cursor:
+                cursor.execute("""
+                    UPDATE api_review 
+                    SET status = 'REJECTED', reviewed_at = CURRENT_TIMESTAMP,
+                        reviewed_by = %s, review_comments = %s
+                    WHERE id = %s AND status = 'PENDING'
+                """, (reviewer, comments, review_id))
+                
+                if cursor.rowcount > 0:
+                    self.conn.commit()
+                    print(f"✓ Review {review_id} rejected successfully")
+                else:
+                    print("Review not found or already processed")
+                    
+        except Exception as e:
+            logger.error(f"Error rejecting review: {e}")
+            self.conn.rollback()
+    
+    def create_review_request(self, existing_api: Dict[str, Any], new_api: Dict[str, Any], description: str = None) -> bool:
+        """Create a review request for API ownership change"""
+        try:
+            with self.conn.cursor() as cursor:
+                cursor.execute("""
+                    INSERT INTO api_review (api_id, endpoint, requested_by, current_owner, description, request_type)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                """, (
+                    existing_api['id'],
+                    existing_api['endpoint'],
+                    new_api['user'],
+                    existing_api.get('current_owner', existing_api['user_id']),
+                    description or f"Request to take ownership of API {existing_api['id']}",
+                    'OWNERSHIP_CHANGE'
+                ))
+                
+                self.conn.commit()
+                logger.info(f"Review request created for API {existing_api['id']}")
+                return True
+        except Exception as e:
+            logger.error(f"Error creating review request: {e}")
+            self.conn.rollback()
+            return False
+    
+    def insert_api_registry(self, api_data: Dict[str, Any]) -> bool:
+        """Insert API data into registry table"""
+        try:
+            with self.conn.cursor() as cursor:
+                cursor.execute("""
+                    INSERT INTO api_registry (
+                        id, endpoint, method, description, entity, operation, 
+                        user_id, version, response_type, request_body, path_params
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (id) DO UPDATE SET
+                        endpoint = EXCLUDED.endpoint,
+                        method = EXCLUDED.method,
+                        description = EXCLUDED.description,
+                        entity = EXCLUDED.entity,
+                        operation = EXCLUDED.operation,
+                        user_id = EXCLUDED.user_id,
+                        version = EXCLUDED.version,
+                        response_type = EXCLUDED.response_type,
+                        request_body = EXCLUDED.request_body,
+                        path_params = EXCLUDED.path_params,
+                        updated_at = CURRENT_TIMESTAMP
+                """, (
+                    api_data['id'],
+                    api_data['endpoint'],
+                    api_data['method'],
+                    api_data.get('description'),
+                    api_data.get('entity'),
+                    api_data.get('operation'),
+                    api_data['user'],
+                    api_data.get('version', 'v1'),
+                    api_data.get('response_type'),
+                    api_data.get('request_body'),
+                    api_data.get('path_params', [])
+                ))
+                return True
+        except Exception as e:
+            logger.error(f"Error inserting API registry: {e}")
+            return False
+    
+    def insert_api_ownership(self, api_id: str, endpoint: str, user_id: str) -> bool:
+        """Insert API ownership record"""
+        try:
+            with self.conn.cursor() as cursor:
+                # First, set existing ownership records to false
+                cursor.execute("""
+                    UPDATE api_ownership 
+                    SET is_current_owner = FALSE 
+                    WHERE api_id = %s
+                """, (api_id,))
+                
+                # Insert new ownership record
+                cursor.execute("""
+                    INSERT INTO api_ownership (api_id, endpoint, user_id, is_current_owner)
+                    VALUES (%s, %s, %s, TRUE)
+                """, (api_id, endpoint, user_id))
+                
+                return True
+        except Exception as e:
+            logger.error(f"Error inserting API ownership: {e}")
+            return False
+    
+    def process_api_registration(self, api_data: Dict[str, Any], current_version: str) -> bool:
+        """Process single API registration with conflict handling"""
+        api_id = api_data['id']
+        original_endpoint = api_data['endpoint']
+        
+        # Create a copy for database operations (don't modify original)
+        db_api_data = api_data.copy()
+        
+        # Update DB copy with current version
+        db_api_data['version'] = current_version
+        # Update endpoint with current version if it contains version info
+        if '/api/v' in original_endpoint:
+            parts = original_endpoint.split('/')
+            if len(parts) >= 3 and parts[2].startswith('v'):
+                parts[2] = current_version
+                db_api_data['endpoint'] = '/'.join(parts)
+        
+        # Check if API already exists using the ORIGINAL config endpoint (not modified)
+        # Only true conflicts are same endpoint AND same method
+        logger.info(f"Checking for conflicts with ORIGINAL endpoint: {original_endpoint}")
+        existing_api = self.check_existing_api(api_id, original_endpoint, api_data.get('method'))
+        
+        if existing_api:
+            # Check if we have a bulk action set
+            if self.bulk_conflict_action == 'skip_all':
+                print(f"⚠ Skipping registration for API {api_id} - using existing (bulk action)")
+                return True
+            elif self.bulk_conflict_action == 'override_all':
+                print(f"⚠ Overriding existing API {api_id} (bulk action)")
+                # Continue with normal registration process
+            else:
+                # Handle conflict with user interaction
+                choice = self.get_user_choice(existing_api, db_api_data)
+                
+                if choice == 1:  # Request approval
+                    description = input("Enter description for the approval request (optional): ").strip()
+                    if self.create_review_request(existing_api, db_api_data, description):
+                        print(f"✓ Review request created for API {api_id}")
+                        return True
+                    else:
+                        print(f"✗ Failed to create review request for API {api_id}")
+                        return False
+                
+                elif choice == 2:  # Continue using existing
+                    print(f"⚠ Skipping registration for API {api_id} - using existing")
+                    return True
+                
+                elif choice == 3:  # Override and create new
+                    print(f"⚠ Overriding existing API {api_id}")
+                    # Continue with normal registration process
+                
+                elif choice == 4:  # Review pending requests
+                    self.show_review_menu()
+                    return True
+                
+                elif choice == 5:  # Skip all remaining
+                    self.bulk_conflict_action = 'skip_all'
+                    print(f"⚠ Skipping registration for API {api_id} - using existing (will skip all remaining conflicts)")
+                    return True
+                
+                elif choice == 6:  # Override all remaining
+                    self.bulk_conflict_action = 'override_all'
+                    print(f"⚠ Overriding existing API {api_id} (will override all remaining conflicts)")
+                    # Continue with normal registration process
+        
+        # Register the API using the DB copy with updated version/endpoint
+        try:
+            with self.conn.cursor() as cursor:
+                # Insert into registry
+                if not self.insert_api_registry(db_api_data):
+                    return False
+                
+                # Insert into ownership
+                if not self.insert_api_ownership(api_id, db_api_data['endpoint'], db_api_data['user']):
+                    return False
+                
+                self.conn.commit()
+                logger.info(f"Successfully registered API: {api_id}")
+                return True
+                
+        except Exception as e:
+            logger.error(f"Error inserting API registry: {e}")
+            try:
+                self.conn.rollback()
+            except:
+                pass
+            return False
+    
+    def process_all_apis(self, config_file: str):
+        """Process all APIs from application configuration"""
+        # Reset bulk conflict action for this run
+        self.bulk_conflict_action = None
+        
+        # Check for schema changes and update version if needed
+        versions_map = self.check_and_update_version(config_file)
+        logger.info(f"Using API version map: {versions_map}")
+        
+        config = self.load_application_config(config_file)
+        apis = config.get('apis', [])
+        
+        if not apis:
+            logger.warning("No APIs found in configuration file")
+            return
+        
+        logger.info(f"Found {len(apis)} APIs to process")
+        
+        successful = 0
+        failed = 0
+        
+        for api in apis:
+            print(f"\nProcessing API: {api['id']}")
+            # Determine per-API version: use versions_map for entity if present, otherwise use api.version or v1
+            entity = api.get('entity')
+            per_api_version = versions_map.get(entity) if isinstance(versions_map, dict) and entity in versions_map else api.get('version', 'v1')
+            if self.process_api_registration(api, per_api_version):
+                successful += 1
+            else:
+                failed += 1
+        
+        print(f"\n" + "="*80)
+        print("REGISTRATION SUMMARY")
+        print("="*80)
+        print(f"Total APIs: {len(apis)}")
+        print(f"Successful: {successful}")
+        print(f"Failed: {failed}")
+        print("="*80)
+    
+    def get_registry_stats(self):
+        """Get registry statistics"""
+        try:
+            with self.conn.cursor(cursor_factory=RealDictCursor) as cursor:
+                # Get total APIs
+                cursor.execute("SELECT COUNT(*) as total FROM api_registry WHERE is_active = TRUE")
+                total_apis = cursor.fetchone()['total']
+                
+                # Get APIs by user
+                cursor.execute("""
+                    SELECT user_id, COUNT(*) as count 
+                    FROM api_registry 
+                    WHERE is_active = TRUE 
+                    GROUP BY user_id 
+                    ORDER BY count DESC
+                """)
+                apis_by_user = cursor.fetchall()
+                
+                # Get pending reviews
+                cursor.execute("SELECT COUNT(*) as pending FROM api_review WHERE status = 'PENDING'")
+                pending_reviews = cursor.fetchone()['pending']
+                
+                print(f"\n" + "="*50)
+                print("API REGISTRY STATISTICS")
+                print("="*50)
+                print(f"Total Active APIs: {total_apis}")
+                print(f"Pending Reviews: {pending_reviews}")
+                print(f"\nAPIs by User:")
+                for user_stat in apis_by_user:
+                    print(f"  {user_stat['user_id']}: {user_stat['count']} APIs")
+                print("="*50)
+                
+        except Exception as e:
+            logger.error(f"Error getting registry stats: {e}")
+
+
+def main():
+    """Main function"""
+    parser = argparse.ArgumentParser(
+        description="API Registry Management System",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python api_registry_manager.py
+  python api_registry_manager.py --config config_output/application_config.json
+  python api_registry_manager.py --review-only
+        """
+    )
+    
+    parser.add_argument(
+        '--config',
+        default='config_output/application_config.json',
+        help='Path to application configuration JSON file'
+    )
+    
+    parser.add_argument(
+        '--stats-only',
+        action='store_true',
+        help='Only show registry statistics without processing APIs'
+    )
+    
+    parser.add_argument(
+        '--review-only',
+        action='store_true',
+        help='Only show review management interface'
+    )
+    
+    args = parser.parse_args()
+    
+    # Create registry manager with hardcoded credentials
+    registry_manager = APIRegistryManager()
+    
+    try:
+        if args.stats_only:
+            registry_manager.get_registry_stats()
+        elif args.review_only:
+            registry_manager.show_review_menu()
+        else:
+            # Process APIs
+            registry_manager.process_all_apis(args.config)
+            
+            # Show stats after processing
+            registry_manager.get_registry_stats()
+            
+    finally:
+        registry_manager.close_connection()
+
+
+if __name__ == '__main__':
+    main()"
