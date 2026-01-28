@@ -1,0 +1,277 @@
+"#!/usr/bin/env python3
+"""
+API Registry Launcher - Web Mode Version
+========================================
+
+Web-compatible version of the API Registry Management System launcher
+that supports WebSocket/HTTP interactions for use in web workflows.
+
+This version maintains the same functionality as the original but replaces
+interactive input() calls with web-based prompt/response mechanisms.
+"""
+
+import subprocess
+import sys
+import json
+import time
+import uuid
+from pathlib import Path
+
+
+def send_web_prompt(prompt_data):
+    """Send interactive prompt to web interface and wait for response"""
+    try:
+        # Clean up any existing prompt file first
+        prompt_file = Path("temp_api_prompt.json")
+        if prompt_file.exists():
+            prompt_file.unlink()
+            
+        # Generate unique prompt ID
+        prompt_id = str(uuid.uuid4())
+        prompt_data['prompt_id'] = prompt_id
+        prompt_data['timestamp'] = time.time()
+        
+        # Save prompt data to file for web interface to pick up
+        with open(prompt_file, 'w') as f:
+            json.dump(prompt_data, f, indent=2)
+        
+        print(f"Prompt saved to {prompt_file}, waiting for web response...")
+        
+        # Wait for response with timeout
+        timeout = 300  # 5 minutes timeout
+        start_time = time.time()
+        
+        while time.time() - start_time < timeout:
+            response_file = Path(f"temp_api_response_{prompt_id}.json")
+            if response_file.exists():
+                try:
+                    with open(response_file, 'r') as f:
+                        response = json.load(f)
+                    # Clean up files
+                    response_file.unlink()
+                    if prompt_file.exists():
+                        prompt_file.unlink()
+                    return response
+                except Exception as e:
+                    print(f"Error reading response file: {e}")
+                    # Clean up prompt file even on error
+                    if prompt_file.exists():
+                        prompt_file.unlink()
+                    break
+            
+            time.sleep(1)  # Check every second
+        
+        print("Timeout waiting for web response")
+        # Clean up prompt file on timeout
+        if prompt_file.exists():
+            prompt_file.unlink()
+        return None
+        
+    except Exception as e:
+        print(f"Error sending web prompt: {e}")
+        # Clean up prompt file on exception
+        prompt_file = Path("temp_api_prompt.json")
+        if prompt_file.exists():
+            prompt_file.unlink()
+        return None
+
+
+def show_main_menu_web(session_id=None):
+    """Show main menu options with web support"""
+    prompt_data = {
+        "type": "menu_selection",
+        "title": "API Registry Management System",
+        "description": "Please select an option to proceed:",
+        "session_id": session_id,
+        "options": [
+            {"id": "1", "label": "Process APIs from configuration file", "description": "Load and process API configurations"},
+            {"id": "2", "label": "Review pending approval requests", "description": "Review and manage API approval requests"},
+            {"id": "3", "label": "Show registry statistics", "description": "Display current registry statistics"},
+            {"id": "4", "label": "Exit", "description": "Exit the application"}
+        ]
+    }
+    
+    response = send_web_prompt(prompt_data)
+    if response and response.get('choice'):
+        return response['choice']
+    else:
+        print("No response received, defaulting to option 1")
+        return "1"
+
+
+def get_config_file_web(session_id=None):
+    """Get config file path with web support"""
+    prompt_data = {
+        "type": "text_input",
+        "title": "Configuration File Path",
+        "description": "Enter the path to the configuration file (or leave empty for default):",
+        "session_id": session_id,
+        "default_value": "config_output/application_config.json",
+        "options": [
+            {"id": "default", "label": "Use default path", "description": "config_output/application_config.json"},
+            {"id": "custom", "label": "Enter custom path", "description": "Specify a custom configuration file path"}
+        ]
+    }
+    
+    response = send_web_prompt(prompt_data)
+    if response and response.get('choice'):
+        if response['choice'] == 'default':
+            return "config_output/application_config.json"
+        elif response['choice'] == 'custom' and response.get('custom_path'):
+            return response['custom_path']
+    
+    return "config_output/application_config.json"
+
+
+def show_main_menu():
+    """Show main menu options - console mode"""
+    while True:
+        print("\\n" + "="*60)
+        print("API REGISTRY MANAGEMENT SYSTEM")
+        print("="*60)
+        print("1. Process APIs from configuration file")
+        print("2. Review pending approval requests")
+        print("3. Show registry statistics")
+        print("4. Exit")
+        print("-"*60)
+        
+        try:
+            choice = int(input("Enter your choice (1-4): "))
+            
+            if choice == 1:
+                config_file = input("Enter config file path (or press Enter for default): ").strip()
+                if not config_file:
+                    config_file = "config_output/application_config.json"
+                
+                cmd = ["python3", "step_3b_api_registry_manager_web.py", "--config", config_file]
+                subprocess.run(cmd)
+                
+            elif choice == 2:
+                cmd = ["python3", "step_3b_api_registry_manager_web.py", "--review-only"]
+                subprocess.run(cmd)
+                
+            elif choice == 3:
+                cmd = ["python3", "step_3b_api_registry_manager_web.py", "--stats-only"]
+                subprocess.run(cmd)
+                
+            elif choice == 4:
+                print("Goodbye!")
+                sys.exit(0)
+                
+            else:
+                print("Please enter a valid choice (1-4)")
+                
+        except ValueError:
+            print("Please enter a valid number")
+        except KeyboardInterrupt:
+            print("\\nGoodbye!")
+            sys.exit(0)
+
+
+def run_web_mode(session_id=None):
+    """Run in web mode with interactive prompts"""
+    print(f"Running API Registry Launcher in web mode (Session: {session_id})")
+    
+    try:
+        while True:  # Keep running until user chooses to exit
+            choice = show_main_menu_web(session_id)
+            
+            if choice == "1":  # Process APIs from configuration file
+                config_file = get_config_file_web(session_id)
+                cmd = [
+                    "python3", "step_3b_api_registry_manager_web.py", 
+                    "--config", config_file, 
+                    "--web-mode", 
+                    "--session-id", session_id or "web_session"
+                ]
+                print(f"Executing: {' '.join(cmd)}")
+                result = subprocess.run(cmd, capture_output=True, text=True)
+                
+                print("STDOUT:", result.stdout)
+                if result.stderr:
+                    print("STDERR:", result.stderr)
+                
+                # Continue to next iteration instead of returning
+                if result.returncode != 0:
+                    print("API Registry Manager execution failed")
+                else:
+                    print("API Registry Manager execution completed")
+                
+            elif choice == "2":  # Review pending approval requests
+                cmd = [
+                    "python3", "step_3b_api_registry_manager_web.py", 
+                    "--review-only",
+                    "--web-mode", 
+                    "--session-id", session_id or "web_session"
+                ]
+                print(f"Executing: {' '.join(cmd)}")
+                result = subprocess.run(cmd, capture_output=True, text=True)
+                
+                print("STDOUT:", result.stdout)
+                if result.stderr:
+                    print("STDERR:", result.stderr)
+                    
+                # Continue to next iteration
+                if result.returncode != 0:
+                    print("API Registry Manager review failed")
+                else:
+                    print("API Registry Manager review completed")
+                
+            elif choice == "3":  # Show registry statistics
+                cmd = [
+                    "python3", "step_3b_api_registry_manager_web.py", 
+                    "--stats-only",
+                    "--web-mode", 
+                    "--session-id", session_id or "web_session"
+                ]
+                print(f"Executing: {' '.join(cmd)}")
+                result = subprocess.run(cmd, capture_output=True, text=True)
+                
+                print("STDOUT:", result.stdout)
+                if result.stderr:
+                    print("STDERR:", result.stderr)
+                    
+                # Continue to next iteration
+                if result.returncode != 0:
+                    print("API Registry Manager stats failed")
+                else:
+                    print("API Registry Manager stats completed")
+                
+            elif choice == "4":  # Exit
+                print("Exiting API Registry Launcher")
+                break  # Exit the loop
+                
+            else:
+                print(f"Invalid choice: {choice}")
+                # Continue to next iteration for invalid choices
+                
+        print("API Registry Launcher web mode session completed")
+        return True
+            
+    except Exception as e:
+        print(f"Error in web mode: {e}")
+        return False
+
+
+if __name__ == "__main__":
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="API Registry Launcher - Web Mode")
+    parser.add_argument(
+        '--web-mode',
+        action='store_true',
+        help='Enable web mode for interactive prompts'
+    )
+    parser.add_argument(
+        '--session-id',
+        type=str,
+        help='Session ID for web mode'
+    )
+    
+    args = parser.parse_args()
+    
+    if args.web_mode:
+        success = run_web_mode(args.session_id)
+        sys.exit(0 if success else 1)
+    else:
+        show_main_menu()"
