@@ -1,0 +1,3402 @@
+"#!/usr/bin/env python3
+"""
+Java Backend Generator for Forward Engineering Core Engine
+
+This script generates a complete Java Spring Boot backend application from application configuration.
+It creates JPA entities, DTOs, repositories, services, and REST controllers with full CRUD operations.
+
+USAGE INSTRUCTIONS:
+==================
+
+1. GENERATE JAVA BACKEND:
+   python3 step_3_java_backend_generator.py
+
+2. BUILD THE APPLICATION:
+   cd Generated/backend_java
+   ./mvnw clean install
+
+3. RUN THE APPLICATION:
+   java -jar target/generated-api-0.0.1-SNAPSHOT.jar
+
+4. TEST THE APPLICATION:
+   - Application runs on: http://localhost:8000
+   - Health check: http://localhost:8000/actuator/health
+   - API endpoints follow pattern: http://localhost:8000/api/{entity-name}
+   
+   Example API endpoints:
+   - GET    /api/inventory           (List all inventory items)
+   - POST   /api/inventory           (Create new inventory item)
+   - GET    /api/inventory/{id}      (Get specific inventory item)
+   - PUT    /api/inventory/{id}      (Update inventory item)
+   - DELETE /api/inventory/{id}      (Delete inventory item)
+
+5. DATABASE CONFIGURATION:
+   - Default: PostgreSQL (configure in application.properties)
+   - H2 in-memory database also supported for testing
+   - Connection details in: src/main/resources/application.properties
+
+6. GENERATED STRUCTURE:
+   - JPA Entities: src/main/java/com/example/api/entity/
+   - DTOs: src/main/java/com/example/api/dto/
+   - Repositories: src/main/java/com/example/api/repository/
+   - Services: src/main/java/com/example/api/service/
+   - Controllers: src/main/java/com/example/api/controller/
+
+Author: Forward Engineering Core Engine
+Date: 2024
+"""
+
+import os
+import sys
+import json
+import argparse
+import logging
+import shutil
+import subprocess
+import platform
+import urllib.request
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, Any, List
+from jinja2 import Environment, FileSystemLoader, TemplateNotFound
+# Phase 2A: Import the tracking mixin
+from dependency_tracking import GenerationTrackingMixin
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Import database analysis functions from the original generator
+try:
+    from step_4_backend_code_generator_db_manager import BackendGenerator
+    HAS_DB_SUPPORT = True
+except ImportError:
+    HAS_DB_SUPPORT = False
+    logger.warning("[WARN] Database packages not available - schema analysis will be limited")
+
+
+class JavaBackendGenerator(GenerationTrackingMixin):  # ✅ STEP 1: Inherit from mixin
+    """Generate Spring Boot backend code from application config"""
+    
+    def __init__(self, config: Dict[str, Any], templates_dir: Path, project_config: Dict[str, Any] = None):
+        super().__init__()  # ✅ STEP 2: Call super().__init__()
+        
+        self.config = config
+        self.templates_dir = templates_dir / 'Java'  # Use Java subdirectory
+        self.framework = 'spring-boot'
+        self.project_config = project_config or {}
+        self.api_version = self.project_config.get('version', 'v1')
+        
+        # Setup Jinja2 environment for Java templates
+        try:
+            self.jinja_env = Environment(
+                loader=FileSystemLoader(str(self.templates_dir)),
+                trim_blocks=False,
+                lstrip_blocks=False,
+                keep_trailing_newline=True
+            )
+            
+            # Add custom filters for template transformation
+            self.jinja_env.filters['to_class_name'] = self._to_class_name
+            self.jinja_env.filters['to_camel_case'] = self._to_camel_case
+            self.jinja_env.filters['java_type'] = self._get_java_type
+            
+            logger.info(f"[DONE] Jinja2 environment initialized with Java templates from: {self.templates_dir}")
+        except Exception as e:
+            logger.warning(f"[WARN] Could not initialize Jinja2: {e}. Falling back to hardcoded generation.")
+            self.jinja_env = None
+        
+        # ✅ STEP 3: Initialize tracking (ONE LINE!)
+        self.init_tracking()
+    
+    def generate(self, app_config: Dict[str, Any], output_dir: Path) -> Dict[str, Any]:
+        """
+        Generate complete Spring Boot backend codebase
+        
+        Args:
+            app_config: Application configuration from config file
+            output_dir: Output directory for Java backend code
+            
+        Returns:
+            Dictionary with generation statistics
+        """
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        logger.info("="*80)
+        logger.info("JAVA BACKEND CODE GENERATION (SPRING BOOT)")
+        logger.info("="*80)
+        
+        # Extract configuration
+        entities = app_config.get('entities', [])
+        apis = app_config.get('apis', [])
+        enums = app_config.get('enums', {})
+        db_config = app_config.get('metadata', {}).get('database', {})
+        
+        logger.info(f"[DATA] Input Statistics:")
+        logger.info(f"  - Entities: {len(entities)}")
+        logger.info(f"  - APIs: {len(apis)}")
+        logger.info(f"  - Enums: {len(enums)}")
+        logger.info(f"  - Database: {db_config.get('type', 'H2')}")
+        
+        files_created = []
+        
+        # Create Spring Boot directory structure
+        self._create_java_directory_structure(output_dir)
+        
+        # Generate enums (if any)
+        if enums:
+            enum_file = self._generate_java_enums_file(output_dir, enums)
+            files_created.append(enum_file)
+            logger.info(f"[DONE] Generated: {enum_file.relative_to(output_dir)}")
+        
+        # Generate JPA entities and DTOs for each entity
+        for entity in entities:
+            # Generate JPA Entity model
+            jpa_file = self._generate_jpa_entity(output_dir, entity, entities, db_config)
+            files_created.append(jpa_file)
+            logger.info(f"[DONE] Generated JPA Entity: {jpa_file.relative_to(output_dir)}")
+            
+            # Generate DTO models
+            dto_file = self._generate_dto_models(output_dir, entity, enums)
+            files_created.append(dto_file)
+            logger.info(f"[DONE] Generated DTOs: {dto_file.relative_to(output_dir)}")
+            
+            # Generate Repository
+            repo_file = self._generate_repository(output_dir, entity)
+            files_created.append(repo_file)
+            logger.info(f"[DONE] Generated Repository: {repo_file.relative_to(output_dir)}")
+            
+            # Generate Service
+            service_file = self._generate_service(output_dir, entity)
+            files_created.append(service_file)
+            logger.info(f"[DONE] Generated Service: {service_file.relative_to(output_dir)}")
+        
+        # Extract entity-specific API versions
+        entity_versions = self._extract_entity_versions(app_config)
+        
+        # Generate controllers
+        route_entities = self._group_apis_by_entity(apis)
+        for entity_name, entity_apis in route_entities.items():
+            controller_file = self._generate_controller(output_dir, entity_name, entity_apis, entities, entity_versions)
+            files_created.append(controller_file)
+            logger.info(f"[DONE] Generated Controller: {controller_file.relative_to(output_dir)}")
+        
+        # Generate TestController for API testing
+        test_controller_file = self._generate_test_controller(output_dir, entity_versions)
+        files_created.append(test_controller_file)
+        logger.info(f"[DONE] Generated TestController: {test_controller_file.relative_to(output_dir)}")
+        
+        # Generate Spring Boot application files
+        main_app_file = self._generate_spring_boot_main(output_dir, db_config)
+        files_created.append(main_app_file)
+        logger.info(f"[DONE] Generated Spring Boot Main: {main_app_file.relative_to(output_dir)}")
+        
+        # Generate database configuration (includes auto-creation for PostgreSQL)
+        db_config_file = self._generate_database_configuration(output_dir, db_config)
+        files_created.append(db_config_file)
+        logger.info(f"[DONE] Generated Database Configuration: {db_config_file.relative_to(output_dir)}")
+        
+        # Generate application configuration
+        app_props_file = self._generate_application_properties(output_dir, db_config)
+        files_created.append(app_props_file)
+        logger.info(f"[DONE] Generated application.properties: {app_props_file.relative_to(output_dir)}")
+        
+        # Generate Maven pom.xml
+        pom_file = self._generate_pom_xml(output_dir, db_config)
+        files_created.append(pom_file)
+        logger.info(f"[DONE] Generated pom.xml: {pom_file.relative_to(output_dir)}")
+        
+        # Generate Maven wrapper files
+        mvnw_files = self._generate_maven_wrapper(output_dir)
+        files_created.extend(mvnw_files)
+        
+        logger.info("="*80)
+        logger.info(f"[DONE] JAVA BACKEND GENERATION COMPLETE: {len(files_created)} files created")
+        
+        # ✅ STEP 5: Display tracking statistics
+        if hasattr(self, '_tracker') and self._tracker is not None:
+            manifest_path = self._tracker.manifest_path
+            if manifest_path.exists():
+                logger.info(f"[MANIFEST] Generation manifest saved: {manifest_path}")
+            
+            # Display tracking statistics
+            stats = self.get_tracking_stats()
+            if stats:
+                logger.info(f"[TRACKING] Files tracked: {stats.get('total_files', 0)}")
+        logger.info("="*80)
+        
+        return {
+            'files_generated': len(files_created),
+            'entities': len(entities),
+            'apis': len(apis),
+            'routes': len(route_entities),
+            'output_dir': str(output_dir),
+            'files': [str(f.relative_to(output_dir)) for f in files_created],
+            'framework': 'spring-boot'
+        }
+    
+    def _extract_entity_versions(self, app_config: Dict[str, Any]) -> Dict[str, str]:
+        """
+        Extract entity-specific API versions from application configuration.
+        Returns a dictionary mapping entity names to their API versions.
+        """
+        entity_versions = {}
+        apis = app_config.get('apis', [])
+        
+        logger.info(f"[VERSIONS] Extracting entity-specific API versions from {len(apis)} APIs")
+        
+        for api in apis:
+            entity_name = api.get('entity')
+            api_version = api.get('version')
+            
+            if entity_name and api_version:
+                # Store the version for this entity
+                if entity_name not in entity_versions:
+                    entity_versions[entity_name] = api_version
+                    logger.info(f"[VERSIONS] Entity '{entity_name}' -> API version '{api_version}'")
+                elif entity_versions[entity_name] != api_version:
+                    logger.warning(f"[VERSIONS] Entity '{entity_name}' has mixed versions: {entity_versions[entity_name]} vs {api_version}")
+        
+        logger.info(f"[VERSIONS] Extracted versions for {len(entity_versions)} entities")
+        return entity_versions
+    
+    def _get_entity_version(self, entity_name: str, entity_versions: Dict[str, str]) -> str:
+        """
+        Get the API version for a specific entity, with fallback to global version.
+        """
+        entity_version = entity_versions.get(entity_name, self.api_version)
+        logger.debug(f"[VERSION] Entity '{entity_name}' using version '{entity_version}'")
+        return entity_version
+    
+    def _create_java_directory_structure(self, output_dir: Path):
+        """Create Spring Boot Maven directory structure"""
+        # Standard Maven structure
+        (output_dir / 'src' / 'main' / 'java' / 'com' / 'example' / 'api').mkdir(parents=True, exist_ok=True)
+        (output_dir / 'src' / 'main' / 'java' / 'com' / 'example' / 'api' / 'models').mkdir(exist_ok=True)
+        (output_dir / 'src' / 'main' / 'java' / 'com' / 'example' / 'api' / 'dtos').mkdir(exist_ok=True)
+        (output_dir / 'src' / 'main' / 'java' / 'com' / 'example' / 'api' / 'controllers').mkdir(exist_ok=True)
+        (output_dir / 'src' / 'main' / 'java' / 'com' / 'example' / 'api' / 'services').mkdir(exist_ok=True)
+        (output_dir / 'src' / 'main' / 'java' / 'com' / 'example' / 'api' / 'repositories').mkdir(exist_ok=True)
+        (output_dir / 'src' / 'main' / 'java' / 'com' / 'example' / 'api' / 'enums').mkdir(exist_ok=True)
+        (output_dir / 'src' / 'main' / 'resources').mkdir(parents=True, exist_ok=True)
+        (output_dir / 'src' / 'test' / 'java' / 'com' / 'example' / 'api').mkdir(parents=True, exist_ok=True)
+        logger.info("[DIR] Created Spring Boot Maven directory structure")
+    
+    def _generate_java_enums_file(self, output_dir: Path, enums: Dict) -> Path:
+        """Generate Java enum classes using Jinja2 template"""
+        file_path = output_dir / 'src' / 'main' / 'java' / 'com' / 'example' / 'api' / 'enums' / 'Enums.java'
+        
+        # Try template-based generation first
+        if self.jinja_env:
+            try:
+                template = self.jinja_env.get_template('enums_java.j2')
+                template_data = self._transform_enums_for_java_template(enums)
+                content = template.render(**template_data)
+                file_path.write_text(content)
+                logger.info(f"[TEMPLATE] Generated enums using template")
+                return file_path
+            except TemplateNotFound:
+                logger.warning("[TEMPLATE] enums_java.j2 template not found")
+            except Exception as e:
+                logger.warning(f"[TEMPLATE] Error with enums template: {e}")
+        
+        # Fallback to hardcoded generation
+        logger.info("[FALLBACK] Generating Java enums using hardcoded method")
+        content = 'package com.example.api.enums;\n\n'
+        
+        for enum_name, enum_values in enums.items():
+            class_name = self._to_class_name(enum_name)
+            content += f'public enum {class_name} {{\n'
+            
+            # Generate enum values
+            enum_entries = []
+            for value in enum_values:
+                # Convert value to valid Java enum constant
+                enum_constant = str(value).upper().replace(' ', '_').replace('-', '_')
+                # Remove invalid characters
+                enum_constant = ''.join(c if c.isalnum() or c == '_' else '' for c in enum_constant)
+                if enum_constant and not enum_constant[0].isdigit():
+                    enum_entries.append(f'    {enum_constant}("{value}")')
+            
+            content += ',\n'.join(enum_entries)
+            content += ';\n\n'
+            
+            # Add constructor and getter
+            content += '    private final String value;\n\n'
+            content += f'    {class_name}(String value) {{\n'
+            content += '        this.value = value;\n'
+            content += '    }\n\n'
+            content += '    public String getValue() {\n'
+            content += '        return value;\n'
+            content += '    }\n'
+            content += '}\n\n'
+        
+        file_path.write_text(content)
+        
+        # ✅ STEP 4: Track generation (ONE LINE!)
+        self.track_file(
+            file_path=file_path,
+            template_ids=['enums_java.j2'],
+            content=content,
+            metadata={'enum_count': len(enums)}
+        )
+        
+        return file_path
+    
+    def _generate_jpa_entity(self, output_dir: Path, entity: Dict, all_entities: List[Dict], db_config: Dict = None) -> Path:
+        """Generate JPA Entity model for an entity using Jinja2 template"""
+        if db_config is None:
+            db_config = {}
+            
+        entity_name = entity['table_name']
+        file_path = output_dir / 'src' / 'main' / 'java' / 'com' / 'example' / 'api' / 'models' / f'{self._to_class_name(entity_name)}.java'
+        
+        # Try template-based generation first
+        if self.jinja_env:
+            try:
+                template = self.jinja_env.get_template('jpa_model_java.j2')
+                template_data = self._transform_entity_for_jpa_template(entity, all_entities, db_config)
+                content = template.render(**template_data)
+                file_path.write_text(content)
+                logger.info(f"[TEMPLATE] Generated JPA entity {entity_name} using template")
+                
+                # ✅ Track template-based generation
+                self.track_file(
+                    file_path=file_path,
+                    template_ids=['jpa_model_java.j2'],
+                    content=content,
+                    metadata={
+                        'entity_name': entity_name,
+                        'field_count': len(entity.get('fields', [])),
+                        'has_relationships': bool(entity.get('relationships', []))
+                    }
+                )
+                return file_path
+            except TemplateNotFound:
+                logger.warning(f"[TEMPLATE] jpa_model_java.j2 template not found")
+            except Exception as e:
+                logger.warning(f"[TEMPLATE] Error with JPA entity template: {e}")
+        
+        # Fallback to hardcoded generation
+        logger.info(f"[FALLBACK] Generating JPA entity {entity_name} using hardcoded method")
+        class_name = self._to_class_name(entity_name)
+        
+        content = f'package com.example.api.models;\n\n'
+        content += f'import javax.persistence.*;\n'
+        content += f'import java.time.LocalDateTime;\n'
+        content += f'import java.util.Optional;\n\n'
+        
+        content += f'@Entity\n'
+        content += f'@Table(name = "{entity_name.lower()}")\n'
+        content += f'public class {class_name} {{\n\n'
+        
+        # Generate fields
+        fields = entity.get('fields', [])
+        for field in fields:
+            field_name = field['name']
+            field_type = field.get('type', 'VARCHAR')
+            is_primary = field.get('primary_key', False)
+            is_nullable = field.get('nullable', True)
+            is_auto_increment = field.get('auto_increment', False)
+            
+            java_type = self._get_java_type(field_type)
+            
+            # Add JPA annotations
+            if is_primary:
+                content += f'    @Id\n'
+                if is_auto_increment:
+                    content += f'    @GeneratedValue(strategy = GenerationType.IDENTITY)\n'
+            
+            content += f'    @Column(name = "{field_name}"'
+            if not is_nullable or is_primary:
+                content += f', nullable = false'
+            
+            # Add length for VARCHAR fields
+            field_length = field.get('length')
+            if field_length and field_type.upper() in ['VARCHAR', 'STR', 'STRING']:
+                content += f', length = {field_length}'
+            
+            content += f')\n'
+            
+            content += f'    private {java_type} {field_name};\n\n'
+        
+        # Generate getters and setters
+        for field in fields:
+            field_name = field['name']
+            java_type = self._get_java_type(field.get('type', 'VARCHAR'))
+            cap_name = field_name.capitalize()
+            
+            # Getter
+            content += f'    public {java_type} get{cap_name}() {{\n'
+            content += f'        return this.{field_name};\n'
+            content += f'    }}\n\n'
+            
+            # Setter
+            content += f'    public void set{cap_name}({java_type} {field_name}) {{\n'
+            content += f'        this.{field_name} = {field_name};\n'
+            content += f'    }}\n\n'
+        
+        content += f'}}\n'
+        
+        file_path.write_text(content)
+        
+        # ✅ STEP 4: Track generation
+        self.track_file(
+            file_path=file_path,
+            template_ids=['jpa_model_java.j2'],
+            content=content,
+            metadata={'entity': entity_name, 'field_count': len(fields)}
+        )
+        
+        return file_path
+    
+    def _generate_dto_models(self, output_dir: Path, entity: Dict, enums: Dict) -> Path:
+        """Generate separate DTO model files for an entity"""
+        entity_name = entity['table_name']
+        class_name = self._to_class_name(entity_name)
+        dto_paths = []
+        
+        # Generate each DTO class as a separate file
+        dto_types = ['Base', 'Create', 'Update', 'Response']
+        
+        for dto_type in dto_types:
+            file_path = output_dir / 'src' / 'main' / 'java' / 'com' / 'example' / 'api' / 'dtos' / f'{class_name}{dto_type}.java'
+            content = self._generate_single_dto(entity, class_name, dto_type)
+            file_path.write_text(content)
+            dto_paths.append(file_path)
+            logger.info(f"[GENERATED] DTO {class_name}{dto_type}: {file_path}")
+            
+            # ✅ STEP 4: Track generation
+            self.track_file(
+                file_path=file_path,
+                template_ids=['dto_model_java.j2'],
+                content=content,
+                metadata={
+                    'entity_name': entity_name,
+                    'dto_type': dto_type,
+                    'field_count': len(entity.get('fields', []))
+                }
+            )
+        
+        return dto_paths[0]  # Return first path for compatibility
+        
+    def _generate_single_dto(self, entity: Dict, class_name: str, dto_type: str) -> str:
+        """Generate content for a single DTO class"""
+        fields = entity.get('fields', [])
+        
+        content = f'package com.example.api.dtos;\n\n'
+        content += f'import java.time.LocalDateTime;\n'
+        content += f'import java.util.Optional;\n\n'
+        
+        if dto_type == 'Base':
+            content += f'public class {class_name}Base {{\n'
+            # Add non-auto-increment fields
+            for field in fields:
+                if not (field.get('primary_key') and field.get('auto_increment')):
+                    java_type = self._get_java_type(field.get('type', 'VARCHAR'))
+                    camel_field_name = self._to_camel_case(field["name"])  # Convert to camelCase
+                    content += f'    private {java_type} {camel_field_name};\n'
+            
+            # Add getters and setters
+            content += f'\n    // Getters and Setters\n'
+            for field in fields:
+                if not (field.get('primary_key') and field.get('auto_increment')):
+                    field_name = field['name']
+                    camel_field_name = self._to_camel_case(field_name)  # Convert to camelCase
+                    java_type = self._get_java_type(field.get('type', 'VARCHAR'))
+                    pascal_name = self._field_to_pascal_case(field_name)
+                    
+                    content += f'    public {java_type} get{pascal_name}() {{ return this.{camel_field_name}; }}\n'
+                    content += f'    public void set{pascal_name}({java_type} {camel_field_name}) {{ this.{camel_field_name} = {camel_field_name}; }}\n'
+            
+        elif dto_type == 'Create':
+            content += f'public class {class_name}Create extends {class_name}Base {{\n'
+            content += f'    // Inherits all fields from {class_name}Base\n'
+            
+        elif dto_type == 'Update':
+            content += f'public class {class_name}Update {{\n'
+            # Add non-primary-key fields as Optional
+            for field in fields:
+                if not field.get('primary_key'):
+                    java_type = self._get_java_type(field.get('type', 'VARCHAR'))
+                    camel_field_name = self._to_camel_case(field["name"])  # Convert to camelCase
+                    content += f'    private Optional<{java_type}> {camel_field_name};\n'
+            
+            content += f'\n    // Getters and Setters\n'
+            for field in fields:
+                if not field.get('primary_key'):
+                    field_name = field['name']
+                    camel_field_name = self._to_camel_case(field_name)  # Convert to camelCase
+                    java_type = self._get_java_type(field.get('type', 'VARCHAR'))
+                    pascal_name = self._field_to_pascal_case(field_name)
+                    
+                    content += f'    public Optional<{java_type}> get{pascal_name}() {{ return this.{camel_field_name}; }}\n'
+                    content += f'    public void set{pascal_name}(Optional<{java_type}> {camel_field_name}) {{ this.{camel_field_name} = {camel_field_name}; }}\n'
+            
+        elif dto_type == 'Response':
+            content += f'public class {class_name}Response extends {class_name}Base {{\n'
+            # Add primary key to response
+            pk_field = next((f for f in fields if f.get('primary_key')), None)
+            if pk_field:
+                pk_name = pk_field['name']
+                pk_type = self._get_java_type(pk_field.get('type', 'INTEGER'))
+                pascal_name = self._field_to_pascal_case(pk_name)
+                
+                content += f'    private {pk_type} {pk_name};\n\n'
+                content += f'    public {pk_type} get{pascal_name}() {{ return this.{pk_name}; }}\n'
+                content += f'    public void set{pascal_name}({pk_type} {pk_name}) {{ this.{pk_name} = {pk_name}; }}\n'
+        
+        content += f'}}\n'
+        return content
+        
+    def _field_to_pascal_case(self, field_name: str) -> str:
+        """Convert field name to PascalCase for getter/setter methods"""
+        return ''.join(word.capitalize() for word in field_name.split('_'))
+    
+    def _generate_repository(self, output_dir: Path, entity: Dict) -> Path:
+        """Generate Spring Data JPA Repository interface using Jinja2 template"""
+        entity_name = entity['table_name']
+        class_name = self._to_class_name(entity_name)
+        file_path = output_dir / 'src' / 'main' / 'java' / 'com' / 'example' / 'api' / 'repositories' / f'{class_name}Repository.java'
+        
+        # Find primary key type
+        pk_field = next((f for f in entity.get('fields', []) if f.get('primary_key')), None)
+        pk_java_type = 'Long'
+        if pk_field:
+            pk_java_type = self._get_java_type(pk_field.get('type', 'INTEGER'))
+        
+        # Try template-based generation first
+        if self.jinja_env:
+            try:
+                template = self.jinja_env.get_template('repository_java.j2')
+                template_data = self._transform_entity_for_repository_template(entity, pk_java_type)
+                content = template.render(**template_data)
+                file_path.write_text(content)
+                logger.info(f"[TEMPLATE] Generated repository for {entity_name} using template")
+                
+                # ✅ Track template-based generation
+                self.track_file(
+                    file_path=file_path,
+                    template_ids=['repository_java.j2'],
+                    content=content,
+                    metadata={
+                        'entity_name': entity['table_name'],
+                        'pk_type': pk_java_type
+                    }
+                )
+                return file_path
+            except TemplateNotFound:
+                logger.warning(f"[TEMPLATE] repository_java.j2 template not found")
+            except Exception as e:
+                logger.warning(f"[TEMPLATE] Error with repository template: {e}")
+        
+        content = f'package com.example.api.repositories;\n\n'
+        content += f'import org.springframework.data.jpa.repository.JpaRepository;\n'
+        content += f'import org.springframework.stereotype.Repository;\n'
+        content += f'import com.example.api.models.{class_name};\n'
+        content += f'import java.util.Optional;\n\n'
+        
+        content += f'@Repository\n'
+        content += f'public interface {class_name}Repository extends JpaRepository<{class_name}, {pk_java_type}> {{\n'
+        
+        # Add common query methods for string fields
+        fields = entity.get('fields', [])
+        for field in fields:
+            if not field.get('primary_key') and self._get_java_type(field.get('type', 'VARCHAR')) == 'String':
+                field_name = field['name']
+                cap_name = field_name.capitalize()
+                content += f'    Optional<{class_name}> findBy{cap_name}(String {field_name});\n'
+        
+        content += f'}}\n'
+        
+        file_path.write_text(content)
+        
+        # ✅ STEP 4: Track generation
+        self.track_file(
+            file_path=file_path,
+            template_ids=['repository_java.j2'],
+            content=content,
+            metadata={'entity': entity_name, 'pk_type': pk_java_type}
+        )
+        
+        return file_path
+    
+    def _generate_service(self, output_dir: Path, entity: Dict) -> Path:
+        """Generate Service layer class using Jinja2 template"""
+        entity_name = entity['table_name']
+        class_name = self._to_class_name(entity_name)
+        file_path = output_dir / 'src' / 'main' / 'java' / 'com' / 'example' / 'api' / 'services' / f'{class_name}Service.java'
+        
+        # Find primary key type
+        pk_field = next((f for f in entity.get('fields', []) if f.get('primary_key')), None)
+        pk_java_type = 'Long'
+        if pk_field:
+            pk_java_type = self._get_java_type(pk_field.get('type', 'INTEGER'))
+        
+        # Try template-based generation first
+        if self.jinja_env:
+            try:
+                template = self.jinja_env.get_template('service_java.j2')
+                template_data = self._transform_entity_for_service_template(entity, pk_java_type)
+                content = template.render(**template_data)
+                file_path.write_text(content)
+                logger.info(f"[TEMPLATE] Generated service for {entity_name} using template")
+                
+                # ✅ Track template-based generation
+                self.track_file(
+                    file_path=file_path,
+                    template_ids=['service_java.j2'],
+                    content=content,
+                    metadata={
+                        'entity_name': entity['table_name'],
+                        'pk_type': pk_java_type
+                    }
+                )
+                return file_path
+            except TemplateNotFound:
+                logger.warning(f"[TEMPLATE] service_java.j2 template not found")
+            except Exception as e:
+                logger.warning(f"[TEMPLATE] Error with service template: {e}")
+        
+        content = f'package com.example.api.services;\n\n'
+        content += f'import org.springframework.beans.factory.annotation.Autowired;\n'
+        content += f'import org.springframework.stereotype.Service;\n'
+        content += f'import java.util.List;\n'
+        content += f'import java.util.Optional;\n'
+        content += f'import com.example.api.models.{class_name};\n'
+        content += f'import com.example.api.repositories.{class_name}Repository;\n'
+        content += f'import com.example.api.dtos.{class_name}Create;\n'
+        content += f'import com.example.api.dtos.{class_name}Update;\n\n'
+        
+        content += f'@Service\n'
+        content += f'public class {class_name}Service {{\n\n'
+        content += f'    @Autowired\n'
+        content += f'    private {class_name}Repository repository;\n\n'
+        
+        # Generate CRUD methods
+        content += self._generate_service_methods(class_name, entity_name, pk_java_type, entity)
+        
+        content += f'}}\n'
+        
+        file_path.write_text(content)
+        
+        # ✅ STEP 4: Track generation
+        self.track_file(
+            file_path=file_path,
+            template_ids=['service_java.j2'],
+            content=content,
+            metadata={'entity': entity_name, 'pk_type': pk_java_type}
+        )
+        
+        return file_path
+    
+    def _generate_service_methods(self, class_name: str, entity_name: str, pk_type: str, entity: Dict) -> str:
+        """Generate service CRUD methods"""
+        content = ''
+        fields = entity.get('fields', [])
+        
+        # CREATE method
+        content += f'    public {class_name} create({class_name}Create createDto) {{\n'
+        content += f'        {class_name} entity = new {class_name}();\n'
+        
+        # Map fields from DTO to entity (excluding auto-increment PK)
+        for field in fields:
+            if not (field.get('primary_key') and field.get('auto_increment')):
+                field_name = field['name']
+                cap_name = field_name.capitalize()
+                content += f'        entity.set{cap_name}(createDto.get{cap_name}());\n'
+        
+        content += f'        return repository.save(entity);\n'
+        content += f'    }}\n\n'
+        
+        # READ ALL method
+        content += f'    public List<{class_name}> getAll() {{\n'
+        content += f'        return repository.findAll();\n'
+        content += f'    }}\n\n'
+        
+        # READ BY ID method
+        content += f'    public {class_name} getById({pk_type} id) {{\n'
+        content += f'        Optional<{class_name}> entity = repository.findById(id);\n'
+        content += f'        return entity.orElse(null);\n'
+        content += f'    }}\n\n'
+        
+        # UPDATE method
+        content += f'    public {class_name} update({pk_type} id, {class_name}Update updateDto) {{\n'
+        content += f'        Optional<{class_name}> existingEntity = repository.findById(id);\n'
+        content += f'        if (existingEntity.isPresent()) {{\n'
+        content += f'            {class_name} entity = existingEntity.get();\n'
+        
+        # Map update fields
+        for field in fields:
+            if not field.get('primary_key'):
+                field_name = field['name']
+                cap_name = field_name.capitalize()
+                content += f'            if (updateDto.get{cap_name}().isPresent()) {{\n'
+                content += f'                entity.set{cap_name}(updateDto.get{cap_name}().get());\n'
+                content += f'            }}\n'
+        
+        content += f'            return repository.save(entity);\n'
+        content += f'        }}\n'
+        content += f'        return null;\n'
+        content += f'    }}\n\n'
+        
+        # DELETE method
+        content += f'    public boolean delete({pk_type} id) {{\n'
+        content += f'        if (repository.existsById(id)) {{\n'
+        content += f'            repository.deleteById(id);\n'
+        content += f'            return true;\n'
+        content += f'        }}\n'
+        content += f'        return false;\n'
+        content += f'    }}\n'
+        
+        return content
+    
+    def _generate_controller(self, output_dir: Path, entity_name: str, 
+                            apis: List[Dict], all_entities: List[Dict], entity_versions: Dict[str, str] = None) -> Path:
+        """Generate Spring Boot REST Controller using Jinja2 template with entity-specific versioning"""
+        file_path = output_dir / 'src' / 'main' / 'java' / 'com' / 'example' / 'api' / 'controllers' / f'{self._to_class_name(entity_name)}Controller.java'
+        
+        class_name = self._to_class_name(entity_name)
+        
+        # Get entity-specific API version
+        if entity_versions is None:
+            entity_versions = {}
+        entity_version = self._get_entity_version(entity_name, entity_versions)
+        
+        # Find primary key info
+        entity_obj = next((e for e in all_entities if e['table_name'].lower() == entity_name.lower()), None)
+        pk_field = 'id'
+        pk_type = 'Long'
+        if entity_obj:
+            pk_f = next((f for f in entity_obj.get('fields', []) if f.get('primary_key')), None)
+            if pk_f:
+                pk_field = pk_f['name']
+                pk_type = self._get_java_type(pk_f.get('type', 'INTEGER'))
+        
+        # Try template-based generation first
+        if self.jinja_env:
+            try:
+                template = self.jinja_env.get_template('controller_java.j2')
+                template_data = {
+                    'entity_name': entity_name,
+                    'class_name': class_name,
+                    'pk_field': pk_field,
+                    'pk_type': pk_type,
+                    'apis': apis,
+                    'api_version': entity_version
+                }
+                logger.info(f"[CONTROLLER] Generating {entity_name} controller with API version: {entity_version}")
+                content = template.render(**template_data)
+                file_path.write_text(content)
+                logger.info(f"[TEMPLATE] Generated controller for {entity_name} using template")
+                self.track_file(Path(str(file_path)), ['controller_java.j2'], content)
+                return file_path
+            except TemplateNotFound:
+                logger.warning(f"[TEMPLATE] controller_java.j2 template not found")
+            except Exception as e:
+                logger.warning(f"[TEMPLATE] Error with controller template: {e}")
+        
+        # Fallback to hardcoded generation
+        logger.info(f"[FALLBACK] Generating controller for {entity_name} using hardcoded method")
+        
+        content = f'package com.example.api.controllers;\n\n'
+        content += f'import org.springframework.beans.factory.annotation.Autowired;\n'
+        content += f'import org.springframework.http.ResponseEntity;\n'
+        content += f'import org.springframework.web.bind.annotation.*;\n'
+        content += f'import java.util.List;\n'
+        content += f'import com.example.api.services.{class_name}Service;\n'
+        content += f'import com.example.api.models.{class_name};\n'
+        content += f'import com.example.api.dtos.*;\n\n'
+        
+        content += f'@RestController\n'
+        content += f'@RequestMapping("/api/{entity_version}/{entity_name.lower()}")\n'
+        content += f'public class {class_name}Controller {{\n\n'
+        content += f'    @Autowired\n'
+        content += f'    private {class_name}Service service;\n\n'
+        
+        # Generate CRUD endpoints
+        content += self._generate_controller_methods(class_name, entity_name, pk_field, pk_type)
+        
+        content += f'}}\n'
+        
+        file_path.write_text(content)
+        
+        # ✅ STEP 4: Track generation
+        self.track_file(Path(str(file_path)), [], content)
+        
+        return file_path
+    
+    def _generate_controller_methods(self, class_name: str, entity_name: str, pk_field: str, pk_type: str) -> str:
+        """Generate controller CRUD methods"""
+        content = ''
+        
+        # CREATE endpoint
+        content += f'    @PostMapping\n'
+        content += f'    public ResponseEntity<{class_name}> create(@RequestBody {class_name}Create createDto) {{\n'
+        content += f'        {class_name} created = service.create(createDto);\n'
+        content += f'        return ResponseEntity.status(201).body(created);\n'
+        content += f'    }}\n\n'
+        
+        # READ ALL endpoint
+        content += f'    @GetMapping\n'
+        content += f'    public List<{class_name}> getAll() {{\n'
+        content += f'        return service.getAll();\n'
+        content += f'    }}\n\n'
+        
+        # READ BY ID endpoint
+        content += f'    @GetMapping("/{{{pk_field}}}")\n'
+        content += f'    public ResponseEntity<{class_name}> getById(@PathVariable {pk_type} {pk_field}) {{\n'
+        content += f'        {class_name} item = service.getById({pk_field});\n'
+        content += f'        if (item == null) {{\n'
+        content += f'            return ResponseEntity.notFound().build();\n'
+        content += f'        }}\n'
+        content += f'        return ResponseEntity.ok(item);\n'
+        content += f'    }}\n\n'
+        
+        # UPDATE endpoint
+        content += f'    @PutMapping("/{{{pk_field}}}")\n'
+        content += f'    public ResponseEntity<{class_name}> update(@PathVariable {pk_type} {pk_field}, @RequestBody {class_name}Update updateDto) {{\n'
+        content += f'        {class_name} updated = service.update({pk_field}, updateDto);\n'
+        content += f'        if (updated == null) {{\n'
+        content += f'            return ResponseEntity.notFound().build();\n'
+        content += f'        }}\n'
+        content += f'        return ResponseEntity.ok(updated);\n'
+        content += f'    }}\n\n'
+        
+        # DELETE endpoint
+        content += f'    @DeleteMapping("/{{{pk_field}}}")\n'
+        content += f'    public ResponseEntity<Void> delete(@PathVariable {pk_type} {pk_field}) {{\n'
+        content += f'        boolean deleted = service.delete({pk_field});\n'
+        content += f'        if (deleted) {{\n'
+        content += f'            return ResponseEntity.noContent().build();\n'
+        content += f'        }}\n'
+        content += f'        return ResponseEntity.notFound().build();\n'
+        content += f'    }}\n'
+        
+        return content
+    
+    def _generate_test_controller(self, output_dir: Path, entity_versions: Dict[str, str] = None) -> Path:
+        """Generate TestController for basic API testing and connectivity with entity-specific versioning"""
+        file_path = output_dir / 'src' / 'main' / 'java' / 'com' / 'example' / 'api' / 'controllers' / 'TestController.java'
+        
+        # Use the most common version from entities, or fallback to global version
+        if entity_versions:
+            # Find the most commonly used version
+            version_counts = {}
+            for version in entity_versions.values():
+                version_counts[version] = version_counts.get(version, 0) + 1
+            test_version = max(version_counts.keys(), key=lambda v: version_counts[v]) if version_counts else self.api_version
+        else:
+            test_version = self.api_version
+        
+        logger.info(f"[TEST_CONTROLLER] Using API version: {test_version}")
+        
+        content = f'''package com.example.api.controllers;
+
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+import java.util.HashMap;
+import java.util.Map;
+
+@RestController
+@RequestMapping("/api/{test_version}")
+public class TestController {{
+
+    @GetMapping("/test")
+    public ResponseEntity<Map<String, Object>> test() {{
+        Map<String, Object> response = new HashMap<>();
+        response.put("status", "success");
+        response.put("message", "Java Spring Boot API is working!");
+        response.put("timestamp", System.currentTimeMillis());
+        response.put("api_version", "{test_version}");
+        return ResponseEntity.ok(response);
+    }}
+
+    @GetMapping("/status")
+    public ResponseEntity<Map<String, Object>> status() {{
+        Map<String, Object> response = new HashMap<>();
+        response.put("application", "Generated Spring Boot API");
+        response.put("version", "0.0.1-SNAPSHOT");
+        response.put("status", "running");
+        response.put("framework", "Spring Boot 2.7.18");
+        response.put("api_version", "{test_version}");
+        return ResponseEntity.ok(response);
+    }}
+}}
+'''
+        
+        file_path.write_text(content)
+        
+        # ✅ STEP 4: Track generation
+        self.track_file(
+            file_path=file_path,
+            template_ids=[],
+            content=content,
+            metadata={'api_version': test_version}
+        )
+        
+        return file_path
+    
+    def _generate_spring_boot_main(self, output_dir: Path, db_config: Dict) -> Path:
+        """Generate Spring Boot main application class"""
+        file_path = output_dir / 'src' / 'main' / 'java' / 'com' / 'example' / 'api' / 'ApiApplication.java'
+        
+        content = f'package com.example.api;\n\n'
+        content += f'import org.springframework.boot.SpringApplication;\n'
+        content += f'import org.springframework.boot.autoconfigure.SpringBootApplication;\n\n'
+        
+        content += f'@SpringBootApplication\n'
+        content += f'public class ApiApplication {{\n\n'
+        content += f'    public static void main(String[] args) {{\n'
+        content += f'        SpringApplication.run(ApiApplication.class, args);\n'
+        content += f'    }}\n'
+        content += f'}}\n'
+        
+        file_path.write_text(content)
+        
+        # ✅ STEP 4: Track generation
+        self.track_file(
+            file_path=file_path,
+            template_ids=[],
+            content=content,
+            metadata={'class_name': 'ApiApplication'}
+        )
+        
+        return file_path
+    
+    def _generate_database_configuration(self, output_dir: Path, db_config: Dict) -> Path:
+        """Generate database configuration with auto-creation for PostgreSQL"""
+        file_path = output_dir / 'src' / 'main' / 'java' / 'com' / 'example' / 'api' / 'config' / 'DatabaseConfig.java'
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        db_type = db_config.get('type', 'h2')
+        
+        content = f'package com.example.api.config;\n\n'
+        content += f'import org.slf4j.Logger;\n'
+        content += f'import org.slf4j.LoggerFactory;\n'
+        content += f'import org.springframework.beans.factory.annotation.Value;\n'
+        content += f'import org.springframework.context.annotation.Bean;\n'
+        content += f'import org.springframework.context.annotation.Configuration;\n'
+        content += f'import org.springframework.context.annotation.Primary;\n'
+        content += f'import javax.sql.DataSource;\n'
+        content += f'import com.zaxxer.hikari.HikariConfig;\n'
+        content += f'import com.zaxxer.hikari.HikariDataSource;\n'
+        
+        if db_type == 'postgresql':
+            content += f'import java.sql.Connection;\n'
+            content += f'import java.sql.DriverManager;\n'
+            content += f'import java.sql.SQLException;\n'
+            content += f'import java.sql.Statement;\n'
+        
+        content += f'\n@Configuration\n'
+        content += f'public class DatabaseConfig {{\n\n'
+        content += f'    private static final Logger logger = LoggerFactory.getLogger(DatabaseConfig.class);\n\n'
+        
+        if db_type == 'postgresql':
+            # Clean database name - remove .db extension if present
+            db_name = db_config.get('name', 'nsi_app')
+            if db_name.endswith('.db'):
+                db_name = db_name[:-3]  # Remove .db extension
+            
+            content += f'    @Value("${{spring.datasource.url:jdbc:postgresql://localhost:5432/{db_name}}}")\n'
+            content += f'    private String databaseUrl;\n\n'
+            
+            content += f'    @Value("${{spring.datasource.username:postgres}}")\n'
+            content += f'    private String username;\n\n'
+            
+            content += f'    @Value("${{spring.datasource.password:password}}")\n'
+            content += f'    private String password;\n\n'
+            
+            content += f'    @Bean\n'
+            content += f'    @Primary\n'
+            content += f'    public DataSource dataSource() {{\n'
+            content += f'        createDatabaseIfNotExists();\n'
+            content += f'        HikariConfig config = new HikariConfig();\n'
+            content += f'        config.setJdbcUrl(databaseUrl);\n'
+            content += f'        config.setUsername(username);\n'
+            content += f'        config.setPassword(password);\n'
+            content += f'        config.setDriverClassName("org.postgresql.Driver");\n'
+            content += f'        return new HikariDataSource(config);\n'
+            content += f'    }}\n\n'
+            
+            content += f'    private void createDatabaseIfNotExists() {{\n'
+            content += f'        // Extract database name from URL\n'
+            content += f'        String dbName = extractDatabaseName(databaseUrl);\n'
+            content += f'        String serverUrl = databaseUrl.substring(0, databaseUrl.lastIndexOf("/")) + "/postgres";\n\n'
+            
+            content += f'        logger.info("[DB] Checking PostgreSQL database: {{}}", dbName);\n\n'
+            
+            content += f'        try (Connection connection = DriverManager.getConnection(serverUrl, username, password)) {{\n'
+            content += f'            // Check if database exists\n'
+            content += f'            String checkQuery = "SELECT 1 FROM pg_database WHERE datname = ?";\n'
+            content += f'            try (var stmt = connection.prepareStatement(checkQuery)) {{\n'
+            content += f'                stmt.setString(1, dbName);\n'
+            content += f'                boolean exists = stmt.executeQuery().next();\n\n'
+            
+            content += f'                if (!exists) {{\n'
+            content += f'                    logger.info("[DB] Creating PostgreSQL database: {{}}", dbName);\n'
+            content += f'                    try (Statement statement = connection.createStatement()) {{\n'
+            content += f'                        statement.executeUpdate("CREATE DATABASE \\"" + dbName + "\\"");\n'
+            content += f'                        logger.info("[DB] Successfully created database: {{}}", dbName);\n'
+            content += f'                    }}\n'
+            content += f'                }} else {{\n'
+            content += f'                    logger.info("[DB] Database already exists: {{}}", dbName);\n'
+            content += f'                }}\n'
+            content += f'            }}\n\n'
+            
+            content += f'        }} catch (SQLException e) {{\n'
+            content += f'            logger.error("[DB] Failed to create/check database: {{}}", e.getMessage());\n'
+            content += f'            logger.warn("[DB] Application will continue - Spring Boot may create tables automatically");\n'
+            content += f'        }}\n'
+            content += f'    }}\n\n'
+            
+            content += f'    private String extractDatabaseName(String url) {{\n'
+            content += f'        int lastSlash = url.lastIndexOf("/");\n'
+            content += f'        int queryStart = url.indexOf("?", lastSlash);\n'
+            content += f'        return queryStart > 0 ? url.substring(lastSlash + 1, queryStart) : url.substring(lastSlash + 1);\n'
+            content += f'    }}\n'
+        
+        else:
+            content += f'    // H2 database auto-configuration - no manual setup needed\n'
+            content += f'    // Spring Boot will automatically configure H2 based on application.properties\n'
+        
+        content += f'}}\n'
+        
+        file_path.write_text(content)
+        
+        # ✅ STEP 4: Track generation
+        self.track_file(
+            file_path=file_path,
+            template_ids=[],
+            content=content,
+            metadata={'db_type': db_type}
+        )
+        
+        return file_path
+    
+    def _generate_application_properties(self, output_dir: Path, db_config: Dict) -> Path:
+        """Generate application.properties with database configuration"""
+        file_path = output_dir / 'src' / 'main' / 'resources' / 'application.properties'
+        
+        db_type = db_config.get('type', 'h2')
+        
+        content = f'# Generated Spring Boot Application Configuration\n\n'
+        content += f'server.port=8000\n'
+        content += f'spring.application.name=Generated API\n\n'
+        
+        # Database configuration
+        if db_type == 'postgresql':
+            # Clean database name - remove .db extension if present
+            db_name = db_config.get('name', 'nsi_app')
+            if db_name.endswith('.db'):
+                db_name = db_name[:-3]  # Remove .db extension
+            
+            content += f'# PostgreSQL Configuration\n'
+            content += f'spring.datasource.url=jdbc:postgresql://localhost:5432/{db_name}\n'
+            content += f'spring.datasource.username=postgres\n'
+            content += f'spring.datasource.password=password\n'
+            content += f'spring.datasource.driver-class-name=org.postgresql.Driver\n'
+            content += f'spring.jpa.database-platform=org.hibernate.dialect.PostgreSQLDialect\n\n'
+        else:
+            # Default to H2 for development
+            content += f'# H2 Database Configuration\n'
+            content += f'spring.datasource.url=jdbc:h2:mem:testdb\n'
+            content += f'spring.datasource.driverClassName=org.h2.Driver\n'
+            content += f'spring.datasource.username=sa\n'
+            content += f'spring.datasource.password=password\n'
+            content += f'spring.h2.console.enabled=true\n'
+            content += f'spring.jpa.database-platform=org.hibernate.dialect.H2Dialect\n\n'
+        
+        content += f'# JPA/Hibernate Configuration\n'
+        content += f'spring.jpa.hibernate.ddl-auto=update\n'
+        content += f'spring.jpa.show-sql=true\n'
+        content += f'spring.jpa.format-sql=true\n'
+        content += f'logging.level.org.hibernate.SQL=DEBUG\n'
+        content += f'logging.level.org.hibernate.type.descriptor.sql.BasicBinder=TRACE\n'
+        content += f'logging.level.org.hibernate.engine.jdbc.connections.internal=DEBUG\n'
+        content += f'logging.level.com.zaxxer.hikari=DEBUG\n'
+        content += f'logging.level.org.springframework.jdbc.datasource=DEBUG\n\n'
+        
+        # CORS configuration
+        content += f'# CORS Configuration\n'
+        content += f'spring.web.cors.allowed-origins=*\n'
+        content += f'spring.web.cors.allowed-methods=*\n'
+        content += f'spring.web.cors.allowed-headers=*\n\n'
+        
+        # Actuator configuration
+        content += f'# Actuator Configuration\n'
+        content += f'management.endpoints.web.exposure.include=health,info,metrics\n'
+        content += f'management.endpoint.health.show-details=always\n'
+        content += f'management.health.defaults.enabled=true\n\n'
+        
+        # JPA configuration
+        content += f'# Disable JPA open-in-view warning\n'
+        content += f'spring.jpa.open-in-view=false\n\n'
+        
+        # Swagger/OpenAPI Configuration
+        content += f'# Swagger/OpenAPI Configuration\n'
+        content += f'springdoc.api-docs.path=/api-docs\n'
+        content += f'springdoc.swagger-ui.path=/swagger-ui.html\n'
+        content += f'springdoc.swagger-ui.operationsSorter=method\n'
+        content += f'springdoc.swagger-ui.tagsSorter=alpha\n\n'
+        
+        # Debug logging for request mappings
+        content += f'# Debug Logging\n'
+        content += f'logging.level.org.springframework.web.servlet.mvc.method.annotation.RequestMappingHandlerMapping=DEBUG\n'
+        content += f'logging.level.org.springframework.web=DEBUG\n'
+        
+        file_path.write_text(content)
+        
+        # ✅ STEP 4: Track generation
+        self.track_file(
+            file_path=file_path,
+            template_ids=[],
+            content=content,
+            metadata={'db_type': db_type}
+        )
+        
+        return file_path
+    
+    def _generate_pom_xml(self, output_dir: Path, db_config: Dict) -> Path:
+        """Generate Maven pom.xml with Spring Boot dependencies"""
+        file_path = output_dir / 'pom.xml'
+        
+        db_type = db_config.get('type', 'h2')
+        
+        content = f'''<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 
+         https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    
+    <modelVersion>4.0.0</modelVersion>
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>2.7.18</version>
+        <relativePath/>
+    </parent>
+    
+    <groupId>com.example</groupId>
+    <artifactId>generated-api</artifactId>
+    <version>0.0.1-SNAPSHOT</version>
+    <name>Generated API</name>
+    <description>Auto-generated Spring Boot backend API</description>
+    
+    <properties>
+        <java.version>11</java.version>
+    </properties>
+    
+    <dependencies>
+        <!-- Spring Boot Web Starter -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+        
+        <!-- Spring Boot Data JPA -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-jpa</artifactId>
+        </dependency>
+        
+        <!-- Spring Boot Validation -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-validation</artifactId>
+        </dependency>
+        
+        <!-- Spring Boot Actuator -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator</artifactId>
+        </dependency>
+        
+        <!-- Swagger/OpenAPI Documentation -->
+        <dependency>
+            <groupId>org.springdoc</groupId>
+            <artifactId>springdoc-openapi-ui</artifactId>
+            <version>1.7.0</version>
+        </dependency>
+'''
+        
+        if db_type == 'postgresql':
+            content += f'''        
+        <!-- PostgreSQL Driver -->
+        <dependency>
+            <groupId>org.postgresql</groupId>
+            <artifactId>postgresql</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+'''
+        else:
+            content += f'''        
+        <!-- H2 Database -->
+        <dependency>
+            <groupId>com.h2database</groupId>
+            <artifactId>h2</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+'''
+        
+        content += f'''        
+        <!-- Spring Boot Test Starter -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+    
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+            </plugin>
+        </plugins>
+    </build>
+    
+</project>
+'''
+        
+        file_path.write_text(content)
+        
+        # ✅ STEP 4: Track generation
+        self.track_file(
+            file_path=file_path,
+            template_ids=[],
+            content=content,
+            metadata={'db_type': db_type}
+        )
+        
+        return file_path
+    
+    def _generate_maven_wrapper(self, output_dir: Path) -> List[Path]:
+        """Generate Maven wrapper files by executing the Maven wrapper command"""
+        import subprocess
+        import shutil
+        import os
+        
+        files_created = []
+        
+        # Check if Maven is available
+        maven_cmd = shutil.which('mvn')
+        if not maven_cmd:
+            logger.warning("[MAVEN] Maven not found in PATH. Creating basic wrapper structure.")
+            return self._create_basic_maven_wrapper(output_dir)
+        
+        logger.info("[MAVEN] Generating Maven wrapper using Maven...")
+        
+        try:
+            # Change to output directory and run Maven wrapper command
+            original_cwd = os.getcwd()
+            os.chdir(output_dir)
+            
+            # Run Maven wrapper generation command
+            result = subprocess.run(
+                ['mvn', '-N', 'wrapper:wrapper'],
+                capture_output=True,
+                text=True,
+                timeout=60
+            )
+            
+            if result.returncode == 0:
+                logger.info("[MAVEN] Maven wrapper generated successfully")
+                
+                # List the generated wrapper files
+                wrapper_files = []
+                if (output_dir / 'mvnw').exists():
+                    wrapper_files.append(output_dir / 'mvnw')
+                if (output_dir / 'mvnw.cmd').exists():
+                    wrapper_files.append(output_dir / 'mvnw.cmd')
+                if (output_dir / '.mvn').exists():
+                    for file in (output_dir / '.mvn').rglob('*'):
+                        if file.is_file():
+                            wrapper_files.append(file)
+                
+                files_created.extend(wrapper_files)
+                
+                # ✅ STEP 4: Track generation for Maven-generated wrapper files
+                for file_path in wrapper_files:
+                    if file_path.name == 'mvnw':
+                        self.track_file(
+                            file_path=file_path,
+                            template_ids=[],
+                            content=file_path.read_text(),
+                            metadata={'wrapper_type': 'maven_generated_unix'}
+                        )
+                    elif file_path.name == 'mvnw.cmd':
+                        self.track_file(
+                            file_path=file_path,
+                            template_ids=[],
+                            content=file_path.read_text(),
+                            metadata={'wrapper_type': 'maven_generated_windows'}
+                        )
+                    elif 'maven-wrapper' in str(file_path):
+                        if file_path.name == 'maven-wrapper.properties':
+                            self.track_file(
+                                file_path=file_path,
+                                template_ids=[],
+                                content=file_path.read_text(),
+                                metadata={'wrapper_type': 'maven_generated_properties'}
+                            )
+                        elif file_path.name == 'maven-wrapper.jar':
+                            self.track_file(
+                                file_path=file_path,
+                                template_ids=[],
+                                content='<binary-jar-file>',
+                                metadata={'wrapper_type': 'maven_generated_jar'}
+                            )
+                
+            else:
+                logger.warning(f"[MAVEN] Failed to generate wrapper: {result.stderr}")
+                logger.info("[MAVEN] Falling back to basic wrapper structure...")
+                files_created = self._create_basic_maven_wrapper(output_dir)
+                
+        except subprocess.TimeoutExpired:
+            logger.warning("[MAVEN] Maven wrapper generation timed out. Creating basic wrapper...")
+            files_created = self._create_basic_maven_wrapper(output_dir)
+            
+        except Exception as e:
+            logger.warning(f"[MAVEN] Error generating wrapper: {e}")
+            files_created = self._create_basic_maven_wrapper(output_dir)
+            
+        finally:
+            os.chdir(original_cwd)
+        
+        return files_created
+    
+    def _create_basic_maven_wrapper(self, output_dir: Path) -> List[Path]:
+        """Create complete Maven wrapper files with cross-platform support"""
+        import urllib.request
+        import platform
+        
+        files_created = []
+        
+        # Create .mvn directory
+        mvn_dir = output_dir / '.mvn' / 'wrapper'
+        mvn_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Maven wrapper properties
+        wrapper_props = mvn_dir / 'maven-wrapper.properties'
+        wrapper_props.write_text('''distributionUrl=https://repo.maven.apache.org/maven2/org/apache/maven/apache-maven/3.8.6/apache-maven-3.8.6-bin.zip
+wrapperUrl=https://repo.maven.apache.org/maven2/org/apache/maven/wrapper/maven-wrapper/3.1.0/maven-wrapper-3.1.0.jar
+''')
+        files_created.append(wrapper_props)
+        
+        # Download Maven wrapper JAR
+        wrapper_jar_url = "https://repo.maven.apache.org/maven2/org/apache/maven/wrapper/maven-wrapper/3.1.0/maven-wrapper-3.1.0.jar"
+        wrapper_jar = mvn_dir / 'maven-wrapper.jar'
+        
+        try:
+            logger.info(f"[MAVEN] Downloading Maven wrapper JAR...")
+            urllib.request.urlretrieve(wrapper_jar_url, wrapper_jar)
+            logger.info(f"[MAVEN] Downloaded Maven wrapper JAR")
+            files_created.append(wrapper_jar)
+        except Exception as e:
+            logger.warning(f"[MAVEN] ⚠️  Failed to download Maven wrapper JAR: {e}")
+            logger.info(f"[MAVEN] Creating placeholder - manual Maven installation may be required")
+        
+        # Maven wrapper script for Unix/Linux/MacOS (mvnw)
+        mvnw_script = output_dir / 'mvnw'
+        mvnw_script.write_text(self._get_unix_mvnw_script())
+        
+        # Make executable on Unix systems
+        if platform.system() != 'Windows':
+            mvnw_script.chmod(0o755)
+        files_created.append(mvnw_script)
+        
+        # Maven wrapper batch file for Windows (mvnw.cmd)
+        mvnw_cmd = output_dir / 'mvnw.cmd'
+        mvnw_cmd.write_text(self._get_windows_mvnw_script())
+        files_created.append(mvnw_cmd)
+        
+        logger.info(f"[MAVEN] Created cross-platform Maven wrapper")
+        
+        # ✅ STEP 4: Track generation for wrapper files
+        for file_path in files_created:
+            if file_path.name == 'maven-wrapper.properties':
+                self.track_file(
+                    file_path=file_path,
+                    template_ids=[],
+                    content=file_path.read_text(),
+                    metadata={'wrapper_type': 'properties'}
+                )
+            elif file_path.name == 'maven-wrapper.jar':
+                self.track_file(
+                    file_path=file_path,
+                    template_ids=[],
+                    content='<binary-jar-file>',
+                    metadata={'wrapper_type': 'jar'}
+                )
+            elif file_path.name == 'mvnw':
+                self.track_file(
+                    file_path=file_path,
+                    template_ids=[],
+                    content=file_path.read_text(),
+                    metadata={'wrapper_type': 'unix_script'}
+                )
+            elif file_path.name == 'mvnw.cmd':
+                self.track_file(
+                    file_path=file_path,
+                    template_ids=[],
+                    content=file_path.read_text(),
+                    metadata={'wrapper_type': 'windows_script'}
+                )
+        
+        return files_created
+    
+    def _get_unix_mvnw_script(self) -> str:
+        """Get Unix/Linux/MacOS Maven wrapper script"""
+        return '''#!/bin/sh
+# ----------------------------------------------------------------------------
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#    https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+# ----------------------------------------------------------------------------
+
+# ----------------------------------------------------------------------------
+# Maven Start Up Batch script
+#
+# Required ENV vars:
+# ------------------
+#   JAVA_HOME - location of a JDK home dir
+#
+# Optional ENV vars
+# -----------------
+#   M2_HOME - location of maven2's installed home dir
+#   MAVEN_OPTS - parameters passed to the Java VM when running Maven
+#     e.g. to debug Maven itself, use
+#       set MAVEN_OPTS=-Xdebug -Xrunjdwp:transport=dt_socket,server=y,suspend=y,address=8000
+#   MAVEN_SKIP_RC - flag to disable loading of mavenrc files
+# ----------------------------------------------------------------------------
+
+if [ -z "$MAVEN_SKIP_RC" ] ; then
+
+  if [ -f /etc/mavenrc ] ; then
+    . /etc/mavenrc
+  fi
+
+  if [ -f "$HOME/.mavenrc" ] ; then
+    . "$HOME/.mavenrc"
+  fi
+
+fi
+
+# OS specific support.  $var _must_ be set to either true or false.
+cygwin=false;
+darwin=false;
+mingw=false
+case "`uname`" in
+  CYGWIN*) cygwin=true ;;
+  MINGW*) mingw=true;;
+  Darwin*) darwin=true
+    # Use /usr/libexec/java_home if available, otherwise fall back to /Library/Java/Home
+    # See https://developer.apple.com/library/mac/qa/qa1170/_index.html
+    if [ -z "$JAVA_HOME" ]; then
+      if [ -x "/usr/libexec/java_home" ]; then
+        export JAVA_HOME="`/usr/libexec/java_home`"
+      else
+        export JAVA_HOME="/Library/Java/Home"
+      fi
+    fi
+    ;;
+esac
+
+if [ -z "$JAVA_HOME" ] ; then
+  if [ -r /etc/gentoo-release ] ; then
+    JAVA_HOME=`java-config --jre-home`
+  fi
+fi
+
+if [ -z "$M2_HOME" ] ; then
+  ## resolve links - $0 may be a link to maven's home
+  PRG="$0"
+
+  # need this for relative symlinks
+  while [ -h "$PRG" ] ; do
+    ls=`ls -ld "$PRG"`
+    link=`expr "$ls" : '.*-> \\(.*\\)$'`
+    if expr "$link" : '/.*' > /dev/null; then
+      PRG="$link"
+    else
+      PRG="`dirname "$PRG"`/$link"
+    fi
+  done
+
+  saveddir=`pwd`
+
+  M2_HOME=`dirname "$PRG"`/..
+
+  # make it fully qualified
+  M2_HOME=`cd "$M2_HOME" && pwd`
+
+  cd "$saveddir"
+  # echo Using m2 at $M2_HOME
+fi
+
+# For Cygwin, ensure paths are in UNIX format before anything is touched
+if $cygwin ; then
+  [ -n "$M2_HOME" ] &&
+    M2_HOME=`cygpath --unix "$M2_HOME"`
+  [ -n "$JAVA_HOME" ] &&
+    JAVA_HOME=`cygpath --unix "$JAVA_HOME"`
+  [ -n "$CLASSPATH" ] &&
+    CLASSPATH=`cygpath --path --unix "$CLASSPATH"`
+fi
+
+# For Mingw, ensure paths are in UNIX format before anything is touched
+if $mingw ; then
+  [ -n "$M2_HOME" ] &&
+    M2_HOME="`(cd "$M2_HOME"; pwd)`"
+  [ -n "$JAVA_HOME" ] &&
+    JAVA_HOME="`(cd "$JAVA_HOME"; pwd)`"
+fi
+
+if [ -z "$JAVA_HOME" ]; then
+  javaExecutable="`which javac`"
+  if [ -n "$javaExecutable" ] && ! [ "`expr \\"$javaExecutable\\" : '\\([^ ]*\\)'`" = "no" ]; then
+    # readlink(1) is not available as standard on Solaris 10.
+    readLink=`which readlink`
+    if [ ! `expr "$readLink" : '\\([^ ]*\\)'` = "no" ]; then
+      if $darwin ; then
+        javaHome="`dirname \\"$javaExecutable\\"`"
+        javaExecutable="`cd \\"$javaHome\\" && pwd -P`/javac"
+      else
+        javaExecutable="`readlink -f \\"$javaExecutable\\"`"
+      fi
+      javaHome="`dirname \\"$javaExecutable\\"`"
+      javaHome=`expr "$javaHome" : '\\(.*\\)/bin'`
+      JAVA_HOME="$javaHome"
+      export JAVA_HOME
+    fi
+  fi
+fi
+
+if [ -z "$JAVACMD" ] ; then
+  if [ -n "$JAVA_HOME"  ] ; then
+    if [ -x "$JAVA_HOME/jre/sh/java" ] ; then
+      # IBM's JDK on AIX uses strange locations for the executables
+      JAVACMD="$JAVA_HOME/jre/sh/java"
+    else
+      JAVACMD="$JAVA_HOME/bin/java"
+    fi
+  else
+    JAVACMD="`which java`"
+  fi
+fi
+
+if [ ! -x "$JAVACMD" ] ; then
+  echo "Error: JAVA_HOME is not defined correctly." >&2
+  echo "  We cannot execute $JAVACMD" >&2
+  exit 1
+fi
+
+if [ -z "$JAVA_HOME" ] ; then
+  echo "Warning: JAVA_HOME environment variable is not set."
+fi
+
+CLASSWORLDS_LAUNCHER=org.codehaus.plexus.classworlds.launcher.Launcher
+
+# traverses directory structure from process work directory to filesystem root
+# first directory with .mvn subdirectory is considered project base directory
+find_maven_basedir() {
+
+  if [ -z "$1" ]
+  then
+    echo "Path not specified to find_maven_basedir"
+    return 1
+  fi
+
+  basedir="$1"
+  wdir="$1"
+  while [ "$wdir" != '/' ] ; do
+    if [ -d "$wdir"/.mvn ] ; then
+      basedir=$wdir
+      break
+    fi
+    # workaround for JBEAP-8937 (on Solaris 10/Sparc)
+    if [ -d "${wdir}" ]; then
+      wdir=`cd "$wdir/.."; pwd`
+    fi
+    # end of workaround
+  done
+  echo "${basedir}"
+}
+
+# concatenates all lines of a file
+concat_lines() {
+  if [ -f "$1" ]; then
+    echo "$(tr -s '\\n' ' ' < "$1")"
+  fi
+}
+
+BASE_DIR=`find_maven_basedir "$(pwd)"`
+if [ -z "$BASE_DIR" ]; then
+  exit 1;
+fi
+
+##########################################################################################
+# Extension to allow automatically downloading the maven-wrapper.jar from Maven-central
+# This allows using the maven wrapper in projects that prohibit checking in binary data.
+##########################################################################################
+if [ -r "$BASE_DIR/.mvn/wrapper/maven-wrapper.jar" ]; then
+    if [ "$MVNW_VERBOSE" = true ]; then
+      echo "Found .mvn/wrapper/maven-wrapper.jar"
+    fi
+else
+    if [ "$MVNW_VERBOSE" = true ]; then
+      echo "Couldn't find .mvn/wrapper/maven-wrapper.jar, downloading it ..."
+    fi
+    if [ -n "$MVNW_REPOURL" ]; then
+      jarUrl="$MVNW_REPOURL/org/apache/maven/wrapper/maven-wrapper/3.1.0/maven-wrapper-3.1.0.jar"
+    else
+      jarUrl="https://repo.maven.apache.org/maven2/org/apache/maven/wrapper/maven-wrapper/3.1.0/maven-wrapper-3.1.0.jar"
+    fi
+    while IFS="=" read key value; do
+      case "$key" in (wrapperUrl) jarUrl="$value"; break ;;
+      esac
+    done < "$BASE_DIR/.mvn/wrapper/maven-wrapper.properties"
+    if [ "$MVNW_VERBOSE" = true ]; then
+      echo "Downloading from: $jarUrl"
+    fi
+    wrapperJarPath="$BASE_DIR/.mvn/wrapper/maven-wrapper.jar"
+    if $cygwin; then
+      wrapperJarPath=`cygpath --path --windows "$wrapperJarPath"`
+    fi
+
+    if command -v wget > /dev/null; then
+        if [ "$MVNW_VERBOSE" = true ]; then
+          echo "Found wget ... using wget"
+        fi
+        if [ -z "$MVNW_USERNAME" ] || [ -z "$MVNW_PASSWORD" ]; then
+            wget "$jarUrl" -O "$wrapperJarPath"
+        else
+            wget --http-user=$MVNW_USERNAME --http-password=$MVNW_PASSWORD "$jarUrl" -O "$wrapperJarPath"
+        fi
+    elif command -v curl > /dev/null; then
+        if [ "$MVNW_VERBOSE" = true ]; then
+          echo "Found curl ... using curl"
+        fi
+        if [ -z "$MVNW_USERNAME" ] || [ -z "$MVNW_PASSWORD" ]; then
+            curl -o "$wrapperJarPath" "$jarUrl" -f
+        else
+            curl --user $MVNW_USERNAME:$MVNW_PASSWORD -o "$wrapperJarPath" "$jarUrl" -f
+        fi
+    else
+        if [ "$MVNW_VERBOSE" = true ]; then
+          echo "Falling back to using Java to download"
+        fi
+        javaClass="$BASE_DIR/.mvn/wrapper/MavenWrapperDownloader.java"
+        # For Cygwin, switch paths to Windows format before running javac
+        if $cygwin; then
+          javaClass=`cygpath --path --windows "$javaClass"`
+        fi
+        if [ -e "$javaClass" ]; then
+            if [ ! -e "$BASE_DIR/.mvn/wrapper/MavenWrapperDownloader.class" ]; then
+                if [ "$MVNW_VERBOSE" = true ]; then
+                  echo " - Compiling MavenWrapperDownloader.java ..."
+                fi
+                # Compiling the Java class
+                ("$JAVACMD" "$javaClass")
+            fi
+            if [ -e "$BASE_DIR/.mvn/wrapper/MavenWrapperDownloader.class" ]; then
+                # Running the downloader
+                if [ "$MVNW_VERBOSE" = true ]; then
+                  echo " - Running MavenWrapperDownloader.java ..."
+                fi
+                ("$JAVACMD" -cp .mvn/wrapper MavenWrapperDownloader "$MAVEN_PROJECTBASEDIR")
+            fi
+        fi
+    fi
+fi
+##########################################################################################
+# End of extension
+##########################################################################################
+
+export MAVEN_PROJECTBASEDIR=$MAVEN_BASEDIR
+MAVEN_OPTS="$(concat_lines "$MAVEN_PROJECTBASEDIR/.mvn/jvm.config") $MAVEN_OPTS"
+
+# For Cygwin, switch paths to Windows format before running java
+if $cygwin; then
+  [ -n "$M2_HOME" ] &&
+    M2_HOME=`cygpath --path --windows "$M2_HOME"`
+  [ -n "$JAVA_HOME" ] &&
+    JAVA_HOME=`cygpath --path --windows "$JAVA_HOME"`
+  [ -n "$CLASSPATH" ] &&
+    CLASSPATH=`cygpath --path --windows "$CLASSPATH"`
+  [ -n "$MAVEN_PROJECTBASEDIR" ] &&
+    MAVEN_PROJECTBASEDIR=`cygpath --path --windows "$MAVEN_PROJECTBASEDIR"`
+fi
+
+# Provide a "standardized" way to retrieve the CLI args that will
+# work with both Windows and non-Windows executions.
+MAVEN_CMD_LINE_ARGS="$MAVEN_CONFIG $@"
+export MAVEN_CMD_LINE_ARGS
+
+exec "$JAVACMD" \\
+  $MAVEN_OPTS \\
+  -classpath "$MAVEN_PROJECTBASEDIR/.mvn/wrapper/maven-wrapper.jar" \\
+  "-Dmaven.home=${M2_HOME}" "-Dmaven.multiModuleProjectDirectory=${MAVEN_PROJECTBASEDIR}" \\
+  ${CLASSWORLDS_LAUNCHER} $MAVEN_CMD_LINE_ARGS
+'''
+
+    def _get_windows_mvnw_script(self) -> str:
+        """Get Windows Maven wrapper script"""
+        return '''@REM ----------------------------------------------------------------------------
+@REM Licensed to the Apache Software Foundation (ASF) under one
+@REM or more contributor license agreements.  See the NOTICE file
+@REM distributed with this work for additional information
+@REM regarding copyright ownership.  The ASF licenses this file
+@REM to you under the Apache License, Version 2.0 (the
+@REM "License"); you may not use this file except in compliance
+@REM with the License.  You may obtain a copy of the License at
+@REM
+@REM    https://www.apache.org/licenses/LICENSE-2.0
+@REM
+@REM Unless required by applicable law or agreed to in writing,
+@REM software distributed under the License is distributed on an
+@REM "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+@REM KIND, either express or implied.  See the License for the
+@REM specific language governing permissions and limitations
+@REM under the License.
+@REM ----------------------------------------------------------------------------
+
+@REM ----------------------------------------------------------------------------
+@REM Maven Start Up Batch script
+@REM
+@REM Required ENV vars:
+@REM JAVA_HOME - location of a JDK home dir
+@REM
+@REM Optional ENV vars
+@REM M2_HOME - location of maven2's installed home dir
+@REM MAVEN_BATCH_ECHO - set to 'on' to enable the echoing of the batch commands
+@REM MAVEN_BATCH_PAUSE - set to 'on' to wait for a keystroke before ending
+@REM MAVEN_OPTS - parameters passed to the Java VM when running Maven
+@REM     e.g. to debug Maven itself, use
+@REM       set MAVEN_OPTS=-Xdebug -Xrunjdwp:transport=dt_socket,server=y,suspend=y,address=8000
+@REM MAVEN_SKIP_RC - flag to disable loading of mavenrc files
+@REM ----------------------------------------------------------------------------
+
+@REM Begin all REM lines with '@' in case MAVEN_BATCH_ECHO is 'on'
+@echo off
+@REM set title of command window
+title %0
+@REM enable echoing by setting MAVEN_BATCH_ECHO to 'on'
+@if "%MAVEN_BATCH_ECHO%" == "on"  echo %MAVEN_BATCH_ECHO%
+
+@REM set %HOME% to equivalent of $HOME
+if "%HOME%" == "" (set "HOME=%HOMEDRIVE%%HOMEPATH%")
+
+@REM Execute a user defined script before this one
+if not "%MAVEN_SKIP_RC%" == "" goto skipRcPre
+@REM check for pre script, once with legacy .bat ending and once with .cmd ending
+if exist "%HOME%\\mavenrc_pre.bat" call "%HOME%\\mavenrc_pre.bat"
+if exist "%HOME%\\mavenrc_pre.cmd" call "%HOME%\\mavenrc_pre.cmd"
+:skipRcPre
+
+@setlocal
+
+set ERROR_CODE=0
+
+@REM To isolate internal variables from possible post scripts, we use another setlocal
+@setlocal
+
+@REM ==== START VALIDATION ====
+if not "%JAVA_HOME%" == "" goto OkJHome
+
+echo.
+echo Error: JAVA_HOME not found in your environment. >&2
+echo Please set the JAVA_HOME variable in your environment to match the >&2
+echo location of your Java installation. >&2
+echo.
+goto error
+
+:OkJHome
+if exist "%JAVA_HOME%\\bin\\java.exe" goto init
+
+echo.
+echo Error: JAVA_HOME is set to an invalid directory. >&2
+echo JAVA_HOME = "%JAVA_HOME%" >&2
+echo Please set the JAVA_HOME variable in your environment to match the >&2
+echo location of your Java installation. >&2
+echo.
+goto error
+
+@REM ==== END VALIDATION ====
+
+:init
+
+@REM Find the project base dir, i.e. the directory that contains the folder ".mvn".
+@REM Fallback to current working directory if not found.
+
+set MAVEN_PROJECTBASEDIR=%MAVEN_BASEDIR%
+IF NOT "%MAVEN_PROJECTBASEDIR%"=="" goto endDetectBaseDir
+
+set EXEC_DIR=%CD%
+set WDIR=%EXEC_DIR%
+:findBaseDir
+IF EXIST "%WDIR%"\\.mvn goto baseDirFound
+cd ..
+IF "%WDIR%"=="%CD%" goto baseDirNotFound
+set WDIR=%CD%
+goto findBaseDir
+
+:baseDirFound
+set MAVEN_PROJECTBASEDIR=%WDIR%
+cd "%EXEC_DIR%"
+goto endDetectBaseDir
+
+:baseDirNotFound
+set MAVEN_PROJECTBASEDIR=%EXEC_DIR%
+cd "%EXEC_DIR%"
+
+:endDetectBaseDir
+
+IF NOT EXIST "%MAVEN_PROJECTBASEDIR%\\.mvn\\jvm.config" goto endReadAdditionalConfig
+
+@setlocal EnableExtensions EnableDelayedExpansion
+for /F "usebackq delims=" %%a in ("%MAVEN_PROJECTBASEDIR%\\.mvn\\jvm.config") do set JVM_CONFIG_MAVEN_PROPS=!JVM_CONFIG_MAVEN_PROPS! %%a
+@endlocal & set JVM_CONFIG_MAVEN_PROPS=%JVM_CONFIG_MAVEN_PROPS%
+
+:endReadAdditionalConfig
+
+SET MAVEN_JAVA_EXE="%JAVA_HOME%\\bin\\java.exe"
+set WRAPPER_JAR="%MAVEN_PROJECTBASEDIR%\\.mvn\\wrapper\\maven-wrapper.jar"
+set WRAPPER_LAUNCHER=org.codehaus.plexus.classworlds.launcher.Launcher
+
+set DOWNLOAD_URL="https://repo.maven.apache.org/maven2/org/apache/maven/wrapper/maven-wrapper/3.1.0/maven-wrapper-3.1.0.jar"
+
+FOR /F "tokens=1,2 delims==" %%A IN ("%MAVEN_PROJECTBASEDIR%\\.mvn\\wrapper\\maven-wrapper.properties") DO (
+    IF "%%A"=="wrapperUrl" SET DOWNLOAD_URL=%%B
+)
+
+@REM Extension to allow automatically downloading the maven-wrapper.jar from Maven-central
+@REM This allows using the maven wrapper in projects that prohibit checking in binary data.
+if exist %WRAPPER_JAR% (
+    if "%MVNW_VERBOSE%" == "true" (
+        echo Found %WRAPPER_JAR%
+    )
+) else (
+    if not "%MVNW_REPOURL%" == "" (
+        SET DOWNLOAD_URL="%MVNW_REPOURL%/org/apache/maven/wrapper/maven-wrapper/3.1.0/maven-wrapper-3.1.0.jar"
+    )
+    if "%MVNW_VERBOSE%" == "true" (
+        echo Couldn't find %WRAPPER_JAR%, downloading it ...
+        echo Downloading from: %DOWNLOAD_URL%
+    )
+
+    powershell -Command "&{"^
+		"$webclient = new-object System.Net.WebClient;"^
+		"if (-not ([string]::IsNullOrEmpty('%MVNW_USERNAME%') -and [string]::IsNullOrEmpty('%MVNW_PASSWORD%'))) {"^
+		"$webclient.Credentials = new-object System.Net.NetworkCredential('%MVNW_USERNAME%', '%MVNW_PASSWORD%');"^
+		"}"^
+		"[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; $webclient.DownloadFile('%DOWNLOAD_URL%', '%WRAPPER_JAR%')"^
+		"}"
+    if "%MVNW_VERBOSE%" == "true" (
+        echo Finished downloading %WRAPPER_JAR%
+    )
+)
+@REM End of extension
+
+@REM Provide a "standardized" way to retrieve the CLI args that will
+@REM work with both Windows and non-Windows executions.
+set MAVEN_CMD_LINE_ARGS=%*
+
+%MAVEN_JAVA_EXE% %JVM_CONFIG_MAVEN_PROPS% %MAVEN_OPTS% %MAVEN_DEBUG_OPTS% -classpath %WRAPPER_JAR% "-Dmaven.multiModuleProjectDirectory=%MAVEN_PROJECTBASEDIR%" %WRAPPER_LAUNCHER% %MAVEN_CMD_LINE_ARGS%
+if ERRORLEVEL 1 goto error
+goto end
+
+:error
+set ERROR_CODE=1
+
+:end
+@endlocal & set ERROR_CODE=%ERROR_CODE%
+
+if not "%MAVEN_SKIP_RC%" == "" goto skipRcPost
+@REM check for post script, once with legacy .bat ending and once with .cmd ending
+if exist "%HOME%\\mavenrc_post.bat" call "%HOME%\\mavenrc_post.bat"
+if exist "%HOME%\\mavenrc_post.cmd" call "%HOME%\\mavenrc_post.cmd"
+:skipRcPost
+
+@REM pause the script if MAVEN_BATCH_PAUSE is set to 'on'
+if "%MAVEN_BATCH_PAUSE%" == "on" pause
+
+if "%MAVEN_BATCH_ECHO%" == "on" echo %MAVEN_BATCH_ECHO%
+
+@endlocal
+cmd /C exit /B %ERROR_CODE%
+'''
+    
+    # Helper methods
+    def _to_class_name(self, name: str) -> str:
+        """Convert snake_case or kebab-case to PascalCase"""
+        return ''.join(word.capitalize() for word in name.replace('-', '_').split('_'))
+    
+    def _to_camel_case(self, name: str) -> str:
+        """Convert snake_case to camelCase"""
+        words = name.replace('-', '_').split('_')
+        return words[0].lower() + ''.join(word.capitalize() for word in words[1:])
+    
+    def _get_java_type(self, field_type: str) -> str:
+        """Map field type to Java type"""
+        type_map = {
+            'INTEGER': 'Integer',
+            'int': 'Integer', 
+            'SERIAL': 'Integer',
+            'BIGSERIAL': 'Long',
+            'BIGINT': 'Long',
+            'VARCHAR': 'String',
+            'str': 'String',
+            'string': 'String',
+            'TEXT': 'String',
+            'text': 'String',
+            'BOOLEAN': 'Boolean',
+            'bool': 'Boolean',
+            'boolean': 'Boolean',
+            'TIMESTAMP': 'LocalDateTime',
+            'datetime': 'LocalDateTime',
+            'FLOAT': 'Double',
+            'float': 'Double',
+            'DOUBLE': 'Double',
+            'REAL': 'Double',
+            'DECIMAL': 'Double',
+            'NUMERIC': 'Double',
+            'JSONB': 'String',
+            'JSON': 'String',
+            'UUID': 'String',
+        }
+        return type_map.get(field_type.upper(), 'String')
+    
+    def _group_apis_by_entity(self, apis: List[Dict]) -> Dict[str, List[Dict]]:
+        """Group APIs by their entity name"""
+        grouped = {}
+        for api in apis:
+            entity = api.get('entity') or api.get('resource')
+            if entity:
+                if entity not in grouped:
+                    grouped[entity] = []
+                grouped[entity].append(api)
+        return grouped
+    
+    # Template Data Transformation Methods
+    def _transform_enums_for_java_template(self, enums: Dict) -> Dict[str, Any]:
+        """Transform enums for Java template"""
+        return {'enums': enums}
+    
+    def _transform_entity_for_jpa_template(self, entity: Dict, all_entities: List[Dict], db_config: Dict) -> Dict[str, Any]:
+        """Transform entity for JPA template"""
+        class_name = self._to_class_name(entity['table_name'])
+        fields = []
+        
+        for field in entity.get('fields', []):
+            fields.append({
+                'name': field['name'],
+                'type': field.get('type', 'VARCHAR'),
+                'length': field.get('length'),
+                'primary_key': field.get('primary_key', False),
+                'nullable': field.get('nullable', True),
+                'auto_increment': field.get('auto_increment', False)
+            })
+        
+        transformed_entity = {
+            'name': class_name,  # Use PascalCase class name
+            'table_name': entity['table_name'].lower(),
+            'fields': fields
+        }
+        
+        return {'entity': transformed_entity}
+    
+    def _transform_entity_for_dto_template(self, entity: Dict, enums: Dict) -> Dict[str, Any]:
+        """Transform entity for DTO template"""
+        entity_name = self._to_class_name(entity['table_name'])
+        fields = []
+        
+        for field in entity.get('fields', []):
+            fields.append({
+                'name': field['name'],
+                'java_type': self._get_java_type(field.get('type', 'VARCHAR')),
+                'is_primary_key': field.get('primary_key', False),
+                'auto_increment': field.get('auto_increment', False)
+            })
+        
+        return {
+            'entity_name': entity_name,
+            'fields': fields
+        }
+    
+    def _transform_entity_for_service_template(self, entity: Dict, pk_type: str) -> Dict[str, Any]:
+        """Transform entity for service template"""
+        class_name = self._to_class_name(entity['table_name'])
+        return {
+            'entity_name': class_name,  # Use PascalCase class name
+            'class_name': class_name,
+            'pk_type': pk_type,
+            'fields': entity.get('fields', [])
+        }
+    
+    def _transform_entity_for_repository_template(self, entity: Dict, pk_type: str) -> Dict[str, Any]:
+        """Transform entity for repository template"""
+        class_name = self._to_class_name(entity['table_name'])
+        return {
+            'entity_name': class_name,  # Use PascalCase class name
+            'class_name': class_name,
+            'pk_type': pk_type,
+            'fields': entity.get('fields', [])
+        }
+    
+    def update_dependency_graph(self, app_config: Dict[str, Any], output_dir: Path, entity_versions: Dict[str, str] = None) -> Dict[str, Any]:
+        """
+        Create/update dependency graph to track relationships between tables, fields, APIs, and models.
+        This graph is used for impact analysis when schema changes occur.
+        """
+        import json
+        from datetime import datetime
+        
+        # Save dependency graph to project root, not inside generated folder
+        graph_file = Path("backend_dependency_graph_java.json")
+        
+        # Load existing graph if present
+        if graph_file.exists():
+            try:
+                with open(graph_file, "r") as f:
+                    existing_graph = json.load(f)
+                print(f"[DEPENDENCY] Loaded existing Java dependency graph with {len(existing_graph.get('tables', {}))} tables")
+            except Exception as e:
+                print(f"[DEPENDENCY] Warning: Could not load existing graph: {e}. Creating new one.")
+                existing_graph = {}
+        else:
+            existing_graph = {}
+            print("[DEPENDENCY] Creating new Java dependency graph")
+        
+        # Initialize graph structure
+        graph = {
+            "metadata": {
+                "version": "1.0",
+                "last_updated": datetime.now().isoformat(),
+                "generator_version": "2.0",
+                "framework": "spring-boot",
+                "database_type": app_config.get('metadata', {}).get('database', {}).get('type', 'h2')
+            },
+            "tables": existing_graph.get('tables', {}),
+            "apis": existing_graph.get('apis', {}),
+            "models": existing_graph.get('models', {}),
+            "relationships": existing_graph.get('relationships', {}),
+            "change_history": existing_graph.get('change_history', [])
+        }
+        
+        entities = app_config.get('entities', [])
+        apis = app_config.get('apis', [])
+        
+        # Track changes for this update
+        changes_made = []
+        
+        # Update tables and fields
+        for entity in entities:
+            table_name = entity['table_name'].lower()
+            class_name = self._to_class_name(entity['table_name'])
+            
+            # Initialize table entry if not exists
+            if table_name not in graph["tables"]:
+                graph["tables"][table_name] = {
+                    "class_name": class_name,
+                    "description": entity.get('description', ''),
+                    "fields": {},
+                    "primary_keys": [],
+                    "foreign_keys": [],
+                    "indexes": [],
+                    "constraints": [],
+                    "related_apis": [],
+                    "related_models": [],
+                    "java_files": {
+                        "entity": f"src/main/java/com/example/api/models/{class_name}.java",
+                        "repository": f"src/main/java/com/example/api/repositories/{class_name}Repository.java",
+                        "service": f"src/main/java/com/example/api/services/{class_name}Service.java",
+                        "controller": f"src/main/java/com/example/api/controllers/{class_name}Controller.java",
+                        "dtos": [
+                            f"src/main/java/com/example/api/dtos/{class_name}Create.java",
+                            f"src/main/java/com/example/api/dtos/{class_name}Update.java",
+                            f"src/main/java/com/example/api/dtos/{class_name}Response.java"
+                        ]
+                    }
+                }
+                changes_made.append(f"Added new table: {table_name}")
+            
+            table_info = graph["tables"][table_name]
+            
+            # Ensure all required fields exist in table_info (for backward compatibility)
+            if "fields" not in table_info:
+                table_info["fields"] = {}
+            if "primary_keys" not in table_info:
+                table_info["primary_keys"] = []
+            if "foreign_keys" not in table_info:
+                table_info["foreign_keys"] = []
+            if "related_apis" not in table_info:
+                table_info["related_apis"] = []
+            if "related_models" not in table_info:
+                table_info["related_models"] = []
+            if "java_files" not in table_info:
+                table_info["java_files"] = {
+                    "entity": f"src/main/java/com/example/api/models/{class_name}.java",
+                    "repository": f"src/main/java/com/example/api/repositories/{class_name}Repository.java",
+                    "service": f"src/main/java/com/example/api/services/{class_name}Service.java",
+                    "controller": f"src/main/java/com/example/api/controllers/{class_name}Controller.java",
+                    "dtos": [
+                        f"src/main/java/com/example/api/dtos/{class_name}Create.java",
+                        f"src/main/java/com/example/api/dtos/{class_name}Update.java",
+                        f"src/main/java/com/example/api/dtos/{class_name}Response.java"
+                    ]
+                }
+            
+            # Update fields
+            for field in entity.get('fields', []):
+                field_name = field['name']
+                field_type = field.get('type', 'VARCHAR')
+                field_length = field.get('length')
+                
+                # Check if field exists and has changes
+                if field_name not in table_info["fields"]:
+                    changes_made.append(f"Added field {table_name}.{field_name}")
+                else:
+                    existing_field = table_info["fields"][field_name]
+                    if existing_field.get("type") != field_type:
+                        changes_made.append(f"Changed field type {table_name}.{field_name}: {existing_field.get('type')} -> {field_type}")
+                    if existing_field.get("length") != field_length and field_length is not None:
+                        changes_made.append(f"Changed field length {table_name}.{field_name}: {existing_field.get('length')} -> {field_length}")
+                
+                table_info["fields"][field_name] = {
+                    "type": field_type,
+                    "java_type": self._get_java_type(field_type),
+                    "length": field_length,
+                    "nullable": field.get('nullable', True),
+                    "primary_key": field.get('primary_key', False),
+                    "auto_increment": field.get('auto_increment', False),
+                    "unique": field.get('unique', False),
+                    "default": field.get('default'),
+                    "foreign_key": field.get('foreign_key'),
+                    "related_apis": [],
+                    "related_models": [],
+                    "impact_analysis": {
+                        "read_apis": [],
+                        "write_apis": [],
+                        "validation_models": []
+                    }
+                }
+                
+                # Track primary keys
+                if field.get('primary_key', False):
+                    # Ensure primary_keys list exists
+                    if "primary_keys" not in table_info:
+                        table_info["primary_keys"] = []
+                    if field_name not in table_info["primary_keys"]:
+                        table_info["primary_keys"].append(field_name)
+                
+                # Track foreign keys
+                if field.get('foreign_key'):
+                    # Ensure foreign_keys list exists
+                    if "foreign_keys" not in table_info:
+                        table_info["foreign_keys"] = []
+                    fk_info = {
+                        "field": field_name,
+                        "references": field['foreign_key']
+                    }
+                    if fk_info not in table_info["foreign_keys"]:
+                        table_info["foreign_keys"].append(fk_info)
+        
+        # Update models information (Java Spring Boot specific)
+        for entity in entities:
+            table_name = entity['table_name'].lower()
+            class_name = self._to_class_name(entity['table_name'])
+            
+            # Java Spring Boot models
+            java_models = {
+                f"{class_name}": {
+                    "type": "jpa_entity",
+                    "description": f"JPA Entity for {class_name}",
+                    "table": table_name,
+                    "fields": [f['name'] for f in entity.get('fields', [])],
+                    "usage": "Database mapping, JPA operations",
+                    "annotations": ["@Entity", "@Table", "@Id", "@GeneratedValue"]
+                },
+                f"{class_name}Create": {
+                    "type": "dto_request",
+                    "description": f"DTO for creating new {class_name}",
+                    "table": table_name,
+                    "fields": [f['name'] for f in entity.get('fields', []) 
+                          if not (f.get('primary_key', False) and f.get('auto_increment', False))],
+                    "usage": "POST requests, create operations",
+                    "validation": ["@Valid", "@NotNull", "@NotBlank"]
+                },
+                f"{class_name}Update": {
+                    "type": "dto_request",
+                    "description": f"DTO for updating {class_name}",
+                    "table": table_name,
+                    "fields": [f['name'] for f in entity.get('fields', []) 
+                          if not (f.get('primary_key', False) and f.get('auto_increment', False))],
+                    "usage": "PUT/PATCH requests, update operations",
+                    "validation": ["@Valid"]
+                },
+                f"{class_name}Response": {
+                    "type": "dto_response",
+                    "description": f"DTO for {class_name} responses",
+                    "table": table_name,
+                    "fields": [f['name'] for f in entity.get('fields', [])],
+                    "usage": "REST API responses",
+                    "serialization": ["Jackson", "JSON"]
+                }
+            }
+            
+            for model_name, model_info in java_models.items():
+                if model_name not in graph["models"]:
+                    changes_made.append(f"Added Java model: {model_name}")
+                graph["models"][model_name] = model_info
+        
+        # Update APIs and link to tables/models (Spring Boot REST endpoints)
+        api_groups = self._group_apis_by_entity(apis)
+        
+        for entity_name, entity_apis in api_groups.items():
+            table_name = entity_name.lower()
+            class_name = self._to_class_name(entity_name)
+            
+            # Find primary key field for this entity
+            entity_obj = next((e for e in entities if e['table_name'].lower() == entity_name.lower()), None)
+            pk_field = 'id'
+            if entity_obj:
+                pk_f = next((f for f in entity_obj.get('fields', []) if f.get('primary_key')), None)
+                if pk_f:
+                    pk_field = pk_f['name']
+            
+            # Get entity-specific version for this entity
+            if entity_versions is None:
+                entity_versions = {}
+            entity_version = self._get_entity_version(entity_name, entity_versions)
+            
+            # Generate standard CRUD endpoints for Spring Boot with entity-specific API versioning
+            crud_apis = [
+                {
+                    "method": "POST", 
+                    "path": f"/api/{entity_version}/{table_name}",
+                    "operation": "create",
+                    "request_model": f"{class_name}Create",
+                    "response_model": class_name,
+                    "description": f"Create a new {class_name}",
+                    "controller_method": f"create{class_name}",
+                    "service_method": f"create",
+                    "http_status": "201 CREATED"
+                },
+                {
+                    "method": "GET", 
+                    "path": f"/api/{entity_version}/{table_name}",
+                    "operation": "read_all",
+                    "request_model": None,
+                    "response_model": f"List<{class_name}>",
+                    "description": f"Get all {class_name} records",
+                    "controller_method": f"getAll{class_name}s",
+                    "service_method": f"getAll",
+                    "http_status": "200 OK"
+                },
+                {
+                    "method": "GET", 
+                    "path": f"/api/{entity_version}/{table_name}/{{{pk_field}}}",
+                    "operation": "read_one",
+                    "request_model": None,
+                    "response_model": class_name,
+                    "description": f"Get a specific {class_name} by {pk_field}",
+                    "controller_method": f"get{class_name}ById",
+                    "service_method": f"getById",
+                    "http_status": "200 OK"
+                },
+                {
+                    "method": "PUT", 
+                    "path": f"/api/{entity_version}/{table_name}/{{{pk_field}}}",
+                    "operation": "update",
+                    "request_model": f"{class_name}Update",
+                    "response_model": class_name,
+                    "description": f"Update a {class_name}",
+                    "controller_method": f"update{class_name}",
+                    "service_method": f"update",
+                    "http_status": "200 OK"
+                },
+                {
+                    "method": "DELETE", 
+                    "path": f"/api/{entity_version}/{table_name}/{{{pk_field}}}",
+                    "operation": "delete",
+                    "request_model": None,
+                    "response_model": "boolean",
+                    "description": f"Delete a {class_name}",
+                    "controller_method": f"delete{class_name}",
+                    "service_method": f"delete",
+                    "http_status": "204 NO CONTENT"
+                }
+            ]
+            
+            # Add any custom APIs from config (only if they have valid paths) with versioning
+            for api in entity_apis:
+                api_endpoint = api.get('endpoint', '').strip()
+                api_method = api.get('method', 'GET').strip()
+                if api_endpoint and api_method:  # Only add if endpoint and method are not empty
+                    # Ensure custom API endpoints also use entity-specific versioning
+                    versioned_endpoint = api_endpoint
+                    if not versioned_endpoint.startswith(f'/api/{entity_version}/'):
+                        if versioned_endpoint.startswith('/api/'):
+                            versioned_endpoint = versioned_endpoint.replace('/api/', f'/api/{entity_version}/', 1)
+                        else:
+                            versioned_endpoint = f'/api/{entity_version}{versioned_endpoint}'
+                    
+                    custom_api = {
+                        "method": api_method,
+                        "path": versioned_endpoint,
+                        "operation": api.get('operation', 'custom'),
+                        "request_model": api.get('request_body'),
+                        "response_model": api.get('response_type'),
+                        "description": api.get('description', ''),
+                        "controller_method": f"custom_{api.get('id', 'unknown')}",
+                        "service_method": "custom",
+                        "http_status": "200 OK"
+                    }
+                    crud_apis.append(custom_api)
+            
+            # Update graph with API information
+            for api in crud_apis:
+                # Only process APIs with valid paths
+                if not api['path'].strip():
+                    continue
+                    
+                api_key = f"{api['method']} {api['path']}"
+                
+                # Skip if this creates an invalid API key
+                if api_key.strip().endswith(' ') or len(api_key.strip()) < 5:
+                    continue
+                
+                if api_key not in graph["apis"]:
+                    changes_made.append(f"Added Spring Boot API: {api_key}")
+                
+                graph["apis"][api_key] = {
+                    "method": api['method'],
+                    "path": api['path'],
+                    "operation": api['operation'],
+                    "table": table_name,
+                    "request_model": api['request_model'],
+                    "response_model": api['response_model'],
+                    "description": api['description'],
+                    "controller_method": api.get('controller_method'),
+                    "service_method": api.get('service_method'),
+                    "http_status": api.get('http_status'),
+                    "fields_read": [],
+                    "fields_written": [],
+                    "impact_analysis": {
+                        "affected_by_field_changes": [],
+                        "affected_by_type_changes": [],
+                        "validation_dependencies": []
+                    }
+                }
+                
+                # Link fields to APIs based on operation type
+                if table_name in graph["tables"] and api_key.strip() and not api_key.strip().endswith(' '):
+                    table_fields = list(graph["tables"][table_name]["fields"].keys())
+                    
+                    if api['operation'] in ['create', 'update']:
+                        # Write operations affect all non-auto fields
+                        write_fields = [f for f in table_fields 
+                                      if not (graph["tables"][table_name]["fields"][f].get("auto_increment", False) and 
+                                             graph["tables"][table_name]["fields"][f].get("primary_key", False))]
+                        graph["apis"][api_key]["fields_written"] = write_fields
+                        
+                        # Update field impact analysis
+                        for field_name in write_fields:
+                            field_info = graph["tables"][table_name]["fields"][field_name]
+                            if api_key not in field_info["impact_analysis"]["write_apis"]:
+                                field_info["impact_analysis"]["write_apis"].append(api_key)
+                    
+                    if api['operation'] in ['read_all', 'read_one', 'update']:
+                        # Read operations affect all fields
+                        graph["apis"][api_key]["fields_read"] = table_fields
+                        
+                        # Update field impact analysis
+                        for field_name in table_fields:
+                            field_info = graph["tables"][table_name]["fields"][field_name]
+                            if api_key not in field_info["impact_analysis"]["read_apis"]:
+                                field_info["impact_analysis"]["read_apis"].append(api_key)
+                
+                # Link to table
+                if table_name in graph["tables"] and api_key.strip() and not api_key.strip().endswith(' '):
+                    # Ensure related_apis list exists
+                    if "related_apis" not in graph["tables"][table_name]:
+                        graph["tables"][table_name]["related_apis"] = []
+                    if api_key not in graph["tables"][table_name]["related_apis"]:
+                        graph["tables"][table_name]["related_apis"].append(api_key)
+        
+        # Build relationships between tables (based on foreign keys)
+        for table_name, table_info in graph["tables"].items():
+            for fk in table_info["foreign_keys"]:
+                ref_table = fk["references"].get("table") if isinstance(fk["references"], dict) else None
+                if ref_table and ref_table in graph["tables"]:
+                    relationship_key = f"{table_name}->{ref_table}"
+                    graph["relationships"][relationship_key] = {
+                        "type": "foreign_key",
+                        "from_table": table_name,
+                        "to_table": ref_table,
+                        "from_field": fk["field"],
+                        "to_field": fk["references"].get("field", "id") if isinstance(fk["references"], dict) else "id",
+                        "cascade_impact": True,
+                        "jpa_annotation": "@ManyToOne, @JoinColumn"
+                    }
+        
+        # Clean up invalid API entries and field references
+        self._cleanup_invalid_apis(graph)
+        
+        # Record changes in history
+        if changes_made:
+            change_entry = {
+                "timestamp": datetime.now().isoformat(),
+                "changes": changes_made,
+                "entities_count": len(entities),
+                "apis_count": len(graph["apis"]),
+                "tables_count": len(graph["tables"]),
+                "framework": "spring-boot"
+            }
+            graph["change_history"].append(change_entry)
+        
+        # Save updated graph
+        try:
+            with open(graph_file, "w") as f:
+                json.dump(graph, f, indent=2)
+            print(f"[DEPENDENCY] Updated Java dependency graph: {graph_file}")
+            print(f"[DEPENDENCY] Changes made: {len(changes_made)}")
+            if changes_made:
+                for change in changes_made[:5]:  # Show first 5 changes
+                    print(f"[DEPENDENCY]   - {change}")
+                if len(changes_made) > 5:
+                    print(f"[DEPENDENCY]   ... and {len(changes_made) - 5} more changes")
+        except Exception as e:
+            print(f"[DEPENDENCY] Error saving Java dependency graph: {e}")
+        
+        return {
+            "graph_file": str(graph_file),
+            "tables_tracked": len(graph["tables"]),
+            "apis_tracked": len(graph["apis"]),
+            "models_tracked": len(graph["models"]),
+            "relationships_tracked": len(graph["relationships"]),
+            "changes_made": len(changes_made)
+        }
+    
+    def _cleanup_invalid_apis(self, graph: Dict[str, Any]):
+        """Remove invalid API entries from the graph"""
+        invalid_api_keys = []
+        
+        for api_key in graph["apis"].keys():
+            # Check for invalid API keys (empty, malformed, etc.)
+            if (not api_key.strip() or 
+                api_key.strip().endswith(' ') or 
+                len(api_key.strip()) < 5 or
+                ' /' not in api_key):
+                invalid_api_keys.append(api_key)
+        
+        # Remove invalid APIs
+        for api_key in invalid_api_keys:
+            del graph["apis"][api_key]
+            
+            # Remove references from tables
+            for table_info in graph["tables"].values():
+                if api_key in table_info.get("related_apis", []):
+                    table_info["related_apis"].remove(api_key)
+                
+                # Remove from field impact analysis
+                for field_info in table_info.get("fields", {}).values():
+                    impact = field_info.get("impact_analysis", {})
+                    if api_key in impact.get("read_apis", []):
+                        impact["read_apis"].remove(api_key)
+                    if api_key in impact.get("write_apis", []):
+                        impact["write_apis"].remove(api_key)
+    
+    def analyze_field_impact(self, output_dir: Path, table_name: str, field_name: str, change_type: str = "modify") -> Dict[str, Any]:
+        """
+        Analyze the impact of changing a specific field in a table.
+        
+        Args:
+            output_dir: Directory containing the dependency graph
+            table_name: Name of the table
+            field_name: Name of the field being changed
+            change_type: Type of change ('add', 'modify', 'delete')
+        
+        Returns:
+            Impact analysis results
+        """
+        import json
+        
+        # Look for dependency graph in project root
+        graph_file = Path("backend_dependency_graph_java.json")
+        if not graph_file.exists():
+            return {
+                "error": "Java dependency graph not found. Generate backend first.",
+                "graph_file": str(graph_file)
+            }
+        
+        try:
+            with open(graph_file, "r") as f:
+                graph = json.load(f)
+        except Exception as e:
+            return {
+                "error": f"Could not load Java dependency graph: {e}",
+                "graph_file": str(graph_file)
+            }
+        
+        # Check if table exists in graph
+        if table_name not in graph.get("tables", {}):
+            return {
+                "error": f"Table '{table_name}' not found in Java dependency graph",
+                "available_tables": list(graph.get("tables", {}).keys())
+            }
+        
+        table_info = graph["tables"][table_name]
+        
+        # Check if field exists
+        if field_name not in table_info.get("fields", {}):
+            return {
+                "error": f"Field '{field_name}' not found in table '{table_name}'",
+                "available_fields": list(table_info.get("fields", {}).keys())
+            }
+        
+        field_info = table_info["fields"][field_name]
+        
+        # Collect impact information
+        impact_result = {
+            "table_name": table_name,
+            "field_name": field_name,
+            "change_type": change_type,
+            "field_info": field_info,
+            "impact_summary": {
+                "apis_affected": len(field_info.get("impact_analysis", {}).get("read_apis", [])) + 
+                               len(field_info.get("impact_analysis", {}).get("write_apis", [])),
+                "read_operations": len(field_info.get("impact_analysis", {}).get("read_apis", [])),
+                "write_operations": len(field_info.get("impact_analysis", {}).get("write_apis", [])),
+                "models_affected": []
+            },
+            "detailed_impact": {
+                "read_apis": field_info.get("impact_analysis", {}).get("read_apis", []),
+                "write_apis": field_info.get("impact_analysis", {}).get("write_apis", []),
+                "affected_files": [],
+                "required_updates": []
+            }
+        }
+        
+        # Determine affected Java files
+        class_name = self._to_class_name(table_name)
+        java_files = table_info.get("java_files", {})
+        
+        if change_type in ["add", "modify"]:
+            impact_result["detailed_impact"]["affected_files"] = [
+                java_files.get("entity", ""),
+                java_files.get("repository", ""),
+                java_files.get("service", ""),
+                java_files.get("controller", "")
+            ] + java_files.get("dtos", [])
+            
+            impact_result["detailed_impact"]["required_updates"] = [
+                f"Update JPA Entity: {class_name}.java",
+                f"Update DTOs: {class_name}Create.java, {class_name}Update.java",
+                f"Verify Repository: {class_name}Repository.java",
+                f"Test Service methods: {class_name}Service.java",
+                f"Test Controller endpoints: {class_name}Controller.java",
+                "Run database migration if needed",
+                "Update API documentation",
+                "Run integration tests"
+            ]
+        
+        elif change_type == "delete":
+            impact_result["detailed_impact"]["required_updates"] = [
+                f"Remove field from JPA Entity: {class_name}.java",
+                f"Remove field from DTOs: {class_name}Create.java, {class_name}Update.java",
+                f"Update validation in Service: {class_name}Service.java", 
+                f"Update API responses in Controller: {class_name}Controller.java",
+                "Create database migration to drop column",
+                "Update API documentation",
+                "Update affected unit tests"
+            ]
+        
+        # Check for models that use this field
+        models = graph.get("models", {})
+        for model_name, model_info in models.items():
+            if (model_info.get("table") == table_name and 
+                field_name in model_info.get("fields", [])):
+                impact_result["impact_summary"]["models_affected"].append(model_name)
+        
+        return impact_result
+    
+    @staticmethod
+    def _are_types_equivalent_static(db_type: str, config_type: str) -> bool:
+        """
+        Static method to check if database type and config type are equivalent
+        """
+        # Normalize types to uppercase for comparison
+        db_type = db_type.upper().strip()
+        config_type = config_type.upper().strip()
+        
+        # Direct match
+        if db_type == config_type:
+            return True
+        
+        # PostgreSQL specific type normalization
+        postgresql_type_mapping = {
+            'CHARACTER VARYING': 'VARCHAR',
+            'TIMESTAMP WITHOUT TIME ZONE': 'TIMESTAMP',
+            'TIMESTAMP WITH TIME ZONE': 'TIMESTAMP',
+            'DOUBLE PRECISION': 'DOUBLE',
+            'BIGSERIAL': 'SERIAL',
+            'SMALLSERIAL': 'SERIAL'
+        }
+        
+        # Normalize PostgreSQL types
+        db_type = postgresql_type_mapping.get(db_type, db_type)
+        config_type = postgresql_type_mapping.get(config_type, config_type)
+        
+        # Check again after normalization
+        if db_type == config_type:
+            return True
+        
+        # Define equivalent type groups
+        equivalent_groups = [
+            # String types (including UUID since UUID is stored as VARCHAR/string)
+            {'VARCHAR', 'TEXT', 'CHAR', 'CHARACTER', 'STRING', 'STR', 'CHARACTER VARYING', 'UUID', 'UNIQUEIDENTIFIER', 'GUID'},
+            # Integer types (including SERIAL since SERIAL creates INTEGER with auto-increment)
+            {'INTEGER', 'INT', 'BIGINT', 'SMALLINT', 'TINYINT', 'SERIAL', 'BIGSERIAL', 'SMALLSERIAL'},
+            # Auto-increment/Identity types
+            {'SERIAL', 'BIGSERIAL', 'SMALLSERIAL', 'AUTO_INCREMENT', 'IDENTITY', 'INTEGER'},
+            # Decimal/Numeric types
+            {'DECIMAL', 'NUMERIC', 'NUMBER', 'REAL', 'DOUBLE', 'FLOAT', 'DOUBLE PRECISION'},
+            # Boolean types
+            {'BOOLEAN', 'BOOL', 'BIT'},
+            # Date/Time types
+            {'TIMESTAMP', 'DATETIME', 'DATE', 'TIME', 'TIMESTAMP WITHOUT TIME ZONE', 'TIMESTAMP WITH TIME ZONE'},
+            # JSON types (including VARCHAR since JSON can be stored as text)
+            {'JSON', 'JSONB', 'VARCHAR', 'TEXT', 'CHARACTER VARYING'}
+        ]
+        
+        # Check if both types belong to the same equivalent group
+        for group in equivalent_groups:
+            if db_type in group and config_type in group:
+                return True
+        
+        return False
+
+
+def create_backup_of_generated_code(output_dir: Path) -> str:
+    """
+    Create a backup of the generated Java backend code inside the Generated folder.
+    Only backs up files created by this specific program.
+    This is the very last step and should not impact any other logic.
+    
+    Args:
+        output_dir: Path to the generated Java backend code directory
+        
+    Returns:
+        Path to the backup directory if successful, None if failed
+    """
+    try:
+        # Create backup inside the Generated folder
+        generated_root = output_dir.parent if output_dir.parent.name == "Generated" else output_dir.parent.parent
+        if generated_root.name != "Generated":
+            # If we can't find Generated parent, create backup inside output_dir
+            backup_path = output_dir / "backup"
+        else:
+            backup_path = generated_root / "backup"
+        
+        backup_path.mkdir(parents=True, exist_ok=True)
+        
+        # Only backup files created by this program (backend_java folder contents)
+        if output_dir.exists():
+            # Copy only the Java backend files generated by this program
+            for item in output_dir.iterdir():
+                # Skip the backup folder itself to avoid infinite recursion
+                if item.name == "backup":
+                    continue
+                if item.is_file():
+                    shutil.copy2(item, backup_path / item.name)
+                elif item.is_dir():
+                    shutil.copytree(item, backup_path / item.name, dirs_exist_ok=True)
+            
+            # Create a metadata file in the backup
+            metadata_file = backup_path / "backup_metadata.txt"
+            metadata_content = f"""Java Spring Boot Backend Code Backup
+=====================================
+Backup Created: {datetime.now().isoformat()}
+Original Path: {output_dir.resolve()}
+Backup Path: {backup_path.resolve()}
+Generator: step_4_java_backend_generator.py
+Framework: Spring Boot 2.7.18
+
+Contents:
+- Spring Boot Java application structure
+- JPA entity models and DTOs
+- Spring Data repositories 
+- Service layer classes
+- REST API controllers with full CRUD
+- Maven configuration (pom.xml)
+- Application properties and database config
+- Maven wrapper for cross-platform builds
+
+Note: This backup contains only files created by the Java backend generator.
+"""
+            metadata_file.write_text(metadata_content)
+            
+            logger.info(f"[BACKUP] Successfully created Java backend code backup at: {backup_path}")
+            return str(backup_path)
+            
+        else:
+            logger.warning(f"[BACKUP] Source directory does not exist: {output_dir}")
+            return None
+            
+    except Exception as e:
+        logger.error(f"[BACKUP] Failed to create Java backend backup: {e}")
+        return None
+
+
+def print_usage_instructions():
+    """Print comprehensive usage and testing instructions"""
+    print("\n" + "="*80)
+    print("JAVA SPRING BOOT BACKEND GENERATED SUCCESSFULLY!")
+    print("="*80)
+    
+    print("\n NEXT STEPS:")
+    print("-" * 40)
+    print("1. Navigate to the generated project:")
+    print("   cd Generated/backend_java")
+    
+    print("\n2. Build the application (cross-platform):")
+    print("   ./mvnw clean install    # Linux/macOS")
+    print("   mvnw.cmd clean install  # Windows")
+    print("   # Note: Maven wrapper is automatically generated with JAR download")
+    
+    print("\n3. Run the application:")
+    print("   java -jar target/generated-api-0.0.1-SNAPSHOT.jar")
+    print("   # OR for development mode:")
+    print("   ./mvnw spring-boot:run    # Linux/macOS")
+    print("   mvnw.cmd spring-boot:run  # Windows")
+    
+    print("\n TESTING YOUR APPLICATION:")
+    print("-" * 40)
+    print("• Application URL: http://localhost:8000")
+    print("• Health Check: http://localhost:8000/actuator/health")
+    print("• H2 Console: http://localhost:8000/h2-console (if using H2)")
+    
+    print("\n API ENDPOINTS:")
+    print("-" * 40)
+    print("Each entity has full CRUD operations:")
+    print("• GET    /api/{entity}       - List all items")
+    print("• POST   /api/{entity}       - Create new item") 
+    print("• GET    /api/{entity}/{id}  - Get specific item")
+    print("• PUT    /api/{entity}/{id}  - Update item")
+    print("• DELETE /api/{entity}/{id}  - Delete item")
+    
+    print("\n EXAMPLE API CALLS:")
+    print("-" * 40)
+    print("# List all inventory items")
+    print("curl http://localhost:8000/api/inventory")
+    print()
+    print("# Create new inventory item")
+    print("curl -X POST http://localhost:8000/api/inventory \\")
+    print("     -H 'Content-Type: application/json' \\")
+    print("     -d '{\"itemName\":\"Test Item\",\"category\":\"Electronics\"}'")
+    print()
+    print("# Get specific inventory item")
+    print("curl http://localhost:8000/api/inventory/1")
+    print()
+    print("# Update inventory item")
+    print("curl -X PUT http://localhost:8000/api/inventory/1 \\")
+    print("     -H 'Content-Type: application/json' \\")
+    print("     -d '{\"itemName\":\"Updated Item\"}'")
+    print()
+    print("# Delete inventory item")
+    print("curl -X DELETE http://localhost:8000/api/inventory/1")
+    
+    print("\n DATABASE INFO:")
+    print("-" * 40)
+    print("• Default: PostgreSQL connection")
+    print("• Config: src/main/resources/application.properties")
+    print("• H2 in-memory database also supported for testing")
+    print("• Database tables created automatically on startup")
+    
+    print("\n GENERATED CODE STRUCTURE:")
+    print("-" * 40)
+    print("src/main/java/com/example/api/")
+    print("├── entity/      # JPA Entity classes")
+    print("├── dto/         # Data Transfer Objects") 
+    print("├── repository/  # Spring Data repositories")
+    print("├── service/     # Business logic services")
+    print("└── controller/  # REST API controllers")
+    
+    print("\n  DEVELOPMENT TIPS:")
+    print("-" * 40)
+    print("• Use ./mvnw spring-boot:run for development mode with auto-reload")
+    print("• Check application logs if startup fails")
+    print("• Verify database connection in application.properties")
+    print("• Use curl, Postman, or browser for API testing")
+    print("• Swagger UI available at: http://localhost:8000/swagger-ui.html")
+    
+    print("\n QUICK START COMMANDS:")
+    print("-" * 40)
+    print("# Linux/macOS:")
+    print("cd Generated/backend_java")
+    print("./mvnw clean install")
+    print("java -jar target/generated-api-0.0.1-SNAPSHOT.jar")
+    print("")
+    print("# Windows:")
+    print("cd Generated\\backend_java")
+    print("mvnw.cmd clean install")
+    print("java -jar target\\generated-api-0.0.1-SNAPSHOT.jar")
+    
+    print("\n" + "="*80)
+
+def validate_database_connection(app_config):
+    """Validate database connection and check for schema changes with impact analysis"""
+    import json
+    import sys
+    
+    db_config = app_config.get('metadata', {}).get('database', {})
+    db_type = db_config.get('type', 'h2')
+    
+    print(f"\n[DB] Validating database connection...")
+    print(f"[DB] Database Type: {db_type}")
+    
+    # Database existence and schema change tracking variables
+    db_exists = False
+    new_fields_detected = False
+    changed_tables = []
+    missing_tables = []
+    new_fields = {}
+    field_changes = {}
+    
+    if db_type == 'postgresql':
+        try:
+            import psycopg2
+            print(f"[DB] Testing PostgreSQL connection...")
+            
+            # Clean database name - remove .db extension if present
+            db_name = db_config.get('name', 'nsi_app')
+            if db_name.endswith('.db'):
+                db_name = db_name[:-3]  # Remove .db extension
+                print(f"[DB] Cleaned database name: {db_name} (removed .db extension)")
+            
+            # Try to connect to PostgreSQL using hardcoded values (consistent with Python version)
+            conn = psycopg2.connect(
+                host="localhost",
+                port=5432,
+                user="postgres",
+                password="password",
+                database=db_name
+            )
+            
+            db_exists = True
+            print(f"[DB] ✅ PostgreSQL connection successful!")
+            print(f"[DB] Connected to database: {db_name}")
+            
+            # Detailed schema analysis
+            cursor = conn.cursor()
+            
+            # Get existing tables
+            cursor.execute("""
+                SELECT table_name 
+                FROM information_schema.tables 
+                WHERE table_schema = 'public'
+            """)
+            existing_tables = set(row[0] for row in cursor.fetchall())
+            
+            # Compare with config entities
+            config_entities = app_config.get('entities', [])
+            config_tables = {entity['table_name'].lower(): entity for entity in config_entities}
+            
+            # Debug output
+            expected_tables = [entity['table_name'].lower() for entity in config_entities]
+            print(f"[DEBUG] PostgreSQL tables found: {sorted(existing_tables)}")
+            print(f"[DEBUG] Expected tables: {sorted(expected_tables)}")
+            
+            # Ensure no duplicates in missing tables list
+            missing_tables = []
+            extra_tables = list(set([table for table in existing_tables if table not in config_tables.keys()]))  # Remove duplicates
+            
+            # Check each entity for table existence and field differences
+            for entity in config_entities:
+                table_name = entity['table_name'].lower()
+                entity_fields = {f['name']: f for f in entity.get('fields', [])}
+                
+                if table_name not in existing_tables:
+                    print(f"[DB] Table '{table_name}' is missing in PostgreSQL database.")
+                    if table_name not in missing_tables:  # Prevent duplicates
+                        missing_tables.append(table_name)
+                else:
+                    # Get current table schema (PostgreSQL version)
+                    cursor.execute("""
+                        SELECT column_name, data_type, character_maximum_length, is_nullable, column_default
+                        FROM information_schema.columns 
+                        WHERE table_schema = 'public' AND table_name = %s
+                        ORDER BY ordinal_position;
+                    """, (table_name,))
+                    db_columns_info = cursor.fetchall()
+                    db_columns = {row[0]: row for row in db_columns_info}
+                    
+                    missing_in_db = set(entity_fields.keys()) - set(db_columns.keys())
+                    extra_in_db = set(db_columns.keys()) - set(entity_fields.keys())
+                    
+                    # Check for field type/length changes
+                    changed_fields = []
+                    for field_name, field in entity_fields.items():
+                        if field_name in db_columns:
+                            db_col_info = db_columns[field_name]
+                            db_data_type = db_col_info[1].upper()
+                            db_length = db_col_info[2]  # character_maximum_length
+                            
+                            config_type = field.get('type', 'TEXT').upper()
+                            config_length = field.get('length')
+                            
+                            # PostgreSQL type mapping (consistent with Python version)
+                            pg_type_map = {
+                                'CHARACTER VARYING': 'VARCHAR',
+                                'TEXT': 'TEXT',
+                                'INTEGER': 'INTEGER',
+                                'BIGINT': 'BIGINT',
+                                'BOOLEAN': 'BOOLEAN',
+                                'TIMESTAMP WITHOUT TIME ZONE': 'TIMESTAMP',
+                                'TIMESTAMP WITH TIME ZONE': 'TIMESTAMP',
+                                'NUMERIC': 'DECIMAL',
+                                'REAL': 'FLOAT',
+                                'DOUBLE PRECISION': 'FLOAT'
+                            }
+                            
+                            normalized_db_type = pg_type_map.get(db_data_type, db_data_type)
+                            
+                            # Compare types using the static equivalence function
+                            if not JavaBackendGenerator._are_types_equivalent_static(normalized_db_type, config_type):
+                                changed_fields.append({
+                                    'field': field_name,
+                                    'change': 'type',
+                                    'old': normalized_db_type,
+                                    'new': config_type
+                                })
+                            
+                            # Compare length if applicable
+                            if config_length and db_length and config_length != db_length:
+                                changed_fields.append({
+                                    'field': field_name,
+                                    'change': 'length',
+                                    'old': db_length,
+                                    'new': config_length
+                                })
+                    
+                    # Report findings
+                    if missing_in_db:
+                        print(f"[DB] Table '{table_name}' missing fields: {missing_in_db}")
+                        new_fields[table_name] = list(missing_in_db)
+                        new_fields_detected = True
+                        
+                    if extra_in_db:
+                        print(f"[DB] Table '{table_name}' has extra fields: {extra_in_db}")
+                        
+                    if changed_fields:
+                        print(f"[DB] Table '{table_name}' has field changes:")
+                        for change in changed_fields:
+                            print(f"  - {change['field']}: {change['change']} from {change['old']} to {change['new']}")
+                        field_changes[table_name] = changed_fields
+                        
+                    if missing_in_db or changed_fields:
+                        changed_tables.append(table_name)
+            
+            cursor.close()
+            conn.close()
+            
+            # Show summary of changes for PostgreSQL (consistent with Python version)
+            if missing_tables or new_fields_detected or field_changes:
+                print(f"\n[SCHEMA] PostgreSQL Schema Analysis Complete:")
+                print(f"  - Missing tables: {len(missing_tables)}")
+                print(f"  - Tables with new fields: {len(new_fields)}")
+                print(f"  - Tables with field changes: {len(field_changes)}")
+                print(f"  - Total affected tables: {len(changed_tables)}")
+                
+                # Show detailed impact analysis for PostgreSQL detected changes
+                print("\n" + "="*80)
+                print("JAVA SPRING BOOT POSTGRESQL SCHEMA CHANGE IMPACT ANALYSIS")
+                print("="*80)
+                
+                # Analyze impact for each table with missing fields (similar to Python version)
+                for table_name, missing_field_names in new_fields.items():
+                    print(f"\nTABLE: {table_name.upper()} - Missing Fields: {', '.join(missing_field_names)}")
+                    print("─" * 60)
+                    
+                    # Find corresponding entity config for field details
+                    entity_config = None
+                    for entity in config_entities:
+                        if entity['table_name'].lower() == table_name:
+                            entity_config = entity
+                            break
+                    
+                    if entity_config:
+                        fields = entity_config.get('fields', [])
+                        print(f"Fields ({len(fields)}): {', '.join([f['name'] for f in fields])}")
+                        class_name = ''.join(word.capitalize() for word in table_name.replace('-', '_').split('_'))
+                        print(f"Will create: {class_name} JPA entity and /api/{table_name}/ endpoints")
+                        
+                        # Show impact for each missing field
+                        for field_name in missing_field_names:
+                            # Load existing dependency graph if available for impact analysis
+                            existing_graph_file = Path('backend_dependency_graph_java.json')
+                            if existing_graph_file.exists():
+                                try:
+                                    with open(existing_graph_file, 'r') as f:
+                                        existing_graph = json.load(f)
+                                    
+                                    # Check if this table exists in the graph
+                                    if table_name in existing_graph.get('tables', {}):
+                                        table_info = existing_graph['tables'][table_name]
+                                        related_apis = table_info.get('related_apis', [])
+                                        
+                                        print(f"\nFIELD: {field_name}")
+                                        print(f"   Potentially Affected APIs ({len(related_apis)}):")
+                                        for api in related_apis[:5]:  # Show first 5
+                                            print(f"     • {api}")
+                                        if len(related_apis) > 5:
+                                            print(f"     ... and {len(related_apis) - 5} more")
+                                        
+                                        print(f"   Java Impact:")
+                                        print(f"     • JPA Entity: @Column annotation for {field_name}")
+                                        print(f"     • DTOs: Add {field_name} to Create/Update/Response DTOs")
+                                        print(f"     • Repository: Query methods may need updates")
+                                        print(f"     • Service: CRUD methods will handle new field")
+                                        print(f"     • Controller: REST endpoints will include new field")
+                                        
+                                except Exception as e:
+                                    print(f"Could not load Java dependency graph: {e}")
+                
+                # Show missing tables impact
+                for table_name in missing_tables:
+                    entity_config = None
+                    for entity in config_entities:
+                        if entity['table_name'].lower() == table_name:
+                            entity_config = entity
+                            break
+                    
+                    if entity_config:
+                        print(f"\nMISSING TABLE: {table_name.upper()}")
+                        print("─" * 60)
+                        print("Impact: New table will generate:")
+                        class_name = ''.join(word.capitalize() for word in table_name.replace('-', '_').split('_'))
+                        print(f"   • JPA Entity: {class_name}")
+                        print(f"   • DTOs: {class_name}Create, {class_name}Update, {class_name}Response")
+                        print(f"   • Repository: {class_name}Repository with JPA methods")
+                        print(f"   • Service: {class_name}Service with CRUD operations")
+                        print(f"   • Controller: {class_name}Controller with REST endpoints")
+                        print(f"   • Database table with proper PostgreSQL constraints")
+                
+                print("\n" + "="*80)
+                print("RECOMMENDATIONS:")
+                print("="*80)
+                print("• Option 1 (Cancel): No changes made, review schema manually")
+                print("• Option 2 (DDL Migration): Execute ALTER TABLE statements for field-level changes and CREATE TABLE for missing tables") 
+                print("• Option 3 (Code Only): Generate Java code - Spring Boot DDL will handle missing tables/columns")
+                print("Use Option 2 for precise control over database changes, Option 3 for automated Spring Boot handling")
+                print("="*80)
+                
+                # Ask for user action (similar to Python version but adapted for Java)
+                print("\nPostgreSQL schema changes detected. Choose an option:")
+                print("  1. Cancel (exit)")
+                print("  2. Apply PostgreSQL DDL migration (ALTER TABLE statements for field changes)")
+                print("  3. Proceed with Java code generation only (Spring Boot will handle schema)")
+                
+                while True:
+                    user_choice = input("Enter 1, 2, or 3: ").strip()
+                    if user_choice == '1':
+                        print("[ABORTED] Operation cancelled by user.")
+                        sys.exit(0)
+                    elif user_choice == '2':
+                        print("[MIGRATION] Applying PostgreSQL DDL migration for field-level changes...")
+                        
+                        # Apply DDL migration similar to Python version
+                        try:
+                            import psycopg2
+                            conn = psycopg2.connect(
+                                host="localhost",
+                                port=5432,
+                                user="postgres",
+                                password="password",
+                                database=db_name
+                            )
+                            cursor = conn.cursor()
+                            
+                            # Add missing tables first
+                            for table_name in missing_tables:
+                                entity_config = None
+                                for entity in config_entities:
+                                    if entity['table_name'].lower() == table_name:
+                                        entity_config = entity
+                                        break
+                                
+                                if entity_config:
+                                    print(f"[MIGRATION] Creating missing table: {table_name}")
+                                    fields = entity_config.get('fields', [])
+                                    column_defs = []
+                                    
+                                    for field in fields:
+                                        field_name = field['name']
+                                        field_type = field.get('type', 'VARCHAR').upper()
+                                        field_length = field.get('length')
+                                        is_nullable = field.get('nullable', True)
+                                        is_primary = field.get('primary_key', False)
+                                        
+                                        # PostgreSQL type mapping for DDL
+                                        pg_ddl_type_map = {
+                                            'VARCHAR': f"VARCHAR({field_length})" if field_length else "VARCHAR(255)",
+                                            'TEXT': 'TEXT',
+                                            'INTEGER': 'INTEGER',
+                                            'BIGINT': 'BIGINT',
+                                            'BOOLEAN': 'BOOLEAN',
+                                            'TIMESTAMP': 'TIMESTAMP WITHOUT TIME ZONE',
+                                            'FLOAT': 'REAL',
+                                            'DOUBLE': 'DOUBLE PRECISION',
+                                            'DECIMAL': 'NUMERIC',
+                                            'SERIAL': 'SERIAL',
+                                            'BIGSERIAL': 'BIGSERIAL'
+                                        }
+                                        
+                                        ddl_type = pg_ddl_type_map.get(field_type, field_type)
+                                        col_def = f"{field_name} {ddl_type}"
+                                        
+                                        if is_primary:
+                                            col_def += " PRIMARY KEY"
+                                        elif not is_nullable:
+                                            col_def += " NOT NULL"
+                                            
+                                        column_defs.append(col_def)
+                                    
+                                    create_sql = f"CREATE TABLE IF NOT EXISTS {table_name} ({', '.join(column_defs)})"
+                                    try:
+                                        cursor.execute(create_sql)
+                                        conn.commit()  # Commit after each successful table creation
+                                        print(f"[MIGRATION] Created table: {table_name}")
+                                    except Exception as e:
+                                        print(f"[MIGRATION] Error creating table {table_name}: {e}")
+                                        conn.rollback()  # Rollback on error and continue
+                            
+                            # Add missing fields to existing tables
+                            for table_name, missing_field_names in new_fields.items():
+                                if table_name not in missing_tables:  # Don't add fields to tables we just created
+                                    entity_config = None
+                                    for entity in config_entities:
+                                        if entity['table_name'].lower() == table_name:
+                                            entity_config = entity
+                                            break
+                                    
+                                    if entity_config:
+                                        entity_fields = {f['name']: f for f in entity_config.get('fields', [])}
+                                        
+                                        for field_name in missing_field_names:
+                                            if field_name in entity_fields:
+                                                field = entity_fields[field_name]
+                                                field_type = field.get('type', 'VARCHAR').upper()
+                                                field_length = field.get('length')
+                                                is_nullable = field.get('nullable', True)
+                                                default_value = field.get('default')
+                                                
+                                                # Build ALTER TABLE statement
+                                                pg_ddl_type_map = {
+                                                    'VARCHAR': f"VARCHAR({field_length})" if field_length else "VARCHAR(255)",
+                                                    'TEXT': 'TEXT',
+                                                    'INTEGER': 'INTEGER',
+                                                    'BIGINT': 'BIGINT',
+                                                    'BOOLEAN': 'BOOLEAN',
+                                                    'TIMESTAMP': 'TIMESTAMP WITHOUT TIME ZONE',
+                                                    'FLOAT': 'REAL',
+                                                    'DOUBLE': 'DOUBLE PRECISION',
+                                                    'DECIMAL': 'NUMERIC'
+                                                }
+                                                
+                                                ddl_type = pg_ddl_type_map.get(field_type, field_type)
+                                                alter_sql = f"ALTER TABLE {table_name} ADD COLUMN {field_name} {ddl_type}"
+                                                
+                                                if default_value:
+                                                    if field_type in ['VARCHAR', 'TEXT']:
+                                                        alter_sql += f" DEFAULT '{default_value}'"
+                                                    else:
+                                                        alter_sql += f" DEFAULT {default_value}"
+                                                
+                                                if not is_nullable:
+                                                    alter_sql += " NOT NULL"
+                                                
+                                                try:
+                                                    cursor.execute(alter_sql)
+                                                    conn.commit()  # Commit after each successful column addition
+                                                    print(f"[MIGRATION] Added column {field_name} to table {table_name}")
+                                                except Exception as e:
+                                                    print(f"[MIGRATION] Error adding column {field_name}: {e}")
+                                                    conn.rollback()  # Rollback on error and continue
+                            
+                            cursor.close()
+                            conn.close()
+                            
+                            print("[MIGRATION] PostgreSQL DDL migration complete!")
+                            
+                        except ImportError:
+                            print("[ERROR] psycopg2 not available for DDL migration")
+                            print("[INFO] Please install psycopg2: pip install psycopg2-binary")
+                            sys.exit(1)
+                        except Exception as e:
+                            print(f"[ERROR] DDL migration failed: {e}")
+                            response = input("Continue with code generation anyway? (y/N): ").strip().lower()
+                            if response != 'y':
+                                sys.exit(1)
+                        
+                        break
+                    elif user_choice == '3':
+                        print("[INFO] Proceeding with Java code generation only.")
+                        print("[INFO] Spring Boot will handle schema creation with spring.jpa.hibernate.ddl-auto=update")
+                        print("[INFO] Note: You may need to manually update PostgreSQL schema for field changes.")
+                        break
+                    else:
+                        print("Invalid input. Please enter 1, 2, or 3.")
+            else:
+                print(f"[DB]  PostgreSQL database schema is up to date.")
+            
+        except ImportError:
+            print(f"[DB]   psycopg2 not available for PostgreSQL pre-validation")
+            print(f"[DB] Database will be created automatically by Spring Boot application")
+            print(f"[DB] Continuing with generation - database creation handled in Java code")
+        except Exception as e:
+            print(f"[DB] PostgreSQL database not accessible: {e}")
+            db_exists = False
+            
+    elif db_type == 'h2':
+        print(f"[DB] Using H2 in-memory database")
+        print(f"[DB] ✅ H2 database will be created automatically by Spring Boot")
+        print(f"[DB] No pre-validation needed for H2 - continuing with generation")
+        db_exists = False  # H2 is always created fresh
+        
+    else:
+        print(f"[DB] Database type '{db_type}' - using Spring Boot auto-configuration")
+        print(f"[DB] ✅ Database will be handled by Spring Boot application")
+        db_exists = False
+    
+    # Handle case where database doesn't exist or is not accessible
+    if not db_exists:
+        if db_type == 'postgresql':
+            print(f"[DB] PostgreSQL database not accessible or doesn't exist.")
+        elif db_type == 'h2':
+            print(f"[DB] H2 database will be created in-memory on application startup.")
+        else:
+            print(f"[DB] Database will be configured by Spring Boot.")
+        
+        # Ask for user confirmation to proceed
+        proceed_db = input(f"\nDo you want to proceed with Java backend generation? (y/N): ").strip().lower()
+        if proceed_db != 'y':
+            print("[ABORTED] Java backend generation cancelled by user.")
+            sys.exit(0)
+
+def main():
+    """Standalone execution entry point for Java backend generation"""
+    
+    # Always use config_output/application_config.json as input and Generated/backend_java as output
+    config_file = Path('config_output/application_config.json')
+    output_dir = Path('Generated/backend_java')
+    
+    print(f"[DEBUG] Java Generator - Checking config at: {config_file.resolve()}")
+
+    if not config_file.exists():
+        logger.error(f"[FAIL] Config file not found: {config_file}")
+        sys.exit(1)
+
+    # Load configuration
+    with open(config_file) as f:
+        app_config = json.load(f)
+    
+    # Load project configuration for API versioning
+    project_config_file = Path('project_configuration.json')
+    project_config = {}
+    if project_config_file.exists():
+        with open(project_config_file) as f:
+            project_config = json.load(f)
+    
+    db_config = app_config.get('metadata', {}).get('database', {})
+    db_type = db_config.get('type', 'h2')
+    
+    # Get API version from project config
+    api_version = project_config.get('version', 'v1')
+    print(f"[API] API version: {api_version}")
+    
+    print(f"\n[INFO] Java Backend Generator Configuration:")
+    print(f"  - Database Type: {db_type}")
+    print(f"  - Entities: {len(app_config.get('entities', []))}")
+    print(f"  - Target Framework: Spring Boot")
+    print(f"  - Output Directory: {output_dir}")
+    
+    # Validate database connection and schema (includes user confirmation prompts)
+    validate_database_connection(app_config)
+    
+    # Check for existing Java backend directory
+    if output_dir.exists() and any(output_dir.iterdir()):
+        response = input(f"\n[WARNING] Directory {output_dir} already exists with files. Overwrite? (y/N): ").strip().lower()
+        if response != 'y':
+            print("[ABORTED] Java backend generation cancelled by user.")
+            sys.exit(0)
+        else:
+            import shutil
+            shutil.rmtree(output_dir)
+            print(f"[CLEANUP] Removed existing directory: {output_dir}")
+    
+    # Final confirmation before Java backend code generation
+    proceed_codegen = input(f"\nDo you want to proceed with Java Spring Boot backend generation? (y/N): ").strip().lower()
+    if proceed_codegen != 'y':
+        print("[ABORTED] Java backend generation cancelled by user.")
+        sys.exit(0)
+
+    # Generate Java Spring Boot backend
+    templates_dir = Path('./Templates')
+    generator = JavaBackendGenerator({}, templates_dir, project_config)
+    result = generator.generate(app_config, output_dir)
+
+    # Generate/Update Java dependency graph
+    print("\n" + "="*80)
+    print("GENERATING JAVA DEPENDENCY GRAPH")
+    print("="*80)
+    entity_versions = generator._extract_entity_versions(app_config)
+    dependency_result = generator.update_dependency_graph(app_config, output_dir, entity_versions)
+    
+    print(f"[DEPENDENCY] Java Dependency Graph Results:")
+    print(f"  - Graph File: {dependency_result['graph_file']}")
+    print(f"  - Tables Tracked: {dependency_result['tables_tracked']}")
+    print(f"  - APIs Tracked: {dependency_result['apis_tracked']}")
+    print(f"  - Models Tracked: {dependency_result['models_tracked']}")
+    print(f"  - Relationships: {dependency_result['relationships_tracked']}")
+    print(f"  - Changes Made: {dependency_result['changes_made']}")
+
+    # Create backup of generated code as the very last step
+    backup_result = create_backup_of_generated_code(output_dir)
+    if backup_result:
+        print(f"\n[BACKUP] Generated Java code backup created at: {backup_result}")
+
+    # Print comprehensive usage instructions
+    print_usage_instructions()
+    
+    # Print generation summary
+    print(f"\n[DATA] Generation Statistics:")
+    print(f"  - Files: {result['files_generated']}")
+    print(f"  - Entities: {result['entities']}")
+    print(f"  - APIs: {result['apis']}")
+    print(f"  - Routes: {result['routes']}")
+    print(f"  - Framework: {result['framework']}")
+    print(f"\n[DIR] Output: {result['output_dir']}")
+    print(f"\n[GRAPH] Dependency Tracking: {dependency_result['graph_file']}")
+    if backup_result:
+        print(f"\n[BACKUP] Code Backup: {backup_result}")
+
+
+if __name__ == '__main__':
+    main()"
