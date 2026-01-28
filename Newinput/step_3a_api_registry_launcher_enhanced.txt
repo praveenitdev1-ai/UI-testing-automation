@@ -1,0 +1,511 @@
+"#!/usr/bin/env python3
+"""
+Enhanced API Registry Launcher - Web Mode with Drill-Down Support
+===============================================================
+
+This is an enhanced version of the API registry launcher that incorporates
+the drill-down approach for better hierarchical menu handling and proper
+step completion tracking.
+
+Key improvements:
+1. Hierarchical prompt management using DrillDownPromptHandler
+2. Proper sub-menu handling for option 2 and other complex options
+3. Dynamic step completion signaling
+4. Better session state management
+"""
+
+import subprocess
+import sys
+import json
+import time
+import uuid
+from pathlib import Path
+import os
+import requests
+
+# Import the drill-down handler
+sys.path.append(str(Path(__file__).parent / "drill-down_v2" / "sdlc-drilldown-complete" / "sdlc-drilldown"))
+try:
+    from DrillDownPromptHandler import DrillDownPromptHandler, PromptOption
+except ImportError:
+    # Fallback to basic implementation if DrillDown not available
+    print("Warning: DrillDown handler not available, using basic implementation")
+    DrillDownPromptHandler = None
+    PromptOption = None
+
+# Import step_3b for direct integration
+try:
+    from step_3b_api_registry_manager_web import APIRegistryManagerWeb
+    STEP_3B_AVAILABLE = True
+except ImportError:
+    print("Warning: step_3b_api_registry_manager_web not available")
+    STEP_3B_AVAILABLE = False
+
+
+class APIRegistryLauncherEnhanced:
+    """Enhanced API Registry Launcher with drill-down support"""
+    
+    def __init__(self, session_id=None):
+        self.session_id = session_id or str(uuid.uuid4())
+        self.running = True
+        self.current_step = "main_menu"
+        self.step_completed = False
+        
+        # Initialize drill-down handler if available
+        if DrillDownPromptHandler:
+            self.prompt_handler = DrillDownPromptHandler(
+                session_id=self.session_id,
+                prompt_file="temp_api_prompt.json",
+                response_pattern="temp_api_response_{}.json",
+                history_file=f"prompt_history_{self.session_id}.json"
+            )
+        else:
+            self.prompt_handler = None
+            
+        # Initialize step_3b manager for direct integration
+        if STEP_3B_AVAILABLE:
+            self.api_manager = APIRegistryManagerWeb()
+            self.api_manager.enable_web_mode(self.session_id)
+        else:
+            self.api_manager = None
+    
+    def send_web_prompt(self, prompt_data):
+        """Enhanced web prompt with drill-down support"""
+        if self.prompt_handler and prompt_data.get("type") == "menu_selection":
+            # Use drill-down for menu selections
+            return self.prompt_handler.send_menu_prompt(
+                title=prompt_data.get("title", "Menu"),
+                options=prompt_data.get("options", []),
+                description=prompt_data.get("description", ""),
+                parent_prompt_id=prompt_data.get("parent_prompt_id")
+            )
+        else:
+            # Fallback to original implementation
+            return self._send_basic_web_prompt(prompt_data)
+    
+    def _send_basic_web_prompt(self, prompt_data):
+        """Original web prompt implementation"""
+        try:
+            # Clean up any existing prompt file first
+            prompt_file = Path("temp_api_prompt.json")
+            if prompt_file.exists():
+                prompt_file.unlink()
+                
+            # Generate unique prompt ID
+            prompt_id = str(uuid.uuid4())
+            prompt_data['prompt_id'] = prompt_id
+            prompt_data['timestamp'] = time.time()
+            
+            # Save prompt data to file for web interface to pick up
+            with open(prompt_file, 'w') as f:
+                json.dump(prompt_data, f, indent=2)
+            
+            print(f"Prompt saved to {prompt_file}, waiting for web response...")
+            
+            # Wait for response with timeout
+            timeout = 300  # 5 minutes timeout
+            start_time = time.time()
+            
+            while time.time() - start_time < timeout:
+                response_file = Path(f"temp_api_response_{prompt_id}.json")
+                if response_file.exists():
+                    try:
+                        with open(response_file, 'r') as f:
+                            response = json.load(f)
+                        # Clean up files
+                        response_file.unlink()
+                        if prompt_file.exists():
+                            prompt_file.unlink()
+                        return response
+                    except Exception as e:
+                        print(f"Error reading response file: {e}")
+                        # Clean up prompt file even on error
+                        if prompt_file.exists():
+                            prompt_file.unlink()
+                        break
+                
+                time.sleep(1)  # Check every second
+            
+            print("Timeout waiting for web response")
+            # Clean up prompt file on timeout
+            if prompt_file.exists():
+                prompt_file.unlink()
+            return None
+            
+        except Exception as e:
+            print(f"Error sending web prompt: {e}")
+            # Clean up prompt file on exception
+            prompt_file = Path("temp_api_prompt.json")
+            if prompt_file.exists():
+                prompt_file.unlink()
+            return None
+
+    def show_main_menu_web(self):
+        """Enhanced main menu with drill-down support"""
+        prompt_data = {
+            "type": "menu_selection",
+            "title": "API Registry Management System",
+            "description": "Select an option to proceed with API registry management:",
+            "session_id": self.session_id,
+            "options": [
+                {
+                    "id": "1", 
+                    "label": "Process APIs from config", 
+                    "description": "Load and process API configurations"
+                },
+                {
+                    "id": "2", 
+                    "label": "Review approval requests", 
+                    "description": "Review and manage API approvals"
+                },
+                {
+                    "id": "3", 
+                    "label": "Show statistics", 
+                    "description": "Display registry metrics"
+                },
+                {
+                    "id": "4", 
+                    "label": "Exit and Complete", 
+                    "description": "Complete Step 3"
+                }
+            ]
+        }
+        
+        response = self.send_web_prompt(prompt_data)
+        print(f" Sent main menu prompt, received response: {response}")
+        if response and response.get('choice'):
+            return response['choice'], response.get('prompt_id')
+        else:
+            print(" No response received, defaulting to option 1")
+            return "1", None
+
+    def show_review_submenu_web(self, parent_prompt_id=None):
+        """Enhanced review submenu with drill-down support"""
+        prompt_data = {
+            "type": "menu_selection",
+            "title": "Review Management Options",
+            "description": "Select the type of review operation you want to perform:",
+            "session_id": self.session_id,
+            "parent_prompt_id": parent_prompt_id,
+            "options": [
+                {
+                    "id": "2.1", 
+                    "label": "Show all pending reviews", 
+                    "description": "Display all pending approval requests",
+                    "icon": "👁️"
+                },
+                {
+                    "id": "2.2", 
+                    "label": "Approve specific review", 
+                    "description": "Approve a specific review request by ID",
+                    "icon": "✅"
+                },
+                {
+                    "id": "2.3", 
+                    "label": "Reject specific review", 
+                    "description": "Reject a specific review request by ID",
+                    "icon": "❌"
+                },
+                {
+                    "id": "2.4", 
+                    "label": "Bulk approve all pending", 
+                    "description": "Approve all pending review requests at once",
+                    "icon": "✅✅"
+                },
+                {
+                    "id": "2.5", 
+                    "label": "Back to main menu", 
+                    "description": "Return to the main API registry menu",
+                    "icon": "🔙"
+                }
+            ]
+        }
+        
+        response = self.send_web_prompt(prompt_data)
+        if response and response.get('choice'):
+            return response['choice'], response.get('prompt_id')
+        else:
+            return "2.5", None  # Default to back to main menu
+
+    def get_config_file_web(self, parent_prompt_id=None):
+        """Enhanced config file selection with drill-down support"""
+        prompt_data = {
+            "type": "menu_selection",
+            "title": "Configuration File Selection",
+            "description": "Choose the configuration file to process:",
+            "session_id": self.session_id,
+            "parent_prompt_id": parent_prompt_id,
+            "options": [
+                {
+                    "id": "default", 
+                    "label": "Use default configuration", 
+                    "description": "config_output/application_config.json",
+                    "icon": "📄"
+                },
+                {
+                    "id": "custom", 
+                    "label": "Enter custom path", 
+                    "description": "Specify a custom configuration file path",
+                    "icon": "🔗"
+                },
+                {
+                    "id": "browse", 
+                    "label": "Browse available configs", 
+                    "description": "Browse available configuration files",
+                    "icon": "📂"
+                }
+            ]
+        }
+        
+        response = self.send_web_prompt(prompt_data)
+        if response and response.get('choice'):
+            if response['choice'] == 'default':
+                return "config_output/application_config.json"
+            elif response['choice'] == 'custom' and response.get('custom_path'):
+                return response['custom_path']
+            elif response['choice'] == 'browse':
+                return self._browse_config_files(response.get('prompt_id'))
+        
+        return "config_output/application_config.json"
+
+    def _browse_config_files(self, parent_prompt_id=None):
+        """Browse available config files"""
+        config_dir = Path("config_output")
+        available_configs = []
+        
+        if config_dir.exists():
+            for config_file in config_dir.glob("*.json"):
+                available_configs.append({
+                    "id": str(config_file),
+                    "label": config_file.name,
+                    "description": f"Modified: {time.ctime(config_file.stat().st_mtime)}",
+                    "icon": "📄"
+                })
+        
+        if not available_configs:
+            available_configs.append({
+                "id": "config_output/application_config.json",
+                "label": "application_config.json (default)",
+                "description": "Default configuration file",
+                "icon": "📄"
+            })
+        
+        prompt_data = {
+            "type": "menu_selection",
+            "title": "Select Configuration File",
+            "description": "Choose from available configuration files:",
+            "session_id": self.session_id,
+            "parent_prompt_id": parent_prompt_id,
+            "options": available_configs
+        }
+        
+        response = self.send_web_prompt(prompt_data)
+        if response and response.get('choice'):
+            return response['choice']
+        
+        return "config_output/application_config.json"
+
+    def execute_api_registry_command(self, cmd_args, operation_name):
+        """Execute API registry manager with proper completion tracking"""
+        cmd = ["python3", "step_3b_api_registry_manager_web.py"] + cmd_args
+        
+        print(f"Executing {operation_name}: {' '.join(cmd)}")
+        
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            
+            print("STDOUT:", result.stdout)
+            if result.stderr:
+                print("STDERR:", result.stderr)
+            
+            if result.returncode == 0:
+                print(f"✅ {operation_name} completed successfully")
+                return True
+            else:
+                print(f"❌ {operation_name} failed with return code {result.returncode}")
+                return False
+                
+        except subprocess.TimeoutExpired:
+            print(f"⏱️ {operation_name} timed out after 5 minutes")
+            return False
+        except Exception as e:
+            print(f"❌ Error executing {operation_name}: {e}")
+            return False
+
+    def handle_review_operation(self, sub_choice, parent_prompt_id):
+        """Handle review sub-operations with enhanced feedback"""
+        if sub_choice == "2.1":  # Show all pending reviews
+            return self.execute_api_registry_command(
+                ["--review-only", "--web-mode", "--session-id", self.session_id],
+                "Show Pending Reviews"
+            )
+        elif sub_choice == "2.2":  # Approve specific review
+            return self.execute_api_registry_command(
+                ["--approve-review", "--web-mode", "--session-id", self.session_id],
+                "Approve Specific Review"
+            )
+        elif sub_choice == "2.3":  # Reject specific review
+            return self.execute_api_registry_command(
+                ["--reject-review", "--web-mode", "--session-id", self.session_id],
+                "Reject Specific Review"
+            )
+        elif sub_choice == "2.4":  # Bulk approve all
+            return self.execute_api_registry_command(
+                ["--bulk-approve", "--web-mode", "--session-id", self.session_id],
+                "Bulk Approve All Reviews"
+            )
+        elif sub_choice == "2.5":  # Back to main menu
+            return True
+        else:
+            print(f"Unknown review operation: {sub_choice}")
+            return False
+
+    def signal_step_completion(self):
+        """Signal that Step 3 is complete"""
+        completion_signal = {
+            "step": 3,
+            "status": "completed",
+            "session_id": self.session_id,
+            "timestamp": time.time(),
+            "message": "API Registry Management completed successfully"
+        }
+        
+        try:
+            # Write local completion signal file (for backup)
+            with open("step3_completion_signal.json", "w") as f:
+                json.dump(completion_signal, f, indent=2)
+            
+            # Also call the workflow server completion endpoint
+            import requests
+            response = requests.post("http://localhost:8001/api/complete-api-registry-step")
+            if response.status_code == 200:
+                print("✅ Step 3 completion signaled to workflow server")
+            else:
+                print(f"⚠️ Warning: Could not signal completion to server (status: {response.status_code})")
+            
+            print("✅ Step 3 completion signal sent")
+            self.step_completed = True
+        except Exception as e:
+            print(f"❌ Error sending completion signal: {e}")
+
+    def run_web_mode(self):
+        """Enhanced web mode with drill-down navigation and proper completion"""
+        print(f"🚀 Starting Enhanced API Registry Launcher (Session: {self.session_id})")
+        
+        try:
+            while self.running:
+                print(f"📋 Showing main menu (running: {self.running}, completed: {self.step_completed})")
+                # Show main menu
+                choice, main_prompt_id = self.show_main_menu_web()
+                print(f"🎯 User selected choice: {choice}")
+                
+                if choice == "1":  # Process APIs from configuration file
+                    print("🔄 Processing APIs from configuration file")
+                    config_file = self.get_config_file_web(main_prompt_id)
+                    success = self.execute_api_registry_command(
+                        ["--config", config_file, "--web-mode", "--session-id", self.session_id],
+                        "Process API Configuration"
+                    )
+                    
+                    if success:
+                        print("✅ API processing completed successfully")
+                    else:
+                        print("❌ API processing failed")
+                
+                elif choice == "2":  # Review pending approval requests
+                    print("📋 Launching review management")
+                    # Use direct API manager instead of subprocess
+                    if self.api_manager:
+                        try:
+                            # Call review menu directly - this will send web prompts
+                            # The review menu will handle its own drill-down navigation
+                            self.api_manager.show_review_menu()
+                            print("✅ Review management completed successfully")
+                        except Exception as e:
+                            print(f"❌ Review management failed: {e}")
+                    else:
+                        # Fallback to subprocess if direct integration not available
+                        success = self.execute_api_registry_command(
+                            ["--review-only", "--web-mode", "--session-id", self.session_id],
+                            "Review Management"
+                        )
+                        
+                        if success:
+                            print("✅ Review management completed successfully")
+                        else:
+                            print("❌ Review management failed")
+                
+                elif choice == "3":  # Show registry statistics
+                    print("📊 Showing registry statistics")
+                    success = self.execute_api_registry_command(
+                        ["--stats-only", "--web-mode", "--session-id", self.session_id],
+                        "Show Registry Statistics"
+                    )
+                    
+                    if success:
+                        print("✅ Registry statistics displayed successfully")
+                    else:
+                        print("❌ Failed to display registry statistics")
+                
+                elif choice == "4":  # Exit and Complete Step
+                    print("🏁 User requested to exit API Registry Management")
+                    self.signal_step_completion()
+                    self.running = False
+                    break
+                
+                else:
+                    print(f"❓ Invalid choice: {choice}")
+                    continue
+                    
+        except KeyboardInterrupt:
+            print("\n🛑 Process interrupted by user")
+            self.signal_step_completion()
+        except Exception as e:
+            print(f"❌ Unexpected error in web mode: {e}")
+            self.signal_step_completion()
+        
+        print("🎯 Enhanced API Registry Launcher session completed")
+        return True
+
+    def cleanup(self):
+        """Clean up resources"""
+        if self.api_manager:
+            try:
+                self.api_manager.close_connection()
+            except Exception as e:
+                print(f"Warning: Error closing API manager connection: {e}")
+
+
+def run_web_mode(session_id=None):
+    """Entry point for web mode execution"""
+    launcher = APIRegistryLauncherEnhanced(session_id)
+    try:
+        return launcher.run_web_mode()
+    finally:
+        launcher.cleanup()
+
+
+if __name__ == "__main__":
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Enhanced API Registry Launcher - Web Mode with Drill-Down")
+    parser.add_argument(
+        '--web-mode',
+        action='store_true',
+        help='Enable web mode for interactive prompts'
+    )
+    parser.add_argument(
+        '--session-id',
+        type=str,
+        help='Session ID for web mode'
+    )
+    
+    args = parser.parse_args()
+    
+    if args.web_mode:
+        success = run_web_mode(args.session_id)
+        sys.exit(0 if success else 1)
+    else:
+        # Fallback to original console mode
+        from step_3a_api_registry_launcher_web import show_main_menu
+        show_main_menu()"
