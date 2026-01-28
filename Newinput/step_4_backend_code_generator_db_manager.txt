@@ -1,0 +1,3267 @@
+"#!/usr/bin/env python3
+"""
+Backend Code Generator - FIXED VERSION 2
+==============================================
+FIXES:
+1. [DONE] Proper Pydantic model class naming
+2. [DONE] Correct SQLAlchemy ORM model generation  
+3. [DONE] Template-based code generation
+4. [DONE] Proper handling of entity relationships
+5. [DONE] Complete CRUD routes with real DB operations
+
+Critical Fix: Ensures all class names are properly generated
+"""
+
+import json
+import logging
+import os
+import sqlite3
+import subprocess
+import sys
+from typing import Dict, Any, List, Optional
+from pathlib import Path
+from jinja2 import Environment, FileSystemLoader, TemplateNotFound
+# Phase 2A: Import the mixin
+from dependency_tracking import GenerationTrackingMixin
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+# class BackendGenerator:
+#     """Generate FastAPI backend code from application config"""
+    
+#     def __init__(self, config: Dict[str, Any], templates_dir: Path, project_config: Dict[str, Any] = None):
+
+class BackendGenerator(GenerationTrackingMixin):  # ✅ STEP 1: Inherit from mixin
+    """Generate FastAPI backend code from application config"""
+    
+    def __init__(self, config: Dict[str, Any], templates_dir: Path, project_config: Dict[str, Any] = None):
+        super().__init__()  # ✅ STEP 2: Call super().__init__()
+
+        self.config = config
+        self.templates_dir = templates_dir
+        self.framework = config.get('backend_framework', 'fastapi')
+        self.project_config = project_config or {}
+        self.api_version = self.project_config.get('version', 'v1')  # Default fallback
+        self.entity_versions = {}  # Will store entity-specific versions
+        
+        # Setup Jinja2 environment
+        try:
+            self.jinja_env = Environment(
+                loader=FileSystemLoader(str(templates_dir)),
+                trim_blocks=False,
+                lstrip_blocks=False,
+                keep_trailing_newline=True
+            )
+            
+            # Add custom filters for template transformation
+            self.jinja_env.filters['to_class_name'] = self._to_class_name
+            
+            logger.info(f"[DONE] Jinja2 environment initialized with templates from: {templates_dir}")
+        except Exception as e:
+            logger.warning(f"[WARN] Could not initialize Jinja2: {e}. Falling back to hardcoded generation.")
+            self.jinja_env = None
+        # ✅ STEP 3: Initialize tracking (ONE LINE!)
+        self.init_tracking()
+    
+    def _extract_entity_versions(self, app_config: Dict[str, Any]) -> None:
+        """Extract entity-specific API versions from application config"""
+        apis = app_config.get('apis', [])
+        
+        # Build a mapping of entity -> version from the APIs
+        for api in apis:
+            entity = api.get('entity')
+            version = api.get('version', self.api_version)
+            if entity:
+                # Take the highest version for each entity if multiple APIs exist
+                current_version = self.entity_versions.get(entity, 'v0')
+                if self._compare_versions(version, current_version) > 0:
+                    self.entity_versions[entity] = version
+        
+        print(f"[DEBUG] Entity versions extracted: {self.entity_versions}")
+    
+    def _compare_versions(self, version1: str, version2: str) -> int:
+        """Compare two version strings (e.g., 'v1' vs 'v2'). Returns 1 if v1 > v2, -1 if v1 < v2, 0 if equal"""
+        try:
+            v1_num = int(version1[1:]) if version1.startswith('v') else int(version1)
+            v2_num = int(version2[1:]) if version2.startswith('v') else int(version2)
+            return 1 if v1_num > v2_num else (-1 if v1_num < v2_num else 0)
+        except (ValueError, IndexError):
+            return 0
+    
+    def _get_entity_version(self, entity_name: str) -> str:
+        """Get the API version for a specific entity"""
+        return self.entity_versions.get(entity_name, self.api_version)
+
+    def generate(self, app_config: Dict[str, Any], output_dir: Path) -> Dict[str, Any]:
+        """
+        Generate complete backend codebase
+        
+        Args:
+            app_config: Application configuration from Step 2
+            output_dir: Output directory for backend code
+            
+        Returns:
+            Dictionary with generation statistics
+        """
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Extract entity-specific versions from application config
+        self._extract_entity_versions(app_config)
+        
+        # Store API version for use in generation
+        api_version = self.api_version
+        
+        logger.info("="*80)
+        logger.info("BACKEND CODE GENERATION (FIXED)")
+        logger.info("="*80)
+        
+        # Extract configuration
+        entities = app_config.get('entities', [])
+        apis = app_config.get('apis', [])
+        enums = app_config.get('enums', {})
+        db_config = app_config.get('metadata', {}).get('database', {})
+        
+        logger.info(f"[DATA] Input Statistics:")
+        logger.info(f"  - Entities: {len(entities)}")
+        logger.info(f"  - APIs: {len(apis)}")
+        logger.info(f"  - Enums: {len(enums)}")
+        logger.info(f"  - Database: {db_config.get('type', 'N/A')}")
+        
+        files_created = []
+        
+        # Create directory structure
+        self._create_directory_structure(output_dir)
+        
+        # Generate enums (if any)
+        if enums:
+            enum_file = self._generate_enums_file(output_dir, enums)
+            files_created.append(enum_file)
+            logger.info(f"[DONE] Generated: {enum_file.relative_to(output_dir)}")
+        
+        # Generate models for each entity
+        for entity in entities:
+            # Generate SQLAlchemy ORM model
+            orm_file = self._generate_orm_model(output_dir, entity, entities, db_config)
+            files_created.append(orm_file)
+            logger.info(f"[DONE] Generated ORM: {orm_file.relative_to(output_dir)}")
+            
+            # Generate Pydantic validation models
+            pydantic_file = self._generate_pydantic_model(output_dir, entity, enums)
+            files_created.append(pydantic_file)
+            logger.info(f"[DONE] Generated Pydantic: {pydantic_file.relative_to(output_dir)}")
+        
+        # Generate models/__init__.py
+        models_init = self._generate_models_init(output_dir, entities)
+        files_created.append(models_init)
+        logger.info(f"[DONE] Generated: {models_init.relative_to(output_dir)}")
+        
+        # Generate routes
+        route_entities = self._group_apis_by_entity(apis)
+        for entity_name, entity_apis in route_entities.items():
+            route_file = self._generate_route_file(output_dir, entity_name, entity_apis, entities)
+            files_created.append(route_file)
+            logger.info(f"[DONE] Generated Route: {route_file.relative_to(output_dir)}")
+        
+        # Generate routes/__init__.py
+        routes_init = self._generate_routes_init(output_dir, list(route_entities.keys()))
+        files_created.append(routes_init)
+        logger.info(f"[DONE] Generated: {routes_init.relative_to(output_dir)}")
+        
+        # Generate database.py
+        database_file = self._generate_database_file(output_dir, db_config)
+        files_created.append(database_file)
+        logger.info(f"[DONE] Generated: {database_file.relative_to(output_dir)}")
+        
+        # Generate main.py
+        main_file = self._generate_main_file(output_dir, list(route_entities.keys()), db_config)
+        files_created.append(main_file)
+        logger.info(f"[DONE] Generated: {main_file.relative_to(output_dir)}")
+        
+        # Generate requirements.txt
+        req_file = self._generate_requirements_file(output_dir, db_config)
+        files_created.append(req_file)
+        logger.info(f"[DONE] Generated: {req_file.relative_to(output_dir)}")
+        
+        logger.info("="*80)
+        logger.info(f"[DONE] BACKEND GENERATION COMPLETE: {len(files_created)} files created")
+        logger.info("="*80)
+        
+        # ✅ Phase 2A: Show tracking statistics (from mixin)
+        stats = self.get_tracking_stats()
+        if stats:
+            logger.info("[PHASE2] Generation Tracking Statistics:")
+            logger.info(f"  - Total tracked files: {stats['total_files']}")
+            logger.info(f"  - Template-based: {stats['template_based_files']}")
+            logger.info(f"  - Hardcoded: {stats['hardcoded_files']}")
+
+        return {
+            'files_generated': len(files_created),
+            'entities': len(entities),
+            'apis': len(apis),
+            'routes': len(route_entities),
+            'output_dir': str(output_dir),
+            'files': [str(f.relative_to(output_dir)) for f in files_created]
+        }
+    
+    def _create_directory_structure(self, output_dir: Path):
+        """Create necessary directory structure"""
+        (output_dir / 'models').mkdir(exist_ok=True)
+        (output_dir / 'routes').mkdir(exist_ok=True)
+        logger.info("[DIR] Created directory structure")
+    
+    def _generate_enums_file(self, output_dir: Path, enums: Dict) -> Path:
+        """Generate enums.py file using Jinja2 template"""
+        file_path = output_dir / 'enums.py'
+        
+        # Try template-based generation first
+        if self.jinja_env:
+            try:
+                template = self.jinja_env.get_template('enums_py.j2')
+                template_data = self._transform_enums_for_template(enums)
+                content = template.render(**template_data)
+                file_path.write_text(content)
+                logger.info("[TEMPLATE] Generated enums.py using Jinja2 template")
+                self.track_file(
+                file_path=file_path,
+                template_ids=['enums_py.j2'],  # Template name
+                content=content,
+                metadata={'enum_count': len(enums)}  # Optional metadata
+                )
+                return file_path
+            except TemplateNotFound:
+                logger.warning("[WARN] Template 'enums_py.j2' not found, falling back to hardcoded generation")
+            except Exception as e:
+                logger.warning(f"[WARN] Template rendering failed: {e}, falling back to hardcoded generation")
+        
+        # Fallback to hardcoded generation
+        logger.info("[FALLBACK] Generating enums.py using hardcoded method")
+        content = '"""Enumeration types for the application"""\n\n'
+        content += 'from enum import Enum\n\n'
+        
+        for enum_name, enum_values in enums.items():
+            class_name = self._to_class_name(enum_name)
+            content += f'class {class_name}(str, Enum):\n'
+            content += f'    """Enumeration for {enum_name}"""\n'
+            
+            for value in enum_values:
+                # Create valid Python identifier from value
+                member_name = value.upper().replace(' ', '_').replace('-', '_')
+                content += f'    {member_name} = "{value}"\n'
+            
+            content += '\n\n'
+        
+        file_path.write_text(content)
+
+        # ✅ STEP 4: Track generation (ONE LINE!)
+        self.track_file(
+            file_path=file_path,
+            template_ids=['enums_py.j2'],  # Template name
+            content=content,
+            metadata={'enum_count': len(enums)}  # Optional metadata
+        )
+        return file_path
+    
+    def _generate_orm_model(self, output_dir: Path, entity: Dict, all_entities: List[Dict], db_config: Dict = None) -> Path:
+        """Generate SQLAlchemy ORM model for an entity using Jinja2 template"""
+        if db_config is None:
+            db_config = {}
+            
+        entity_name = entity['table_name']
+        file_path = output_dir / 'models' / f'{entity_name.lower()}_orm.py'
+        db_type = db_config.get('type', 'sqlite')
+        
+        # Try template-based generation first
+        if self.jinja_env:
+            try:
+                template = self.jinja_env.get_template('sqlalchemy_model_py.j2')
+                template_data = self._transform_entity_for_sqlalchemy_template(entity, all_entities, {})
+                content = template.render(**template_data)
+                file_path.write_text(content)
+                logger.info(f"[TEMPLATE] Generated {entity_name}_orm.py using Jinja2 template")
+
+                self.track_file(
+                file_path=file_path,
+                template_ids=['sqlalchemy_model_py.j2'],  # Template name
+                content=content
+                #metadata={'entity': entity_name, 'field_count': len(fields)}
+                )
+                return file_path
+            except TemplateNotFound:
+                logger.warning("[WARN] Template 'sqlalchemy_model_py.j2' not found, falling back to hardcoded generation")
+            except Exception as e:
+                logger.warning(f"[WARN] Template rendering failed: {e}, falling back to hardcoded generation")
+        
+        # Fallback to hardcoded generation
+        logger.info(f"[FALLBACK] Generating {entity_name}_orm.py using hardcoded method")
+        class_name = self._to_class_name(entity_name)
+        
+        content = f'"""\n{class_name} ORM Model\n'
+        content += '='*(len(class_name) + 10) + '\n'
+        content += 'SQLAlchemy ORM model for database operations\n"""\n\n'
+        
+        # Import SQLAlchemy types based on database type
+        if db_type == 'postgresql':
+            content += 'from sqlalchemy import Column, Integer, BigInteger, String, Boolean, DateTime, Text, ForeignKey, Float, Numeric\n'
+        else:
+            content += 'from sqlalchemy import Column, Integer, String, Boolean, DateTime, Text, ForeignKey, Float\n'
+        
+        content += 'from sqlalchemy.orm import relationship\n'
+        content += 'from database import Base\n'
+        content += 'from datetime import datetime\n\n'
+        
+        # Start class definition - CRITICAL FIX: Ensure class name is present
+        content += f'class {class_name}(Base):\n'
+        content += f'    """ORM model for {entity_name} table"""\n'
+        content += f'    __tablename__ = "{entity_name.lower()}"\n\n'
+        
+        # Generate fields
+        fields = entity.get('fields', [])
+        for field in fields:
+            field_name = field['name']
+            field_type = field.get('type', 'VARCHAR')  # Use SQL type, not python_type
+            is_primary = field.get('primary_key', False)
+            is_nullable = field.get('nullable', True)
+            is_auto_increment = field.get('auto_increment', False)
+            
+            # Map to SQLAlchemy types
+            sql_type = self._get_sqlalchemy_type(field_type, db_type)
+            
+            # Build column definition
+            col_def = f'    {field_name} = Column({sql_type}'
+            
+            # Add primary key
+            if is_primary:
+                col_def += ', primary_key=True'
+            
+            # Add auto increment (only for integer primary keys)
+            if is_auto_increment and is_primary:
+                col_def += ', autoincrement=True'
+            
+            # Add nullable (primary keys are always non-nullable)
+            if not is_nullable or is_primary:
+                col_def += ', nullable=False'
+            
+            col_def += ')\n'
+            content += col_def
+        
+        content += '\n    def __repr__(self):\n'
+        pk_field = next((f['name'] for f in fields if f.get('primary_key')), 'id')
+        content += f'        return f"<{class_name}({{self.{pk_field}}})>"\n'
+        
+        file_path.write_text(content)
+
+        # ✅ STEP 4: Track generation (ONE LINE!)
+        self.track_file(
+            file_path=file_path,
+            template_ids=['sqlalchemy_model_py.j2'],  # Template name
+            content=content,
+            metadata={'entity': entity_name, 'field_count': len(fields)}
+        )
+        return file_path
+    
+    def _generate_pydantic_model(self, output_dir: Path, entity: Dict, enums: Dict) -> Path:
+        """
+        Generate Pydantic validation models for an entity using Jinja2 template
+        
+        CRITICAL FIX: Ensures class names are properly generated
+        """
+        entity_name = entity['table_name']
+        file_path = output_dir / 'models' / f'{entity_name.lower()}_pydantic.py'
+        
+        # Try template-based generation first
+        if self.jinja_env:
+            try:
+                template = self.jinja_env.get_template('pydantic_model_py.j2')
+                template_data = self._transform_entity_for_pydantic_template(entity, enums)
+                content = template.render(**template_data)
+                file_path.write_text(content)
+                logger.info(f"[TEMPLATE] Generated {entity_name}_pydantic.py using Jinja2 template")
+                # ✅ ADD TRACKING BEFORE RETURN!
+                self.track_file(
+                file_path=file_path,
+                template_ids=['pydantic_model_py.j2'],
+                content=content
+                #metadata={'entity': entity_name}
+                )
+                return file_path
+            except TemplateNotFound:
+                logger.warning("[WARN] Template 'pydantic_model_py.j2' not found, falling back to hardcoded generation")
+            except Exception as e:
+                logger.warning(f"[WARN] Template rendering failed: {e}, falling back to hardcoded generation")
+        
+        # Fallback to hardcoded generation
+        logger.info(f"[FALLBACK] Generating {entity_name}_pydantic.py using hardcoded method")
+        class_name = self._to_class_name(entity_name)
+        
+        content = f'"""\n{class_name} Pydantic Models\n'
+        content += '='*(len(class_name) + 16) + '\n'
+        content += 'Pydantic models for API validation and serialization\n"""\n\n'
+        
+        content += 'from pydantic import BaseModel, Field, ConfigDict\n'
+        content += 'from typing import Optional\n'
+        content += 'from datetime import datetime\n\n'
+        
+        # Import enums if needed
+        if enums:
+            content += 'from enums import *\n\n'
+        
+        fields = entity.get('fields', [])
+        
+        # Generate Base model (without auto-increment PK)
+        content += f'class {class_name}Base(BaseModel):\n'
+        content += f'    """Base Pydantic model for {entity_name}"""\n'
+        content += '    model_config = ConfigDict(from_attributes=True)\n\n'
+
+        for field in fields:
+            # Skip auto-increment primary keys and auto-generated fields in base model
+            if field.get('primary_key', False) and field.get('auto_increment', False):
+                continue
+            if field.get('auto_generated', False):
+                continue
+
+            field_name = field['name']
+            py_type = self._get_python_type(field.get('type', 'VARCHAR'))
+            is_nullable = field.get('nullable', True)
+
+            # Check for enum types
+            for enum_name in enums.keys():
+                if enum_name.lower() in field_name.lower():
+                    py_type = self._to_class_name(enum_name)
+                    break
+
+            if is_nullable:
+                content += f'    {field_name}: Optional[{py_type}] = None\n'
+            else:
+                content += f'    {field_name}: {py_type}\n'
+        
+        content += '\n\n'
+        
+        # Generate Create model
+        content += f'class {class_name}Create({class_name}Base):\n'
+        content += f'    """Pydantic model for creating {entity_name}"""\n'
+        content += '    pass\n\n\n'
+        
+        # Generate Update model
+        content += f'class {class_name}Update(BaseModel):\n'
+        content += f'    """Pydantic model for updating {entity_name}"""\n'
+        content += '    model_config = ConfigDict(from_attributes=True)\n\n'
+        
+        for field in fields:
+            # Skip auto-increment primary keys in update
+            if field.get('primary_key') and field.get('auto_increment'):
+                continue
+                
+            field_name = field['name']
+            py_type = self._get_python_type(field.get('type', 'VARCHAR'))
+            
+            # All fields optional in update
+            content += f'    {field_name}: Optional[{py_type}] = None\n'
+        
+        content += '\n\n'
+        
+        # Generate Response model (with ID)
+        content += f'class {class_name}({class_name}Base):\n'
+        content += f'    """Complete Pydantic model for {entity_name} with ID"""\n'
+        
+        # Add primary key field to response model
+        pk_field = next((f for f in fields if f.get('primary_key')), None)
+        pk_added = False
+        
+        if pk_field:
+            pk_name = pk_field['name']
+            pk_type = self._get_python_type(pk_field.get('type', 'INTEGER'))
+            content += f'    {pk_name}: {pk_type}  # Primary key\n'
+            pk_added = True
+            logger.info(f"[PYDANTIC] Added primary key field: {pk_name} ({pk_type})")
+        else:
+            # If no primary key was found, check for common PK patterns
+            logger.warning(f"[PYDANTIC] No primary key field found for {entity_name}, checking common patterns...")
+            for field in fields:
+                if field['name'] in ['id', f'{entity_name.lower()}_id', 'nsi_id'] and not pk_added:
+                    pk_type = self._get_python_type(field.get('type', 'INTEGER'))
+                    content += f'    {field["name"]}: {pk_type}  # Primary key (inferred)\n'
+                    pk_added = True
+                    logger.info(f"[PYDANTIC] Inferred primary key field: {field['name']} ({pk_type})")
+                    break
+        
+        # Add any other auto-generated fields (like timestamps)
+        for field in fields:
+            if field.get('auto_generated') and not field.get('primary_key'):
+                field_name = field['name']
+                py_type = self._get_python_type(field.get('type', 'VARCHAR'))
+                content += f'    {field_name}: {py_type}  # Auto-generated field\n'
+        
+        # If still no primary key was added, add a warning comment
+        if not pk_added:
+            content += '    # WARNING: No primary key field detected!\n'
+            logger.error(f"[PYDANTIC] No primary key could be determined for {entity_name}")
+        
+        file_path.write_text(content)
+
+        # ✅ STEP 4: Track generation
+        self.track_file(file_path, ['pydantic_model_py.j2'], content, {'entity': entity_name})
+
+        return file_path
+    
+    def _generate_models_init(self, output_dir: Path, entities: List[Dict]) -> Path:
+        """Generate models/__init__.py"""
+        file_path = output_dir / 'models' / '__init__.py'
+        
+        content = '"""Models package - ORM and Pydantic models"""\n\n'
+        
+        # Import all models
+        for entity in entities:
+            entity_name = entity['table_name']
+            class_name = self._to_class_name(entity_name)
+            
+            # Import ORM model
+            content += f'from .{entity_name.lower()}_orm import {class_name} as {class_name}ORM\n'
+            
+            # Import Pydantic models
+            content += f'from .{entity_name.lower()}_pydantic import (\n'
+            content += f'    {class_name},\n'
+            content += f'    {class_name}Create,\n'
+            content += f'    {class_name}Update,\n'
+            content += f'    {class_name}Base,\n'
+            content += f')\n\n'
+        
+        # Create __all__ list
+        content += '__all__ = [\n'
+        for entity in entities:
+            class_name = self._to_class_name(entity['table_name'])
+            content += f'    "{class_name}ORM",\n'
+            content += f'    "{class_name}",\n'
+            content += f'    "{class_name}Create",\n'
+            content += f'    "{class_name}Update",\n'
+            content += f'    "{class_name}Base",\n'
+        content += ']\n'
+        
+        file_path.write_text(content)
+
+        # ✅ STEP 4: Track generation - HARDCODED (empty list!)
+        self.track_file(file_path, [], content, {'entity_count': len(entities)})
+
+        return file_path
+    
+    def _generate_route_file(self, output_dir: Path, entity_name: str, 
+                            apis: List[Dict], all_entities: List[Dict]) -> Path:
+        """Generate route file with CRUD operations for an entity using Jinja2 template"""
+        file_path = output_dir / 'routes' / f'{entity_name.lower()}.py'
+        
+        class_name = self._to_class_name(entity_name)
+        
+        # Find primary key field
+        entity_obj = next((e for e in all_entities if e['table_name'].lower() == entity_name.lower()), None)
+        pk_field = 'id'
+        pk_type = 'int'
+        if entity_obj:
+            pk_f = next((f for f in entity_obj.get('fields', []) if f.get('primary_key')), None)
+            if pk_f:
+                pk_field = pk_f['name']
+                pk_type = 'int' if pk_f.get('type') in ['INTEGER', 'SERIAL', 'int'] else 'str'
+        
+        # Try template-based generation first
+        if self.jinja_env:
+            try:
+                template = self.jinja_env.get_template('route_py.j2')
+                template_data = {
+                    'class_name': class_name,
+                    'entity_name': entity_name,
+                    'pk_field': pk_field,
+                    'pk_type': pk_type,
+                    'api_version': self._get_entity_version(entity_name)
+                }
+                content = template.render(**template_data)
+                file_path.write_text(content)
+                logger.info(f"[TEMPLATE] Generated {entity_name}.py route using Jinja2 template")
+
+                # ✅ STEP 4: Track generation
+                self.track_file(file_path, ['route_py.j2'], content, {'entity': entity_name, 'api_count': len(apis)})
+                return file_path
+            except TemplateNotFound:
+                logger.warning("[WARN] Template 'route_py.j2' not found, falling back to hardcoded generation")
+            except Exception as e:
+                logger.warning(f"[WARN] Template rendering failed: {e}, falling back to hardcoded generation")
+        
+        # Fallback to hardcoded generation
+        logger.info(f"[FALLBACK] Generating {entity_name}.py route using hardcoded method")
+        content = f'"""\n{class_name} API Routes\n'
+        content += '='*(len(class_name) + 11) + '\n'
+        content += 'CRUD endpoints with real database operations\n"""\n\n'
+        
+        content += 'from fastapi import APIRouter, HTTPException, Depends, status\n'
+        content += 'from sqlalchemy.orm import Session\n'
+        content += 'from typing import List\n'
+        content += 'from database import get_db\n\n'
+        
+        # Import models
+        content += f'from models.{entity_name.lower()}_orm import {class_name} as {class_name}ORM\n'
+        content += f'from models.{entity_name.lower()}_pydantic import (\n'
+        content += f'    {class_name},\n'
+        content += f'    {class_name}Create,\n'
+        content += f'    {class_name}Update,\n'
+        content += f')\n\n'
+        
+        # Get entity-specific API version
+        entity_version = self._get_entity_version(entity_name)
+        
+        content += f'router = APIRouter(\n'
+        content += f'    prefix="/api/{entity_version}/{entity_name.lower()}",\n'
+        content += f'    tags=["{class_name}"],\n'
+        content += f')\n\n'
+        
+        # Generate CRUD operations
+        content += self._generate_crud_operations(class_name, entity_name, pk_field, pk_type, all_entities)
+        
+        file_path.write_text(content)
+        
+        # ✅ STEP 4: Track generation
+        self.track_file(file_path, ['route_py.j2'], content, {'entity': entity_name, 'api_count': len(apis)})
+        
+        return file_path
+    
+    def _generate_crud_operations(self, class_name: str, entity_name: str, 
+                                 pk_field: str, pk_type: str, all_entities: List[Dict]) -> str:
+        """Generate CRUD operation methods"""
+        content = ''
+        
+        # CREATE
+        content += f'@router.post("/", response_model={class_name}, status_code=status.HTTP_201_CREATED)\n'
+        content += f'def create_{entity_name.lower()}(\n'
+        content += f'    item: {class_name}Create,\n'
+        content += f'    db: Session = Depends(get_db)\n'
+        content += f') -> {class_name}:\n'
+        content += f'    """Create a new {entity_name}"""\n'
+        content += f'    db_item = {class_name}ORM(**item.model_dump())\n'
+        content += f'    db.add(db_item)\n'
+        content += f'    db.commit()\n'
+        content += f'    db.refresh(db_item)\n'
+        content += f'    return db_item\n\n'
+        
+        # READ ALL
+        content += f'@router.get("/", response_model=List[{class_name}])\n'
+        content += f'def get_{entity_name.lower()}s(\n'
+        content += f'    skip: int = 0,\n'
+        content += f'    limit: int = 100,\n'
+        content += f'    db: Session = Depends(get_db)\n'
+        content += f') -> List[{class_name}]:\n'
+        content += f'    """Get all {entity_name} records"""\n'
+        content += f'    items = db.query({class_name}ORM).offset(skip).limit(limit).all()\n'
+        content += f'    return items\n\n'
+        
+        # READ ONE
+        content += f'@router.get("/{{{pk_field}}}", response_model={class_name})\n'
+        content += f'def get_{entity_name.lower()}(\n'
+        content += f'    {pk_field}: {pk_type},\n'
+        content += f'    db: Session = Depends(get_db)\n'
+        content += f') -> {class_name}:\n'
+        content += f'    """Get a specific {entity_name} by ID"""\n'
+        content += f'    item = db.query({class_name}ORM).filter({class_name}ORM.{pk_field} == {pk_field}).first()\n'
+        content += f'    if item is None:\n'
+        content += f'        raise HTTPException(status_code=404, detail="{class_name} not found")\n'
+        content += f'    return item\n\n'
+        
+        # Add endpoints for common identifier fields (non-primary key string fields)
+        entity_obj = next((e for e in all_entities if e['table_name'].lower() == entity_name.lower()), None)
+        if entity_obj:
+            # Look for common identifier field names that are strings and not primary keys
+            identifier_fields = []
+            for field in entity_obj.get('fields', []):
+                field_name = field.get('name', '')
+                field_type = field.get('type', '')
+                is_primary = field.get('primary_key', False)
+                is_string = field_type.upper() in ['VARCHAR', 'TEXT', 'STRING', 'str']
+                
+                # Check if it's a common identifier field name
+                identifier_patterns = ['item_id', 'entity_id', 'reference_id', 'tracking_number', 'document_id', 'user_id']
+                if (not is_primary and is_string and 
+                    (field_name in identifier_patterns or field_name.endswith('_id') or 'id' in field_name.lower())):
+                    identifier_fields.append(field_name)
+            
+            # Generate endpoints for each identifier field
+            for field_name in identifier_fields:
+                clean_name = field_name.replace('_', '-')
+                method_name = field_name.replace('_', '_')
+                content += f'@router.get("/by-{clean_name}/{{field_value}}", response_model=List[{class_name}])\n'
+                content += f'def get_{entity_name.lower()}_by_{method_name}(\n'
+                content += f'    field_value: str,\n'
+                content += f'    db: Session = Depends(get_db)\n'
+                content += f') -> List[{class_name}]:\n'
+                content += f'    """Get {entity_name} records by {field_name}"""\n'
+                content += f'    items = db.query({class_name}ORM).filter({class_name}ORM.{field_name} == field_value).all()\n'
+                content += f'    return items\n\n'
+        
+        # UPDATE
+        content += f'@router.put("/{{{pk_field}}}", response_model={class_name})\n'
+        content += f'def update_{entity_name.lower()}(\n'
+        content += f'    {pk_field}: {pk_type},\n'
+        content += f'    item_update: {class_name}Update,\n'
+        content += f'    db: Session = Depends(get_db)\n'
+        content += f') -> {class_name}:\n'
+        content += f'    """Update a {entity_name}"""\n'
+        content += f'    db_item = db.query({class_name}ORM).filter({class_name}ORM.{pk_field} == {pk_field}).first()\n'
+        content += f'    if db_item is None:\n'
+        content += f'        raise HTTPException(status_code=404, detail="{class_name} not found")\n'
+        content += f'    \n'
+        content += f'    update_data = item_update.model_dump(exclude_unset=True)\n'
+        content += f'    for field, value in update_data.items():\n'
+        content += f'        setattr(db_item, field, value)\n'
+        content += f'    \n'
+        content += f'    db.commit()\n'
+        content += f'    db.refresh(db_item)\n'
+        content += f'    return db_item\n\n'
+        
+        # DELETE
+        content += f'@router.delete("/{{{pk_field}}}", status_code=status.HTTP_204_NO_CONTENT)\n'
+        content += f'def delete_{entity_name.lower()}(\n'
+        content += f'    {pk_field}: {pk_type},\n'
+        content += f'    db: Session = Depends(get_db)\n'
+        content += f'):\n'
+        content += f'    """Delete a {entity_name}"""\n'
+        content += f'    db_item = db.query({class_name}ORM).filter({class_name}ORM.{pk_field} == {pk_field}).first()\n'
+        content += f'    if db_item is None:\n'
+        content += f'        raise HTTPException(status_code=404, detail="{class_name} not found")\n'
+        content += f'    \n'
+        content += f'    db.delete(db_item)\n'
+        content += f'    db.commit()\n'
+        content += f'    return None\n\n'
+        
+        return content
+    
+    def _generate_routes_init(self, output_dir: Path, entity_names: List[str]) -> Path:
+        """Generate routes/__init__.py"""
+        file_path = output_dir / 'routes' / '__init__.py'
+        
+        content = '"""Routes package - API endpoints"""\n\n'
+        
+        for entity_name in entity_names:
+            content += f'from .{entity_name.lower()} import router as {entity_name.lower()}_router\n'
+        
+        content += '\n__all__ = [\n'
+        for entity_name in entity_names:
+            content += f'    "{entity_name.lower()}_router",\n'
+        content += ']\n'
+        
+        file_path.write_text(content)
+
+        # ✅ STEP 4: Track generation - HARDCODED
+        self.track_file(file_path, [], content, {'entity_count': len(entity_names)})
+
+        return file_path
+    
+    def _generate_database_file(self, output_dir: Path, db_config: Dict) -> Path:
+        """Generate database.py with connection configuration for SQLite or PostgreSQL"""
+        file_path = output_dir / 'database.py'
+        
+        db_type = db_config.get('type', 'sqlite')
+        
+        # Try template-based generation first
+        if self.jinja_env:
+            try:
+                template = self.jinja_env.get_template('database_py.j2')
+                template_data = {
+                    'db_type': db_type
+                }
+                content = template.render(**template_data)
+                file_path.write_text(content)
+                logger.info(f"[TEMPLATE] Generated database.py using Jinja2 template for {db_type}")
+
+                # ✅ STEP 4: Track generation - HARDCODED
+                self.track_file(
+                file_path=file_path,
+                template_ids=['database_py.j2'],  # Template name
+                content=content)
+
+                return file_path
+            except TemplateNotFound:
+                logger.warning("[WARN] Template 'database_py.j2' not found, falling back to hardcoded generation")
+            except Exception as e:
+                logger.warning(f"[WARN] Template rendering failed: {e}, falling back to hardcoded generation")
+        
+        # Fallback to hardcoded generation
+        logger.info(f"[FALLBACK] Generating database.py using hardcoded method for {db_type}")
+        content = '"""\nDatabase Configuration\n===================\n'
+        content += 'SQLAlchemy database connection and session management\n"""\n\n'
+        
+        content += 'import os\n'
+        content += 'from sqlalchemy import create_engine\n'
+        content += 'from sqlalchemy.ext.declarative import declarative_base\n'
+        content += 'from sqlalchemy.orm import sessionmaker\n\n'
+        
+        # Generate connection URL based on database type
+        if db_type == 'postgresql':
+            content += f'# PostgreSQL Configuration (hardcoded)\n'
+            content += f'DB_HOST = "localhost"\n'
+            content += f'DB_PORT = 5432\n'
+            content += f'DB_NAME = "nsi_app"\n'
+            content += f'DB_USER = "postgres"\n'
+            content += f'DB_PASSWORD = "password"\n\n'
+            
+            content += f'SQLALCHEMY_DATABASE_URL = "postgresql://postgres:password@localhost:5432/nsi_app"\n\n'
+            
+            content += 'engine = create_engine(\n'
+            content += '    SQLALCHEMY_DATABASE_URL,\n'
+            content += '    pool_pre_ping=True,\n'
+            content += '    pool_recycle=300,\n'
+            content += '    echo=False  # Set to True for SQL logging\n'
+            content += ')\n\n'
+            
+        elif db_type == 'mysql':
+            content += f'SQLALCHEMY_DATABASE_URL = "mysql+pymysql://user:password@localhost:3306/nsi_app"\n\n'
+            content += 'engine = create_engine(\n'
+            content += '    SQLALCHEMY_DATABASE_URL,\n'
+            content += '    pool_pre_ping=True\n'
+            content += ')\n\n'
+            
+        else:  # sqlite
+            content += f'# SQLite Configuration (hardcoded)\n'
+            content += f'DB_NAME = "nsi_app.db"\n'
+            content += f'# Create database in project root folder (3 levels up from Generated/backend/database.py)\n'
+            content += f'PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))\n'
+            content += f'DB_PATH = os.path.join(PROJECT_ROOT, DB_NAME)\n\n'
+            content += f'SQLALCHEMY_DATABASE_URL = f"sqlite:///{{DB_PATH}}"\n\n'
+            
+            content += 'engine = create_engine(\n'
+            content += '    SQLALCHEMY_DATABASE_URL,\n'
+            content += '    connect_args={"check_same_thread": False},\n'
+            content += '    echo=False  # Set to True for SQL logging\n'
+            content += ')\n\n'
+        
+        content += 'SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)\n\n'
+        content += 'Base = declarative_base()\n\n'
+        
+        content += 'def get_db():\n'
+        content += '    """Database session dependency"""\n'
+        content += '    db = SessionLocal()\n'
+        content += '    try:\n'
+        content += '        yield db\n'
+        content += '    finally:\n'
+        content += '        db.close()\n\n'
+        
+        # Add database creation helper for PostgreSQL
+        if db_type == 'postgresql':
+            content += 'def create_database_if_not_exists():\n'
+            content += '    """Create database if it doesn\'t exist (PostgreSQL only)"""\n'
+            content += '    import psycopg2\n'
+            content += '    from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT\n'
+            content += '    \n'
+            content += '    try:\n'
+            content += f'        # Connect to PostgreSQL server (not specific database)\n'
+            content += f'        conn = psycopg2.connect(\n'
+            content += f'            host=DB_HOST,\n'
+            content += f'            port=DB_PORT,\n'
+            content += f'            user=DB_USER,\n'
+            content += f'            password=DB_PASSWORD,\n'
+            content += f'            database="postgres"  # Connect to default postgres database\n'
+            content += f'        )\n'
+            content += '        conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)\n'
+            content += '        cursor = conn.cursor()\n'
+            content += '        \n'
+            content += f'        # Check if database exists\n'
+            content += f'        cursor.execute("SELECT 1 FROM pg_catalog.pg_database WHERE datname = %s", (DB_NAME,))\n'
+            content += '        exists = cursor.fetchone()\n'
+            content += '        \n'
+            content += '        if not exists:\n'
+            content += f'            cursor.execute(f"CREATE DATABASE {{DB_NAME}}")\n'
+            content += f'            print(f"[DB] Created PostgreSQL database: {{DB_NAME}}")\n'
+            content += '        else:\n'
+            content += f'            print(f"[DB] PostgreSQL database already exists: {{DB_NAME}}")\n'
+            content += '        \n'
+            content += '        cursor.close()\n'
+            content += '        conn.close()\n'
+            content += '        \n'
+            content += '    except Exception as e:\n'
+            content += '        print(f"[DB] Error creating PostgreSQL database: {e}")\n'
+            content += '        raise\n'
+        
+        file_path.write_text(content)
+
+        # ✅ STEP 4: Track generation - HARDCODED
+        self.track_file(file_path, [], content, {'db_type': db_type})
+        
+        return file_path
+    
+    def _generate_main_file(self, output_dir: Path, entity_names: List[str], db_config: Dict = None) -> Path:
+        """Generate main.py FastAPI application with database type support"""
+        file_path = output_dir / 'main.py'
+        
+        if db_config is None:
+            db_config = {}
+        
+        db_type = db_config.get('type', 'sqlite')
+        
+        content = '"""\nFastAPI Application\n=================\n'
+        content += 'Main application entry point\n"""\n\n'
+        
+        content += 'from fastapi import FastAPI\n'
+        content += 'from fastapi.middleware.cors import CORSMiddleware\n'
+        
+        if db_type == 'postgresql':
+            content += 'from database import engine, Base, create_database_if_not_exists\n\n'
+        else:
+            content += 'from database import engine, Base\n\n'
+        
+        # Import routers
+        for entity_name in entity_names:
+            content += f'from routes.{entity_name.lower()} import router as {entity_name.lower()}_router\n'
+        
+        # Database initialization based on type
+        if db_type == 'postgresql':
+            content += '\n# Initialize PostgreSQL database\n'
+            content += 'try:\n'
+            content += '    create_database_if_not_exists()\n'
+            content += 'except Exception as e:\n'
+            content += '    print(f"[WARNING] Could not create PostgreSQL database: {e}")\n'
+            content += '    print("[INFO] Make sure PostgreSQL is running and credentials are correct")\n\n'
+        
+        content += '# Create database tables\n'
+        content += 'try:\n'
+        content += '    Base.metadata.create_all(bind=engine)\n'
+        if db_type == 'postgresql':
+            content += '    print("[DB] PostgreSQL tables created successfully")\n'
+        else:
+            content += '    print("[DB] SQLite tables created successfully")\n'
+        content += 'except Exception as e:\n'
+        content += '    print(f"[ERROR] Could not create tables: {e}")\n'
+        content += '    raise\n\n'
+        
+        content += 'app = FastAPI(\n'
+        content += '    title="Generated API",\n'
+        content += '    description="Auto-generated FastAPI backend",\n'
+        content += '    version="1.0.0"\n'
+        content += ')\n\n'
+        
+        content += '# CORS configuration\n'
+        content += 'app.add_middleware(\n'
+        content += '    CORSMiddleware,\n'
+        content += '    allow_origins=["*"],\n'
+        content += '    allow_credentials=True,\n'
+        content += '    allow_methods=["*"],\n'
+        content += '    allow_headers=["*"],\n'
+        content += ')\n\n'
+        
+        # Include routers with API versioning
+        api_version = self.api_version
+        for entity_name in entity_names:
+            content += f'app.include_router({entity_name.lower()}_router, prefix="/api")\n'
+        
+        content += '\n@app.get("/")\n'
+        content += 'def root():\n'
+        content += '    return {"message": "API is running", "docs": "/docs"}\n\n'
+        
+        content += 'if __name__ == "__main__":\n'
+        content += '    import uvicorn\n'
+        content += '    uvicorn.run(app, host="0.0.0.0", port=8000)\n'
+        
+        file_path.write_text(content)
+
+        # ✅ STEP 4: Track generation - HARDCODED
+        self.track_file(file_path, [], content, {'entity_count': len(entity_names)})
+        
+        return file_path
+    
+    def _generate_requirements_file(self, output_dir: Path, db_config: Dict) -> Path:
+        """Generate requirements.txt with Python 3.13 compatible versions"""
+        file_path = output_dir / 'requirements.txt'
+        
+        db_type = db_config.get('type', 'sqlite')
+        
+        requirements = [
+            '# FastAPI and dependencies',
+            'fastapi==0.115.5',
+            'uvicorn[standard]==0.32.1',
+            'pydantic==2.9.2',
+            '',
+            '# Database',
+            'sqlalchemy==2.0.36',
+        ]
+        
+        if db_type == 'postgresql':
+            requirements.extend([
+                '# PostgreSQL dependencies',
+                'psycopg2-binary==2.9.10',
+                'alembic==1.13.1  # Database migrations'
+            ])
+        elif db_type == 'mysql':
+            requirements.extend([
+                '# MySQL dependencies',
+                'pymysql==1.1.1',
+                'alembic==1.13.1  # Database migrations'
+            ])
+        else:  # sqlite
+            requirements.append('alembic==1.13.1  # Database migrations')
+        
+        requirements.extend([
+            '',
+            '# Additional utilities',
+            'python-multipart==0.0.20',
+            'python-jose[cryptography]==3.3.0',
+            'passlib[bcrypt]==1.7.4',
+        ])
+
+        # ✅ STEP 1: Store content in variable
+        content = '\n'.join(requirements)
+
+        # ✅ STEP 2: Write file
+        file_path.write_text(content)
+  
+        #file_path.write_text('\n'.join(requirements))
+
+        # ✅ STEP 4: Track generation - HARDCODED
+        self.track_file(file_path, [], content, {'db_type': db_config.get('type', 'sqlite')})
+        
+        
+        return file_path
+    
+    # Helper methods
+    
+    def _to_class_name(self, name: str) -> str:
+        """Convert snake_case or kebab-case to PascalCase"""
+        return ''.join(word.capitalize() for word in name.replace('-', '_').split('_'))
+    
+    def _get_sqlalchemy_type(self, field_type: str, db_type: str = 'sqlite') -> str:
+        """Map field type to SQLAlchemy column type based on database type"""
+        # Common types for both SQLite and PostgreSQL
+        type_map = {
+            'INTEGER': 'Integer',
+            'int': 'Integer',
+            'BIGINT': 'BigInteger',
+            'VARCHAR': 'String',
+            'str': 'String',
+            'string': 'String',
+            'TEXT': 'Text',
+            'text': 'Text',
+            'BOOLEAN': 'Boolean',
+            'bool': 'Boolean',
+            'boolean': 'Boolean',
+            'TIMESTAMP': 'DateTime',
+            'datetime': 'DateTime',
+            'FLOAT': 'Float',
+            'float': 'Float',
+            'DOUBLE': 'Float',
+            'REAL': 'Float',
+        }
+        
+        # Database-specific type mappings
+        if db_type == 'postgresql':
+            pg_specific = {
+                'SERIAL': 'Integer',  # PostgreSQL SERIAL
+                'BIGSERIAL': 'BigInteger',  # PostgreSQL BIGSERIAL
+                'DECIMAL': 'Numeric',  # Use Numeric for PostgreSQL DECIMAL
+                'NUMERIC': 'Numeric',
+                'JSONB': 'Text',  # PostgreSQL JSONB as Text for now
+                'JSON': 'Text',   # PostgreSQL JSON as Text
+                'UUID': 'String', # PostgreSQL UUID as String
+                'UNIQUEIDENTIFIER': 'String',  # SQL Server compatibility
+            }
+            type_map.update(pg_specific)
+        else:  # sqlite
+            sqlite_specific = {
+                'SERIAL': 'Integer',  # SQLite doesn't have SERIAL, use INTEGER
+                'BIGSERIAL': 'Integer',
+                'DECIMAL': 'Float',  # SQLite stores DECIMAL as REAL
+                'NUMERIC': 'Float',  # SQLite stores NUMERIC as REAL or INTEGER
+                'JSONB': 'Text',  # JSON stored as TEXT in SQLite
+                'JSON': 'Text',
+                'UUID': 'String',  # UUID stored as TEXT in SQLite
+                'UNIQUEIDENTIFIER': 'String',
+            }
+            type_map.update(sqlite_specific)
+        
+        return type_map.get(field_type.upper(), 'String')
+    
+    def _get_python_type(self, field_type: str) -> str:
+        """Map field type to Python type annotation"""
+        type_map = {
+            'INTEGER': 'int',
+            'int': 'int',
+            'SERIAL': 'int',
+            'BIGSERIAL': 'int',
+            'VARCHAR': 'str',
+            'str': 'str',
+            'string': 'str',
+            'TEXT': 'str',
+            'text': 'str',
+            'BOOLEAN': 'bool',
+            'bool': 'bool',
+            'boolean': 'bool',
+            'TIMESTAMP': 'datetime',
+            'datetime': 'datetime',
+            'FLOAT': 'float',
+            'float': 'float',
+            'DOUBLE': 'float',
+            'DECIMAL': 'float',
+            'NUMERIC': 'float',
+            'JSONB': 'str',  # JSON as string for Python
+            'JSON': 'str',
+            'UUID': 'str',
+        }
+        return type_map.get(field_type.upper(), 'str')
+    
+    def _group_apis_by_entity(self, apis: List[Dict]) -> Dict[str, List[Dict]]:
+        """Group APIs by their entity name"""
+        grouped = {}
+        for api in apis:
+            entity = api.get('entity') or api.get('resource')
+            if entity:
+                entity_lower = entity.lower()
+                if entity_lower not in grouped:
+                    grouped[entity_lower] = []
+                grouped[entity_lower].append(api)
+        return grouped
+    
+    # Template Data Transformation Methods
+    
+    def _transform_entity_for_pydantic_template(self, entity: Dict, enums: Dict) -> Dict[str, Any]:
+        """
+        Transform entity data structure to match pydantic_model_py.j2 template expectations
+        
+        Template expects:
+        - entity_name: Class name (PascalCase)
+        - generation_timestamp: ISO timestamp
+        - enums: List of enum objects with 'name' attribute
+        - fields: List with is_nullable, python_type, is_primary_key, default_value
+        """
+        from datetime import datetime
+        
+        entity_name = self._to_class_name(entity['table_name'])
+        fields = entity.get('fields', [])
+        
+        # Transform fields to template format
+        transformed_fields = []
+        all_fields = []  # Keep all fields for response model
+        
+        for field in fields:
+            transformed_field = {
+                'name': field['name'],
+                'python_type': self._get_python_type(field.get('type', 'VARCHAR')),
+                'is_nullable': field.get('nullable', True),
+                'is_primary_key': field.get('primary_key', False),
+                'auto_increment': field.get('auto_increment', False),
+                'default_value': field.get('default'),
+            }
+            
+            # Add to all fields list
+            all_fields.append(transformed_field)
+            
+            # Skip auto-increment primary keys in base model only
+            if field.get('primary_key', False) and field.get('auto_increment', False):
+                continue
+                
+            transformed_fields.append(transformed_field)
+        
+        # Transform enums to template format (list of objects with 'name')
+        transformed_enums = [{'name': self._to_class_name(enum_name)} for enum_name in enums.keys()] if enums else []
+        
+        return {
+            'entity_name': entity_name,
+            'generation_timestamp': datetime.now().isoformat(),
+            'enums': transformed_enums,
+            'fields': transformed_fields,  # Base/Create/Update models (without auto-increment PK)
+            'all_fields': all_fields  # Response model (with all fields including PK)
+        }
+    
+    def _transform_entity_for_sqlalchemy_template(self, entity: Dict, all_entities: List[Dict], enums: Dict) -> Dict[str, Any]:
+        """
+        Transform entity data structure to match sqlalchemy_model_py.j2 template expectations
+        
+        Template expects:
+        - entity: {name, table_name, description, fields}
+        - relationships: List of relationship objects
+        - enums: List of enum names
+        """
+        class_name = self._to_class_name(entity['table_name'])
+        fields = entity.get('fields', [])
+        
+        # Transform fields to template format
+        transformed_fields = []
+        for field in fields:
+            field_type = field.get('type', 'VARCHAR')
+            transformed_field = {
+                'name': field['name'],
+                'type': field_type,
+                'length': field.get('length', 255) if field_type in ['VARCHAR', 'str', 'string'] else None,
+                'primary_key': field.get('primary_key', False),
+                'nullable': field.get('nullable', True),
+                'unique': field.get('unique', False),
+                'default': field.get('default'),
+                'index': field.get('index', False),
+                'enum': None  # Could be enhanced to detect enum fields
+            }
+            transformed_fields.append(transformed_field)
+        
+        transformed_entity = {
+            'name': class_name,
+            'table_name': entity['table_name'].lower(),
+            'description': entity.get('description', f'ORM model for {class_name}'),
+            'fields': transformed_fields
+        }
+        
+        # Transform relationships (if any)
+        relationships = []  # Could be enhanced to extract from foreign keys
+        
+        # Transform enums
+        transformed_enums = [self._to_class_name(enum_name) for enum_name in enums.keys()] if enums else []
+        
+        return {
+            'entity': transformed_entity,
+            'relationships': relationships,
+            'enums': transformed_enums
+        }
+    
+    def _transform_enums_for_template(self, enums: Dict) -> Dict[str, Any]:
+        """
+        Transform enums data structure to match enums_py.j2 template expectations
+        
+        Template expects:
+        - enums: Dict mapping enum class names to list of values
+        """
+        transformed = {}
+        for enum_name, enum_values in enums.items():
+            class_name = self._to_class_name(enum_name)
+            transformed[class_name] = enum_values
+        return {'enums': transformed}
+
+    def update_dependency_graph(self, app_config: Dict[str, Any], output_dir: Path) -> Dict[str, Any]:
+        """
+        Create/update dependency graph to track relationships between tables, fields, APIs, and models.
+        This graph is used for impact analysis when schema changes occur.
+        """
+        import json
+        from datetime import datetime
+        
+        # Save dependency graph to project root, not inside generated folder
+        graph_file = Path("backend_dependency_graph.json")
+        
+        # Load existing graph if present
+        if graph_file.exists():
+            try:
+                with open(graph_file, "r") as f:
+                    existing_graph = json.load(f)
+                print(f"[DEPENDENCY] Loaded existing dependency graph with {len(existing_graph.get('tables', {}))} tables")
+            except Exception as e:
+                print(f"[DEPENDENCY] Warning: Could not load existing graph: {e}. Creating new one.")
+                existing_graph = {}
+        else:
+            existing_graph = {}
+            print("[DEPENDENCY] Creating new dependency graph")
+        
+        # Initialize graph structure
+        graph = {
+            "metadata": {
+                "version": "1.0",
+                "last_updated": datetime.now().isoformat(),
+                "generator_version": "2.0",
+                "database_type": app_config.get('metadata', {}).get('database', {}).get('type', 'sqlite')
+            },
+            "tables": existing_graph.get('tables', {}),
+            "apis": existing_graph.get('apis', {}),
+            "models": existing_graph.get('models', {}),
+            "relationships": existing_graph.get('relationships', {}),
+            "change_history": existing_graph.get('change_history', [])
+        }
+        
+        entities = app_config.get('entities', [])
+        apis = app_config.get('apis', [])
+        
+        # Track changes for this update
+        changes_made = []
+        
+        # Update tables and fields
+        for entity in entities:
+            table_name = entity['table_name'].lower()
+            class_name = self._to_class_name(entity['table_name'])
+            
+            # Initialize table entry if not exists
+            if table_name not in graph["tables"]:
+                graph["tables"][table_name] = {
+                    "class_name": class_name,
+                    "description": entity.get('description', ''),
+                    "fields": {},
+                    "primary_keys": [],
+                    "foreign_keys": [],
+                    "indexes": [],
+                    "constraints": [],
+                    "related_apis": [],
+                    "related_models": []
+                }
+                changes_made.append(f"Added new table: {table_name}")
+            
+            table_info = graph["tables"][table_name]
+            
+            # Update fields
+            for field in entity.get('fields', []):
+                field_name = field['name']
+                field_type = field.get('type', 'TEXT')
+                field_length = field.get('length')
+                
+                # Check if field exists and has changes
+                if field_name not in table_info["fields"]:
+                    changes_made.append(f"Added field {table_name}.{field_name}")
+                else:
+                    existing_field = table_info["fields"][field_name]
+                    if existing_field.get("type") != field_type:
+                        changes_made.append(f"Changed field type {table_name}.{field_name}: {existing_field.get('type')} -> {field_type}")
+                    if existing_field.get("length") != field_length and field_length is not None:
+                        changes_made.append(f"Changed field length {table_name}.{field_name}: {existing_field.get('length')} -> {field_length}")
+                
+                table_info["fields"][field_name] = {
+                    "type": field_type,
+                    "length": field_length,
+                    "nullable": field.get('nullable', True),
+                    "primary_key": field.get('primary_key', False),
+                    "auto_increment": field.get('auto_increment', False),
+                    "unique": field.get('unique', False),
+                    "default": field.get('default'),
+                    "foreign_key": field.get('foreign_key'),
+                    "related_apis": [],
+                    "related_models": [],
+                    "impact_analysis": {
+                        "read_apis": [],
+                        "write_apis": [],
+                        "validation_models": []
+                    }
+                }
+                
+                # Track primary keys
+                if field.get('primary_key', False):
+                    if field_name not in table_info["primary_keys"]:
+                        table_info["primary_keys"].append(field_name)
+                
+                # Track foreign keys
+                if field.get('foreign_key'):
+                    fk_info = {
+                        "field": field_name,
+                        "references": field['foreign_key']
+                    }
+                    if fk_info not in table_info["foreign_keys"]:
+                        table_info["foreign_keys"].append(fk_info)
+        
+        # Update models information
+        for entity in entities:
+            table_name = entity['table_name'].lower()
+            class_name = self._to_class_name(entity['table_name'])
+            
+            # Pydantic models
+            pydantic_models = {
+                f"{class_name}": {
+                    "type": "response",
+                    "description": f"Complete model for {class_name} with all fields",
+                    "table": table_name,
+                    "fields": [f['name'] for f in entity.get('fields', [])],
+                    "usage": "API responses, database queries"
+                },
+                f"{class_name}Create": {
+                    "type": "request",
+                    "description": f"Model for creating new {class_name}",
+                    "table": table_name,
+                    "fields": [f['name'] for f in entity.get('fields', []) 
+                          if not (f.get('primary_key', False) and f.get('auto_increment', False))],
+                    "usage": "POST requests, create operations"
+                },
+                f"{class_name}Update": {
+                    "type": "request",
+                    "description": f"Model for updating {class_name}",
+                    "table": table_name,
+                    "fields": [f['name'] for f in entity.get('fields', []) 
+                          if not (f.get('primary_key', False) and f.get('auto_increment', False))],
+                    "usage": "PUT/PATCH requests, update operations"
+                }
+            }
+            
+            for model_name, model_info in pydantic_models.items():
+                if model_name not in graph["models"]:
+                    changes_made.append(f"Added model: {model_name}")
+                graph["models"][model_name] = model_info
+        
+        # Update APIs and link to tables/models
+        api_groups = self._group_apis_by_entity(apis)
+        
+        for entity_name, entity_apis in api_groups.items():
+            table_name = entity_name.lower()
+            class_name = self._to_class_name(entity_name)
+            
+            # Generate standard CRUD endpoints with API versioning
+            entity_version = self._get_entity_version(entity_name)
+            crud_apis = [
+                {
+                    "method": "POST", 
+                    "path": f"/api/{entity_version}/{table_name}/",
+                    "operation": "create",
+                    "request_model": f"{class_name}Create",
+                    "response_model": class_name,
+                    "description": f"Create a new {class_name}"
+                },
+                {
+                    "method": "GET", 
+                    "path": f"/api/{entity_version}/{table_name}/",
+                    "operation": "read_all",
+                    "request_model": None,
+                    "response_model": f"List[{class_name}]",
+                    "description": f"Get all {class_name} records"
+                },
+                {
+                    "method": "GET", 
+                    "path": f"/api/{entity_version}/{table_name}/{{id}}",
+                    "operation": "read_one",
+                    "request_model": None,
+                    "response_model": class_name,
+                    "description": f"Get a specific {class_name} by ID"
+                },
+                {
+                    "method": "PUT", 
+                    "path": f"/api/{entity_version}/{table_name}/{{id}}",
+                    "operation": "update",
+                    "request_model": f"{class_name}Update",
+                    "response_model": class_name,
+                    "description": f"Update a {class_name}"
+                },
+                {
+                    "method": "DELETE", 
+                    "path": f"/api/{entity_version}/{table_name}/{{id}}",
+                    "operation": "delete",
+                    "request_model": None,
+                    "response_model": None,
+                    "description": f"Delete a {class_name}"
+                }
+            ]
+            
+            # Add any custom APIs from config (only if they have valid paths)
+            for api in entity_apis:
+                api_path = api.get('path', '').strip()
+                api_method = api.get('method', 'GET').strip()
+                if api_path and api_method:  # Only add if path and method are not empty
+                    custom_api = {
+                        "method": api_method,
+                        "path": api_path,
+                        "operation": api.get('operation', 'custom'),
+                        "request_model": api.get('request_model'),
+                        "response_model": api.get('response_model'),
+                        "description": api.get('description', '')
+                    }
+                    crud_apis.append(custom_api)
+            
+            # Update graph with API information
+            for api in crud_apis:
+                # Only process APIs with valid paths
+                if not api['path'].strip():
+                    continue
+                    
+                api_key = f"{api['method']} {api['path']}"
+                
+                # Skip if this creates an invalid API key (like "PUT " or "POST ")
+                if api_key.strip().endswith(' ') or len(api_key.strip()) < 5:
+                    continue
+                
+                if api_key not in graph["apis"]:
+                    changes_made.append(f"Added API: {api_key}")
+                
+                graph["apis"][api_key] = {
+                    "method": api['method'],
+                    "path": api['path'],
+                    "operation": api['operation'],
+                    "table": table_name,
+                    "request_model": api['request_model'],
+                    "response_model": api['response_model'],
+                    "description": api['description'],
+                    "fields_read": [],
+                    "fields_written": [],
+                    "impact_analysis": {
+                        "affected_by_field_changes": [],
+                        "affected_by_type_changes": [],
+                        "validation_dependencies": []
+                    }
+                }
+                
+                # Link fields to APIs based on operation type (only for valid API keys)
+                if table_name in graph["tables"] and api_key.strip() and not api_key.strip().endswith(' '):
+                    table_fields = list(graph["tables"][table_name]["fields"].keys())
+                    
+                    if api['operation'] in ['create', 'update']:
+                        # Write operations affect all non-auto fields
+                        write_fields = [f for f in table_fields 
+                                      if not (graph["tables"][table_name]["fields"][f].get("auto_increment", False) and 
+                                             graph["tables"][table_name]["fields"][f].get("primary_key", False))]
+                        graph["apis"][api_key]["fields_written"] = write_fields
+                        
+                        # Update field impact analysis
+                        for field_name in write_fields:
+                            field_info = graph["tables"][table_name]["fields"][field_name]
+                            if api_key not in field_info["impact_analysis"]["write_apis"]:
+                                field_info["impact_analysis"]["write_apis"].append(api_key)
+                    
+                    if api['operation'] in ['read_all', 'read_one', 'update']:
+                        # Read operations affect all fields
+                        graph["apis"][api_key]["fields_read"] = table_fields
+                        
+                        # Update field impact analysis
+                        for field_name in table_fields:
+                            field_info = graph["tables"][table_name]["fields"][field_name]
+                            if api_key not in field_info["impact_analysis"]["read_apis"]:
+                                field_info["impact_analysis"]["read_apis"].append(api_key)
+                
+                # Link to table (only for valid API keys)
+                if table_name in graph["tables"] and api_key.strip() and not api_key.strip().endswith(' '):
+                    if api_key not in graph["tables"][table_name]["related_apis"]:
+                        graph["tables"][table_name]["related_apis"].append(api_key)
+        
+        # Build relationships between tables (based on foreign keys)
+        for table_name, table_info in graph["tables"].items():
+            for fk in table_info["foreign_keys"]:
+                ref_table = fk["references"].get("table") if isinstance(fk["references"], dict) else None
+                if ref_table and ref_table in graph["tables"]:
+                    relationship_key = f"{table_name}->{ref_table}"
+                    graph["relationships"][relationship_key] = {
+                        "type": "foreign_key",
+                        "from_table": table_name,
+                        "to_table": ref_table,
+                        "from_field": fk["field"],
+                        "to_field": fk["references"].get("field", "id") if isinstance(fk["references"], dict) else "id",
+                        "cascade_impact": True
+                    }
+        
+        # Clean up invalid API entries and field references
+        self._cleanup_invalid_apis(graph)
+        
+        # Record changes in history
+        if changes_made:
+            change_entry = {
+                "timestamp": datetime.now().isoformat(),
+                "changes": changes_made,
+                "entities_count": len(entities),
+                "apis_count": len(graph["apis"]),
+                "tables_count": len(graph["tables"])
+            }
+            graph["change_history"].append(change_entry)
+        
+        # Save updated graph
+        try:
+            with open(graph_file, "w") as f:
+                json.dump(graph, f, indent=2)
+            print(f"[DEPENDENCY] Updated dependency graph: {graph_file}")
+            print(f"[DEPENDENCY] Changes made: {len(changes_made)}")
+            if changes_made:
+                for change in changes_made[:5]:  # Show first 5 changes
+                    print(f"[DEPENDENCY]   - {change}")
+                if len(changes_made) > 5:
+                    print(f"[DEPENDENCY]   ... and {len(changes_made) - 5} more changes")
+        except Exception as e:
+            print(f"[DEPENDENCY] Error saving dependency graph: {e}")
+        
+        return {
+            "graph_file": str(graph_file),
+            "tables_tracked": len(graph["tables"]),
+            "apis_tracked": len(graph["apis"]),
+            "models_tracked": len(graph["models"]),
+            "relationships_tracked": len(graph["relationships"]),
+            "changes_made": len(changes_made)
+        }
+    
+    def analyze_field_impact(self, output_dir: Path, table_name: str, field_name: str, change_type: str = "modify") -> Dict[str, Any]:
+        """
+        Analyze the impact of changing a specific field in a table.
+        
+        Args:
+            output_dir: Directory containing the dependency graph (not used anymore, kept for compatibility)
+            table_name: Name of the table
+            field_name: Name of the field being changed
+            change_type: Type of change ('add', 'modify', 'delete')
+        
+        Returns:
+            Impact analysis results
+        """
+        import json
+        
+        # Look for dependency graph in project root
+        graph_file = Path("backend_dependency_graph.json")
+        if not graph_file.exists():
+            return {"error": "Dependency graph not found. Run code generation first."}
+        
+        try:
+            with open(graph_file, "r") as f:
+                graph = json.load(f)
+        except Exception as e:
+            return {"error": f"Could not load dependency graph: {e}"}
+        
+        table_name = table_name.lower()
+        if table_name not in graph.get("tables", {}):
+            return {"error": f"Table '{table_name}' not found in dependency graph."}
+        
+        table_info = graph["tables"][table_name]
+        if field_name not in table_info.get("fields", {}):
+            if change_type != "add":
+                return {"error": f"Field '{field_name}' not found in table '{table_name}'."}
+            field_info = {"impact_analysis": {"read_apis": [], "write_apis": [], "validation_models": []}}
+        else:
+            field_info = table_info["fields"][field_name]
+        
+        impact = {
+            "table": table_name,
+            "field": field_name,
+            "change_type": change_type,
+            "affected_apis": {
+                "read_operations": field_info.get("impact_analysis", {}).get("read_apis", []),
+                "write_operations": field_info.get("impact_analysis", {}).get("write_apis", [])
+            },
+            "affected_models": [],
+            "related_tables": [],
+            "recommendations": []
+        }
+        
+        # Find affected models
+        class_name = self._to_class_name(table_name)
+        for model_name, model_info in graph.get("models", {}).items():
+            if model_info.get("table") == table_name:
+                if field_name in model_info.get("fields", []):
+                    impact["affected_models"].append({
+                        "model": model_name,
+                        "type": model_info.get("type"),
+                        "usage": model_info.get("usage")
+                    })
+        
+        # Find related tables through foreign key relationships
+        for rel_key, rel_info in graph.get("relationships", {}).items():
+            if (rel_info.get("from_table") == table_name and rel_info.get("from_field") == field_name) or \
+               (rel_info.get("to_table") == table_name and rel_info.get("to_field") == field_name):
+                related_table = rel_info.get("to_table") if rel_info.get("from_table") == table_name else rel_info.get("from_table")
+                impact["related_tables"].append({
+                    "table": related_table,
+                    "relationship_type": rel_info.get("type"),
+                    "cascade_impact": rel_info.get("cascade_impact", False)
+                })
+        
+        # Generate recommendations based on change type
+        if change_type == "add":
+            impact["recommendations"].extend([
+                "Update Pydantic models to include the new field",
+                "Consider if API responses should include this field",
+                "Update database migration scripts",
+                "Add validation rules if needed"
+            ])
+        elif change_type == "modify":
+            impact["recommendations"].extend([
+                "Check if API validation needs updating",
+                "Verify data compatibility with existing records",
+                "Update documentation and API specs",
+                "Test API endpoints with new field constraints"
+            ])
+        elif change_type == "delete":
+            impact["recommendations"].extend([
+                "Remove field from all Pydantic models",
+                "Update API responses to exclude this field",
+                "Create migration to safely remove field data",
+                "Update API documentation",
+                "Check if any business logic depends on this field"
+            ])
+        
+        return impact
+
+    def _are_types_equivalent(self, db_type: str, config_type: str) -> bool:
+        """
+        Check if database type and config type are equivalent.
+        Handles ALL SQLite type conversions comprehensively to eliminate false positives.
+        """
+        # Normalize types to uppercase and remove extra whitespace
+        db_type = db_type.upper().strip()
+        config_type = config_type.upper().strip()
+        
+        # Direct match - fastest check
+        if db_type == config_type:
+            return True
+        
+        # SQLite has only 5 storage classes but supports many type names
+        # Create comprehensive mapping based on SQLite's type affinity rules
+        
+        # INTEGER affinity (includes SERIAL, BOOLEAN, etc.)
+        integer_types = {
+            'INTEGER', 'INT', 'TINYINT', 'SMALLINT', 'MEDIUMINT', 'BIGINT',
+            'UNSIGNED BIG INT', 'INT2', 'INT8', 'SERIAL', 'BIGSERIAL',
+            'BOOLEAN', 'BOOL'  # SQLite stores boolean as 0/1 integers
+        }
+        
+        # TEXT affinity (includes VARCHAR, JSON, UUID, TIMESTAMP, etc.)
+        text_types = {
+            'TEXT', 'CLOB', 'VARCHAR', 'VARYING CHARACTER', 'NCHAR',
+            'NATIVE CHARACTER', 'NVARCHAR', 'STRING', 'STR', 'CHAR',
+            'CHARACTER', 'JSON', 'JSONB',  # JSON stored as text in SQLite
+            'UUID', 'UNIQUEIDENTIFIER', 'GUID',  # UUID stored as text
+            'TIMESTAMP', 'DATETIME', 'DATE', 'TIME'  # Dates stored as text
+        }
+        
+        # REAL affinity (floating point numbers)
+        real_types = {
+            'REAL', 'DOUBLE', 'DOUBLE PRECISION', 'FLOAT', 'DECIMAL',
+            'NUMERIC'  # SQLite converts DECIMAL/NUMERIC to REAL
+        }
+        
+        # BLOB affinity
+        blob_types = {'BLOB'}
+        
+        # NUMERIC affinity (can store as INTEGER, REAL, or TEXT)
+        numeric_types = {'NUMERIC'}
+        
+        # Group all type families
+        type_families = [
+            integer_types,
+            text_types, 
+            real_types,
+            blob_types,
+            numeric_types
+        ]
+        
+        # Check if both types belong to the same family
+        for family in type_families:
+            if db_type in family and config_type in family:
+                return True
+        
+        # Special SQLite conversions that cross families but are still valid
+        special_conversions = {
+            # NUMERIC can be stored as INTEGER or REAL
+            ('INTEGER', 'NUMERIC'): True,
+            ('REAL', 'NUMERIC'): True,
+            ('NUMERIC', 'INTEGER'): True,
+            ('NUMERIC', 'REAL'): True,
+            
+            # DECIMAL often gets converted to REAL in SQLite
+            ('REAL', 'DECIMAL'): True,
+            ('DECIMAL', 'REAL'): True,
+            
+            # Common text variants
+            ('TEXT', 'VARCHAR'): True,
+            ('VARCHAR', 'TEXT'): True,
+        }
+        
+        # Check both directions for special conversions
+        conversion_key = (db_type, config_type)
+        reverse_key = (config_type, db_type)
+        
+        if conversion_key in special_conversions or reverse_key in special_conversions:
+            return True
+        
+        return False
+
+    @staticmethod
+    def _are_types_equivalent_static(db_type: str, config_type: str) -> bool:
+        """
+        Static version of type equivalence check to avoid creating generator instances.
+        Handles ALL SQLite type conversions comprehensively to eliminate false positives.
+        """
+        # Normalize types to uppercase and remove extra whitespace
+        db_type = db_type.upper().strip()
+        config_type = config_type.upper().strip()
+        
+        # Direct match - fastest check
+        if db_type == config_type:
+            return True
+        
+        # SQLite has only 5 storage classes but supports many type names
+        # Create comprehensive mapping based on SQLite's type affinity rules
+        
+        # INTEGER affinity (includes SERIAL, BOOLEAN, etc.)
+        integer_types = {
+            'INTEGER', 'INT', 'TINYINT', 'SMALLINT', 'MEDIUMINT', 'BIGINT',
+            'UNSIGNED BIG INT', 'INT2', 'INT8', 'SERIAL', 'BIGSERIAL',
+            'BOOLEAN', 'BOOL'  # SQLite stores boolean as 0/1 integers
+        }
+        
+        # TEXT affinity (includes VARCHAR, JSON, UUID, TIMESTAMP, etc.)
+        text_types = {
+            'TEXT', 'CLOB', 'VARCHAR', 'VARYING CHARACTER', 'NCHAR',
+            'NATIVE CHARACTER', 'NVARCHAR', 'STRING', 'STR', 'CHAR',
+            'CHARACTER', 'JSON', 'JSONB',  # JSON stored as text in SQLite
+            'UUID', 'UNIQUEIDENTIFIER', 'GUID',  # UUID stored as text
+            'TIMESTAMP', 'DATETIME', 'DATE', 'TIME'  # Dates stored as text
+        }
+        
+        # REAL affinity (floating point numbers)
+        real_types = {
+            'REAL', 'DOUBLE', 'DOUBLE PRECISION', 'FLOAT', 'DECIMAL',
+            'NUMERIC'  # SQLite converts DECIMAL/NUMERIC to REAL
+        }
+        
+        # BLOB affinity
+        blob_types = {'BLOB'}
+        
+        # Group all type families
+        type_families = [
+            integer_types,
+            text_types, 
+            real_types,
+            blob_types
+        ]
+        
+        # Check if both types belong to the same family
+        for family in type_families:
+            if db_type in family and config_type in family:
+                return True
+        
+        # Special SQLite conversions that cross families but are still valid
+        special_conversions = {
+            # NUMERIC can be stored as INTEGER or REAL
+            ('INTEGER', 'NUMERIC'): True,
+            ('REAL', 'NUMERIC'): True,
+            ('NUMERIC', 'INTEGER'): True,
+            ('NUMERIC', 'REAL'): True,
+            
+            # DECIMAL often gets converted to REAL in SQLite
+            ('REAL', 'DECIMAL'): True,
+            ('DECIMAL', 'REAL'): True,
+            
+            # Common text variants
+            ('TEXT', 'VARCHAR'): True,
+            ('VARCHAR', 'TEXT'): True,
+        }
+        
+        # Check both directions for special conversions
+        conversion_key = (db_type, config_type)
+        reverse_key = (config_type, db_type)
+        
+        if conversion_key in special_conversions or reverse_key in special_conversions:
+            return True
+        
+        return False
+
+    def _cleanup_invalid_apis(self, graph: Dict[str, Any]):
+        """Remove invalid API entries and clean up field references"""
+        # Find invalid API keys (empty paths, just method names, etc.)
+        invalid_api_keys = []
+        for api_key in list(graph.get("apis", {}).keys()):
+            # Check for invalid patterns
+            if (api_key.strip().endswith(' ') or 
+                len(api_key.strip()) < 5 or 
+                api_key.strip() in ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'] or
+                not api_key.strip() or
+                '/' not in api_key):
+                invalid_api_keys.append(api_key)
+        
+        # Remove invalid APIs
+        for invalid_key in invalid_api_keys:
+            if invalid_key in graph["apis"]:
+                del graph["apis"][invalid_key]
+                print(f"[DEPENDENCY] Cleaned up invalid API: '{invalid_key}'")
+        
+        # Clean up field references to invalid APIs
+        for table_name, table_info in graph.get("tables", {}).items():
+            # Clean table's related_apis
+            table_info["related_apis"] = [
+                api for api in table_info.get("related_apis", []) 
+                if api not in invalid_api_keys
+            ]
+            
+            # Clean field impact analysis
+            for field_name, field_info in table_info.get("fields", {}).items():
+                impact = field_info.get("impact_analysis", {})
+                impact["read_apis"] = [
+                    api for api in impact.get("read_apis", []) 
+                    if api not in invalid_api_keys
+                ]
+                impact["write_apis"] = [
+                    api for api in impact.get("write_apis", []) 
+                    if api not in invalid_api_keys
+                ]
+
+
+        
+
+def create_backup_of_generated_code(output_dir: Path) -> str:
+    """
+    Create a backup of the generated backend code inside the Generated folder.
+    Only backs up files created by this specific program.
+    This is the very last step and should not impact any other logic.
+    
+    Args:
+        output_dir: Path to the generated backend code directory
+        
+    Returns:
+        Path to the backup directory if successful, None if failed
+    """
+    try:
+        from datetime import datetime
+        import shutil
+        
+        # Create backup inside the Generated folder
+        generated_root = output_dir.parent if output_dir.parent.name == "Generated" else output_dir.parent.parent
+        if generated_root.name != "Generated":
+            # If we can't find Generated parent, create backup inside output_dir
+            backup_path = output_dir / "backup"
+        else:
+            backup_path = generated_root / "backup"
+        
+        backup_path.mkdir(parents=True, exist_ok=True)
+        
+        # Only backup files created by this program (backend folder contents)
+        if output_dir.exists():
+            # Copy only the backend files generated by this program
+            for item in output_dir.iterdir():
+                # Skip the backup folder itself to avoid infinite recursion
+                if item.name == "backup":
+                    continue
+                if item.is_file():
+                    shutil.copy2(item, backup_path / item.name)
+                elif item.is_dir():
+                    shutil.copytree(item, backup_path / item.name, dirs_exist_ok=True)
+            
+            # Create a metadata file in the backup
+            metadata_file = backup_path / "backup_metadata.txt"
+            metadata_content = f"""Backend Code Backup
+==================
+Backup Created: {datetime.now().isoformat()}
+Original Path: {output_dir.resolve()}
+Backup Path: {backup_path.resolve()}
+Generator: step_4_backend_code_generator_db_manager.py v2.0
+
+Contents:
+- Backend code generated from application configuration
+- Database models (ORM and Pydantic)
+- API routes with CRUD operations
+- Database configuration and main application
+- Requirements file
+
+Note: This backup contains only files created by the backend generator.
+"""
+            metadata_file.write_text(metadata_content)
+            
+            logger.info(f"[BACKUP] Successfully created backend code backup at: {backup_path}")
+            return str(backup_path)
+            
+        else:
+            logger.warning(f"[BACKUP] Source directory does not exist: {output_dir}")
+            return None
+            
+    except Exception as e:
+        logger.error(f"[BACKUP] Failed to create backup: {e}")
+        return None
+
+
+def main():
+    """Standalone execution entry point"""
+    import sys
+    import argparse
+    
+    parser = argparse.ArgumentParser(
+        description="Generate FastAPI backend code with database management from application configuration",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python step_3_backend_code_generator_db_manager.py -i config_output/application_config.json
+  python step_3_backend_code_generator_db_manager.py --input path/to/config.json --output Generated/backend
+        """
+    )
+    
+    parser.add_argument(
+        '-i', '--input',
+        type=str,
+        default='config_output/application_config.json',
+        help='Path to the application configuration JSON file (default: config_output/application_config.json)'
+    )
+    
+    parser.add_argument(
+        '-o', '--output',
+        type=str,
+        default='Generated/backend',
+        help='Output directory for generated backend code (default: Generated/backend)'
+    )
+    
+    args = parser.parse_args()
+    
+    config_file = Path(args.input)
+    output_dir = Path(args.output)
+    db_path = Path('nsi_app.db')  # SQLite database in project root
+
+    print(f"[DEBUG] Using input config: {config_file}")
+    print(f"[DEBUG] Using output directory: {output_dir}")
+    print(f"[DEBUG] Checking DB existence at: {db_path.resolve()}")
+
+    if not config_file.exists():
+        logger.error(f"[FAIL] Config file not found: {config_file}")
+        sys.exit(1)
+
+    # Load configuration
+    with open(config_file) as f:
+        app_config = json.load(f)
+
+    # Load project configuration for API versioning
+    project_config_file = Path('project_configuration.json')
+    project_config = {}
+    if project_config_file.exists():
+        with open(project_config_file) as f:
+            project_config = json.load(f)
+    
+    # Get database configuration
+    db_config = app_config.get('metadata', {}).get('database', {})
+    db_type = db_config.get('type', 'sqlite')
+
+    print(f"[DB] Database type: {db_type}")
+    
+    # Get API version from project config
+    api_version = project_config.get('version', 'v1')
+    print(f"[API] API version: {api_version}")
+
+    # Check if DB exists and detect schema changes based on database type
+    db_exists = False
+    new_fields_detected = False
+    changed_tables = []
+    missing_tables = []
+    new_fields = {}
+
+    if db_type == 'sqlite':
+        db_exists = db_path.exists()
+        print(f"[DEBUG] SQLite DB exists: {db_exists}")
+        if db_exists:
+            print(f"[DB] Database file '{db_path.name}' exists.")
+        else:
+            print(f"[DB] Database file '{db_path.name}' does not exist.")
+    elif db_type == 'postgresql':
+        # For PostgreSQL, check if database exists by trying to connect (using hardcoded values)
+        try:
+            import psycopg2
+
+            conn = psycopg2.connect(
+                host="localhost",
+                port=5432,
+                user="postgres",
+                password="password",
+                database="nsi_app"
+            )
+            conn.close()
+            db_exists = True
+            print(f"[DB] PostgreSQL database 'nsi_app' exists and is accessible")
+        except Exception as e:
+            print(f"[DB] PostgreSQL database not accessible: {e}")
+            db_exists = False
+        
+        if db_exists and db_type == 'sqlite':
+            import sqlite3  # Ensure import is available
+            conn = sqlite3.connect(str(db_path))
+            cursor = conn.cursor()
+            # Get list of tables in DB
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+            db_tables = set(row[0] for row in cursor.fetchall())
+            # For each entity, check table and fields
+            field_changes = {}  # Track field type/length changes
+            for entity in app_config.get('entities', []):
+                table_name = entity['table_name'].lower()
+                entity_fields = {f['name']: f for f in entity.get('fields', [])}
+                if table_name not in db_tables:
+                    print(f"[DB] Table '{table_name}' is missing in database.")
+                    missing_tables.append(table_name)
+                else:
+                    # Check for missing/new fields and field changes
+                    cursor.execute(f"PRAGMA table_info({table_name});")
+                    db_columns = {row[1]: row for row in cursor.fetchall()}
+                    missing_in_db = set(entity_fields.keys()) - set(db_columns.keys())
+                    extra_in_db = set(db_columns.keys()) - set(entity_fields.keys())
+                    
+                    # Check for field type/length changes
+                    changed_fields = []
+                    for field_name, field in entity_fields.items():
+                        if field_name in db_columns:
+                            db_type = db_columns[field_name][2].upper()
+                            db_length = None
+                            if '(' in db_type and ')' in db_type:
+                                db_type_base, db_length_str = db_type.split('(')
+                                try:
+                                    db_length = int(db_length_str.rstrip(')'))
+                                except:
+                                    db_length = None
+                            else:
+                                db_type_base = db_type
+                                
+                            config_type = field.get('type', 'TEXT').upper()
+                            config_length = field.get('length')
+                            
+                            # Compare type (with comprehensive equivalent type mapping)
+                            # Use static function to avoid creating generator instances
+                            if not BackendGenerator._are_types_equivalent_static(db_type_base, config_type):
+                                changed_fields.append({
+                                    'field': field_name,
+                                    'change': 'type',
+                                    'old': db_type_base,
+                                    'new': config_type
+                                })
+                            # Compare length if applicable
+                            elif config_length and db_length and db_length != config_length:
+                                changed_fields.append({
+                                    'field': field_name,
+                                    'change': 'length',
+                                    'old': db_length,
+                                    'new': config_length
+                                })
+                    
+                    if missing_in_db:
+                        print(f"[DB] Table '{table_name}' is missing fields: {sorted(missing_in_db)}")
+                        new_fields[table_name] = sorted(missing_in_db)
+                    if extra_in_db:
+                        print(f"[DB] Table '{table_name}' has extra fields not in config: {sorted(extra_in_db)}")
+                    if changed_fields:
+                        print(f"[DB] Table '{table_name}' has field changes:")
+                        field_changes[table_name] = changed_fields
+                        for change in changed_fields:
+                            print(f"  - Field '{change['field']}' {change['change']}: {change['old']} → {change['new']}")
+                        # Add to new_fields to trigger reconstruction
+                        if table_name in new_fields:
+                            new_fields[table_name].extend([c['field'] for c in changed_fields])
+                        else:
+                            new_fields[table_name] = [c['field'] for c in changed_fields]
+            conn.close()
+            if not missing_tables and not new_fields and not field_changes:
+                print("[DB] All tables and fields match the config.")
+            else:
+                # Show detailed impact analysis for detected changes
+                print("\n" + "="*80)
+                print("SCHEMA CHANGE IMPACT ANALYSIS")
+                print("="*80)
+                
+                # Create a temporary generator for impact analysis
+                temp_generator = BackendGenerator({}, Path('./Templates'), project_config)
+                
+                # Analyze impact for each table with missing fields
+                for table_name, missing_field_names in new_fields.items():
+                    print(f"\nTABLE: {table_name.upper()} - Missing Fields: {', '.join(missing_field_names)}")
+                    print("─" * 60)
+                    
+                    for field_name in missing_field_names:
+                        # Load existing dependency graph if available for impact analysis
+                        existing_graph_file = Path('backend_dependency_graph.json')
+                        if existing_graph_file.exists():
+                            try:
+                                with open(existing_graph_file, 'r') as f:
+                                    existing_graph = json.load(f)
+                                
+                                # Check if this table exists in the graph
+                                if table_name in existing_graph.get('tables', {}):
+                                    table_info = existing_graph['tables'][table_name]
+                                    related_apis = table_info.get('related_apis', [])
+                                    
+                                    print(f"\nFIELD: {field_name}")
+                                    print(f"   Potentially Affected APIs ({len(related_apis)}):")
+                                    for api in related_apis[:5]:  # Show first 5
+                                        print(f"     • {api}")
+                                    if len(related_apis) > 5:
+                                        print(f"     ... and {len(related_apis) - 5} more APIs")
+                                    
+                                    # Show affected models
+                                    models = existing_graph.get('models', {})
+                                    class_name = temp_generator._to_class_name(table_name)
+                                    affected_models = [m for m in models.keys() if class_name in m]
+                                    print(f"   Affected Models ({len(affected_models)}): {', '.join(affected_models)}")
+                                
+                            except Exception as e:
+                                print(f"   Could not load existing dependency graph: {e}")
+                        else:
+                            print(f"FIELD: {field_name} (New field - will be added to all API operations)")
+                
+                # Show field changes impact
+                for table_name, changes in field_changes.items():
+                    if table_name not in new_fields:  # Only show if not already covered above
+                        print(f"\nTABLE: {table_name.upper()} - Field Changes")
+                        print("─" * 60)
+                        
+                        for change in changes:
+                            field_name = change['field']
+                            change_type = change['change']
+                            old_val = change['old']
+                            new_val = change['new']
+                            
+                            print(f"\nFIELD CHANGE: {field_name}")
+                            print(f"Change Type: {change_type.upper()}")
+                            print(f"Old Value: {old_val}")
+                            print(f"New Value: {new_val}")
+                            
+                            # Show potential impact
+                            if change_type == 'type':
+                                print(f"Impact: Data type change may affect API validation and data compatibility")
+                            elif change_type == 'length':
+                                if new_val > old_val:
+                                    print(f"Impact: Length increase is generally safe")
+                                else:
+                                    print(f"Impact: Length decrease may truncate existing data")
+                
+                # Show missing tables impact
+                for table_name in missing_tables:
+                    print(f"\nNEW TABLE: {table_name.upper()}")
+                    print("─" * 60)
+                    print("Impact: New table will create new API endpoints and models")
+                    
+                    # Find entity config for this table
+                    entity_config = None
+                    for entity in app_config.get('entities', []):
+                        if entity['table_name'].lower() == table_name:
+                            entity_config = entity
+                            break
+                    
+                    if entity_config:
+                        fields = entity_config.get('fields', [])
+                        print(f"Fields ({len(fields)}): {', '.join([f['name'] for f in fields])}")
+                        class_name = temp_generator._to_class_name(table_name)
+                        print(f"Will create: {class_name} models and /api/{table_name}/ endpoints")
+                
+                print("\n" + "="*80)
+                print("RECOMMENDATIONS:")
+                print("="*80)
+                print("• Option 1 (Cancel): No changes made, review schema manually")
+                print("• Option 2 (Migration): Safely add missing fields/tables with data preservation") 
+                print("• Option 3 (Code Only): Generate new code without database changes")
+                print("Use Option 2 in case of missing tables and Option 3 in case of missing fields")
+                print("="*80)
+                
+                # Ask for user action: cancel, migration, or codegen only
+                print("\nSchema changes detected. Choose an option:")
+                print("  1. Cancel (exit)")
+                print("  2. Run Alembic migration with impact handling")
+                print("  3. Proceed with backend code generation only (skip migration)")
+                while True:
+                    user_choice = input("Enter 1, 2, or 3: ").strip()
+                    if user_choice == '1':
+                        print("[ABORTED] Operation cancelled by user.")
+                        sys.exit(0)
+                    elif user_choice == '2':
+                        
+                        # First generate backend code so Alembic can import the models
+                        print("[INFO] Generating backend code first for Alembic to use...")
+                        templates_dir = Path('./Templates')
+                        temp_generator = BackendGenerator({}, templates_dir, project_config)
+                        temp_generator.generate(app_config, output_dir)
+                        
+                        # Update dependency graph after backend code generation
+                        print("[INFO] Updating dependency graph after migration...")
+                        dependency_result = temp_generator.update_dependency_graph(app_config, output_dir)
+                        
+                        alembic_dir = Path('alembic')
+                        if not alembic_dir.exists():
+                            print("[ALEMBIC] Initializing Alembic...")
+                            subprocess.run([sys.executable, '-m', 'alembic', 'init', 'alembic'], check=True)
+                            
+                            # Update env.py to use correct import path
+                            env_py = alembic_dir / 'env.py'
+                            if env_py.exists():
+                                content = env_py.read_text()
+                                
+                                # Replace the import section with proper path setup
+                                old_import_section = '''from alembic import context
+
+# add your model's MetaData object here
+# for 'autogenerate' support
+# from myapp import mymodel
+# target_metadata = mymodel.Base.metadata
+target_metadata = None'''
+                                
+                                new_import_section = '''from alembic import context
+
+# Fix the import path for the generated models
+import sys
+from pathlib import Path
+backend_path = Path(__file__).parent.parent / "Generated" / "backend"
+sys.path.insert(0, str(backend_path))
+
+# Now import the database Base and models
+from database import Base
+import models  # This will import all models which will register them with Base
+
+# add your model's MetaData object here
+# for 'autogenerate' support
+target_metadata = Base.metadata'''
+                                
+                                content = content.replace(old_import_section, new_import_section)
+                                env_py.write_text(content)
+                        
+                        print("[ALEMBIC] Checking migration status...")
+                        
+                        # Check if there are any migration files
+                        versions_dir = alembic_dir / 'versions'
+                        migration_files = []
+                        if versions_dir.exists():
+                            import glob
+                            migration_files = glob.glob(str(versions_dir / "*.py"))
+                        
+                        if not migration_files:
+                            print("[ALEMBIC] No migration files found. Creating initial migration based on current database state...")
+                            # Create initial migration that matches current database
+                            subprocess.run([sys.executable, '-m', 'alembic', 'stamp', 'head'], check=True)
+                            print("[ALEMBIC] Stamped database as up-to-date.")
+                        else:
+                            # Try to apply existing migrations
+                            try:
+                                subprocess.run([sys.executable, '-m', 'alembic', 'upgrade', 'head'], check=True)
+                                print("[ALEMBIC] Applied existing migrations.")
+                            except subprocess.CalledProcessError as e:
+                                print(f"[ALEMBIC] Warning: Could not apply existing migrations: {e}")
+                                # Check if this is a stale revision error or table already exists
+                                error_str = str(e)
+                                if ("Can't locate revision identified by" in error_str or 
+                                    "revision id from filename" in error_str or
+                                    "table" in error_str and "already exists" in error_str):
+                                    print("[ALEMBIC] Detected migration conflicts. Resetting Alembic state...")
+                                    # Clear the alembic_version table and migration files
+                                    import sqlite3
+                                    conn = sqlite3.connect(str(db_path))
+                                    conn.execute('DROP TABLE IF EXISTS alembic_version')
+                                    conn.commit()
+                                    conn.close()
+                                    print("[ALEMBIC] Cleared alembic_version table.")
+                                    
+                                    # Remove existing migration files
+                                    for migration_file in migration_files:
+                                        try:
+                                            Path(migration_file).unlink()
+                                            print(f"[ALEMBIC] Removed migration: {Path(migration_file).name}")
+                                        except Exception:
+                                            pass
+                                    
+                                    # Also remove any corrupted migration files
+                                    try:
+                                        import glob
+                                        versions_dir = alembic_dir / 'versions'
+                                        for corrupted_file in glob.glob(str(versions_dir / "*.py")):
+                                            if Path(corrupted_file).stat().st_size == 0:  # Empty file
+                                                Path(corrupted_file).unlink()
+                                                print(f"[ALEMBIC] Removed corrupted migration: {Path(corrupted_file).name}")
+                                    except Exception:
+                                        pass
+                                    
+                                    print("[ALEMBIC] Reset complete. Will stamp database as current state.")
+                                    # Stamp the database as being at the current state with error handling
+                                    try:
+                                        subprocess.run([sys.executable, '-m', 'alembic', 'stamp', 'head'], check=True)
+                                    except subprocess.CalledProcessError:
+                                        print("[ALEMBIC] Warning: Could not stamp head, but proceeding with migration...")
+                        
+                        # Handle any field-level changes if needed
+                        if new_fields:
+                            print("[ALEMBIC] Safely handling missing fields with proper table reconstruction...")
+                            # Use safe table reconstruction method for SQLite
+                            conn = sqlite3.connect(str(db_path))
+                            cursor = conn.cursor()
+                            
+                            for table_name, missing_field_names in new_fields.items():
+                                # Find the entity config for this table
+                                entity_config = None
+                                for entity in app_config.get('entities', []):
+                                    if entity['table_name'].lower() == table_name:
+                                        entity_config = entity
+                                        break
+                                if entity_config:
+                                    print(f"[ALEMBIC] Reconstructing table '{table_name}' with missing fields: {missing_field_names}")
+                                    # Step 1: Get current table data
+                                    cursor.execute(f"SELECT * FROM {table_name}")
+                                    existing_data = cursor.fetchall()
+                                    # Step 2: Get current column names
+                                    cursor.execute(f"PRAGMA table_info({table_name})")
+                                    current_columns = [col[1] for col in cursor.fetchall()]
+                                    # Step 3: Build new table schema with all fields from config
+                                    fields = entity_config.get('fields', [])
+                                    column_defs = []
+                                    fk_defs = []
+                                for field in fields:
+                                    field_name = field['name']
+                                    field_type = field.get('type', 'TEXT')
+                                    sql_type = "TEXT"
+                                    if field_type in ['INTEGER', 'int', 'SERIAL']:
+                                        sql_type = "INTEGER"
+                                    elif field_type in ['FLOAT', 'DECIMAL', 'float']:
+                                        sql_type = "REAL"
+                                    elif field_type in ['BOOLEAN', 'bool']:
+                                        sql_type = "INTEGER"
+                                    col_def = f"{field_name} {sql_type}"
+                                    if field.get('primary_key', False):
+                                        if field.get('auto_increment', False):
+                                            col_def += " PRIMARY KEY AUTOINCREMENT"
+                                        else:
+                                            col_def += " PRIMARY KEY"
+                                        col_def += " NOT NULL"
+                                    elif not field.get('nullable', True):
+                                        col_def += " NOT NULL"
+                                    if field.get('default') is not None:
+                                        default_val = field['default']
+                                        if field_type in ['VARCHAR', 'TEXT', 'str']:
+                                            col_def += f" DEFAULT '{default_val}'"
+                                        else:
+                                            col_def += f" DEFAULT {default_val}"
+                                    # Foreign key support
+                                    if field.get('foreign_key'):
+                                        fk = field['foreign_key']
+                                        # fk should be like 'other_table(other_field)'
+                                        ref_table, ref_field = fk.split('(')
+                                        ref_field = ref_field.rstrip(')')
+                                        fk_defs.append(f"FOREIGN KEY({field_name}) REFERENCES {ref_table}({ref_field})")
+                                    column_defs.append(col_def)
+                                # Step 4: Get indexes and triggers from old table
+                                cursor.execute(f"SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name='{table_name}' AND sql NOT NULL")
+                                index_sqls = [row[0] for row in cursor.fetchall()]
+                                cursor.execute(f"SELECT sql FROM sqlite_master WHERE type='trigger' AND tbl_name='{table_name}' AND sql NOT NULL")
+                                trigger_sqls = [row[0] for row in cursor.fetchall()]
+                                # Step 5: Create new table with proper structure and FKs
+                                all_defs = column_defs + fk_defs
+                                new_table_sql = f"CREATE TABLE {table_name}_new ({', '.join(all_defs)})"
+                                try:
+                                    cursor.execute(new_table_sql)
+                                    print(f"[ALEMBIC] Created new table structure: {table_name}_new")
+                                    # Step 6: Copy existing data with defaults for new columns
+                                    if existing_data:
+                                        all_field_names = [f['name'] for f in fields]
+                                        for row in existing_data:
+                                            row_dict = dict(zip(current_columns, row))
+                                            new_row = []
+                                            for field in fields:
+                                                field_name = field['name']
+                                                if field_name in row_dict and row_dict[field_name] is not None:
+                                                    new_row.append(row_dict[field_name])
+                                                elif field.get('default') is not None:
+                                                    new_row.append(field['default'])
+                                                elif field.get('nullable', True):
+                                                    new_row.append(None)
+                                                else:
+                                                    field_type = field.get('type', 'TEXT')
+                                                    if field_type in ['INTEGER', 'int', 'SERIAL']:
+                                                        new_row.append(0)
+                                                    elif field_type in ['BOOLEAN', 'bool']:
+                                                        new_row.append(0)
+                                                    else:
+                                                        new_row.append('')
+                                            placeholders = ', '.join(['?' for _ in new_row])
+                                            insert_sql = f"INSERT INTO {table_name}_new ({', '.join(all_field_names)}) VALUES ({placeholders})"
+                                            cursor.execute(insert_sql, new_row)
+                                    # Step 7: Replace old table with new one
+                                    cursor.execute(f"DROP TABLE {table_name}")
+                                    cursor.execute(f"ALTER TABLE {table_name}_new RENAME TO {table_name}")
+                                    print(f"[ALEMBIC] Successfully reconstructed table '{table_name}' with proper constraints")
+                                    # Step 8: Recreate indexes and triggers
+                                    for index_sql in index_sqls:
+                                        try:
+                                            cursor.execute(index_sql)
+                                            print(f"[ALEMBIC] Recreated index: {index_sql}")
+                                        except Exception as e:
+                                            print(f"[ALEMBIC] Error recreating index: {e}")
+                                    for trigger_sql in trigger_sqls:
+                                        try:
+                                            cursor.execute(trigger_sql)
+                                            print(f"[ALEMBIC] Recreated trigger: {trigger_sql}")
+                                        except Exception as e:
+                                            print(f"[ALEMBIC] Error recreating trigger: {e}")
+                                except sqlite3.Error as e:
+                                    print(f"[ALEMBIC] Error reconstructing table '{table_name}': {e}")
+                                    try:
+                                        cursor.execute(f"DROP TABLE IF EXISTS {table_name}_new")
+                                    except:
+                                        pass
+                            
+                            conn.commit()
+                            conn.close()
+                            
+                            print("[ALEMBIC] Schema synchronized. Marking database as up-to-date...")
+                            # Since we've manually handled the missing fields, try to mark the database as current
+                            try:
+                                subprocess.run([sys.executable, '-m', 'alembic', 'stamp', 'head'], check=True)
+                                print("[ALEMBIC] Migration complete.")
+                            except subprocess.CalledProcessError as e:
+                                print(f"[ALEMBIC] Warning: Could not stamp database as current: {e}")
+                                print("[ALEMBIC] Schema changes applied manually, but alembic state may be inconsistent.")
+                                print("[ALEMBIC] You may need to reset alembic: delete alembic/versions/* and run 'alembic stamp head'")
+                        
+                        
+                        # Skip the later code generation since we already did it
+                        print("\n" + "="*80)
+                        print("[DONE] BACKEND GENERATION AND MIGRATION COMPLETE!")
+                        print("="*80)
+                        print(f"[DEPENDENCY] Graph updated: {dependency_result['changes_made']} changes tracked")
+                        sys.exit(0)
+                    elif user_choice == '3':
+                        print("[INFO] Proceeding with backend code generation only (no migration).")
+                        break
+                    else:
+                        print("Invalid input. Please enter 1, 2, or 3.")
+        elif db_exists and db_type == 'postgresql':
+            # PostgreSQL database exists, perform detailed schema analysis
+            import psycopg2
+            
+            # Initialize temp generator for utility methods
+            templates_dir = Path('./Templates')
+            temp_generator = BackendGenerator({}, templates_dir, project_config)
+            
+            try:
+                conn = psycopg2.connect(
+                    host="localhost",
+                    port=5432,
+                    user="postgres",
+                    password="password",
+                    database="nsi_app"
+                )
+                cursor = conn.cursor()
+                
+                # Get list of tables in PostgreSQL database
+                cursor.execute("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public';")
+                db_tables = set(row[0] for row in cursor.fetchall())
+                
+                # Debug output
+                expected_tables = [entity['table_name'].lower() for entity in app_config.get('entities', [])]
+                print(f"[DEBUG] PostgreSQL tables found: {sorted(db_tables)}")
+                print(f"[DEBUG] Expected tables: {sorted(expected_tables)}")
+                
+                # For each entity, check table and fields
+                field_changes = {}  # Track field type/length changes
+                for entity in app_config.get('entities', []):
+                    table_name = entity['table_name'].lower()
+                    entity_fields = {f['name']: f for f in entity.get('fields', [])}
+                    if table_name not in db_tables:
+                        print(f"[DB] Table '{table_name}' is missing in PostgreSQL database.")
+                        missing_tables.append(table_name)
+                    else:
+                        # Check for missing/new fields and field changes in PostgreSQL
+                        cursor.execute("""
+                            SELECT column_name, data_type, character_maximum_length, is_nullable, column_default
+                            FROM information_schema.columns 
+                            WHERE table_schema = 'public' AND table_name = %s
+                            ORDER BY ordinal_position;
+                        """, (table_name,))
+                        db_columns_info = cursor.fetchall()
+                        db_columns = {row[0]: row for row in db_columns_info}
+                        missing_in_db = set(entity_fields.keys()) - set(db_columns.keys())
+                        extra_in_db = set(db_columns.keys()) - set(entity_fields.keys())
+                        
+                        # Check for field type/length changes
+                        changed_fields = []
+                        for field_name, field in entity_fields.items():
+                            if field_name in db_columns:
+                                db_col_info = db_columns[field_name]
+                                db_data_type = db_col_info[1].upper()
+                                db_length = db_col_info[2]  # character_maximum_length
+                                
+                                config_type = field.get('type', 'TEXT').upper()
+                                config_length = field.get('length')
+                                
+                                # PostgreSQL type mapping
+                                pg_type_map = {
+                                    'CHARACTER VARYING': 'VARCHAR',
+                                    'TEXT': 'TEXT',
+                                    'INTEGER': 'INTEGER',
+                                    'BIGINT': 'BIGINT',
+                                    'BOOLEAN': 'BOOLEAN',
+                                    'TIMESTAMP WITHOUT TIME ZONE': 'TIMESTAMP',
+                                    'TIMESTAMP WITH TIME ZONE': 'TIMESTAMP',
+                                    'NUMERIC': 'DECIMAL',
+                                    'REAL': 'FLOAT',
+                                    'DOUBLE PRECISION': 'FLOAT'
+                                }
+                                
+                                normalized_db_type = pg_type_map.get(db_data_type, db_data_type)
+                                
+                                # Compare types using the static equivalence function
+                                if not BackendGenerator._are_types_equivalent_static(normalized_db_type, config_type):
+                                    changed_fields.append({
+                                        'field': field_name,
+                                        'change': 'type',
+                                        'old': normalized_db_type,
+                                        'new': config_type
+                                    })
+                                
+                                # Compare length if applicable
+                                if config_length and db_length and config_length != db_length:
+                                    changed_fields.append({
+                                        'field': field_name,
+                                        'change': 'length',
+                                        'old': db_length,
+                                        'new': config_length
+                                    })
+                        
+                        if missing_in_db:
+                            print(f"[DB] Table '{table_name}' missing fields: {missing_in_db}")
+                            new_fields[table_name] = list(missing_in_db)
+                            new_fields_detected = True
+                            
+                        if extra_in_db:
+                            print(f"[DB] Table '{table_name}' has extra fields: {extra_in_db}")
+                            
+                        if changed_fields:
+                            print(f"[DB] Table '{table_name}' has field changes:")
+                            for change in changed_fields:
+                                print(f"  - {change['field']}: {change['change']} from {change['old']} to {change['new']}")
+                            field_changes[table_name] = changed_fields
+                            
+                        if missing_in_db or changed_fields:
+                            changed_tables.append(table_name)
+                
+                cursor.close()
+                conn.close()
+                
+                # Show summary of changes for PostgreSQL
+                if missing_tables or new_fields_detected or field_changes:
+                    print(f"\n[SCHEMA] PostgreSQL Schema Analysis Complete:")
+                    print(f"  - Missing tables: {len(missing_tables)}")
+                    print(f"  - Tables with new fields: {len(new_fields)}")
+                    print(f"  - Tables with field changes: {len(field_changes)}")
+                    print(f"  - Total affected tables: {len(changed_tables)}")
+                    
+                    # Show detailed impact analysis for PostgreSQL detected changes
+                    print("\n" + "="*80)
+                    print("POSTGRESQL SCHEMA CHANGE IMPACT ANALYSIS")
+                    print("="*80)
+                    
+                    # Analyze impact for each table with missing fields
+                    for table_name, missing_field_names in new_fields.items():
+                        print(f"\nTABLE: {table_name.upper()} - Missing Fields: {', '.join(missing_field_names)}")
+                        print("─" * 60)
+                        
+                        for field_name in missing_field_names:
+                            # Load existing dependency graph if available for impact analysis
+                            existing_graph_file = Path('backend_dependency_graph.json')
+                            if existing_graph_file.exists():
+                                try:
+                                    with open(existing_graph_file, 'r') as f:
+                                        existing_graph = json.load(f)
+                                    
+                                    # Check if this table exists in the graph
+                                    if table_name in existing_graph.get('tables', {}):
+                                        table_info = existing_graph['tables'][table_name]
+                                        related_apis = table_info.get('related_apis', [])
+                                        
+                                        print(f"\nFIELD: {field_name}")
+                                        print(f"   Potentially Affected APIs ({len(related_apis)}):")
+                                        for api in related_apis[:5]:  # Show first 5
+                                            print(f"     • {api}")
+                                        if len(related_apis) > 5:
+                                            print(f"     ... and {len(related_apis) - 5} more APIs")
+                                        
+                                        # Show affected models
+                                        models = existing_graph.get('models', {})
+                                        class_name = temp_generator._to_class_name(table_name)
+                                        affected_models = [m for m in models.keys() if class_name in m]
+                                        print(f"   Affected Models ({len(affected_models)}): {', '.join(affected_models)}")
+                                    
+                                except Exception as e:
+                                    print(f"   Could not load existing dependency graph: {e}")
+                            else:
+                                print(f"FIELD: {field_name} (New field - will be added to all API operations)")
+                    
+                    # Show field changes impact for PostgreSQL
+                    for table_name, changes in field_changes.items():
+                        if table_name not in new_fields:  # Only show if not already covered above
+                            print(f"\nTABLE: {table_name.upper()} - Field Changes")
+                            print("─" * 60)
+                            
+                            for change in changes:
+                                field_name = change['field']
+                                change_type = change['change']
+                                old_val = change['old']
+                                new_val = change['new']
+                                
+                                print(f"\nFIELD CHANGE: {field_name}")
+                                print(f"Change Type: {change_type.upper()}")
+                                print(f"Old Value: {old_val}")
+                                print(f"New Value: {new_val}")
+                                
+                                # Show potential impact for PostgreSQL
+                                if change_type == 'type':
+                                    print(f"Impact: PostgreSQL data type change may affect API validation and data compatibility")
+                                elif change_type == 'length':
+                                    if new_val > old_val:
+                                        print(f"Impact: Length increase is generally safe")
+                                    else:
+                                        print(f"Impact: Length decrease may truncate existing data")
+                    
+                    # Show missing tables impact for PostgreSQL
+                    for table_name in missing_tables:
+                        print(f"\nNEW TABLE: {table_name.upper()}")
+                        print("─" * 60)
+                        print("Impact: New table will generate:")
+                        class_name = temp_generator._to_class_name(table_name)
+                        print(f"   • ORM Model: {class_name}")
+                        print(f"   • Pydantic Models: {class_name}Create, {class_name}Update, {class_name}")
+                        print(f"   • API Routes: GET, POST, PUT, DELETE for /{table_name}")
+                        print(f"   • Database table with proper PostgreSQL constraints")
+                    
+                    print("\n" + "="*80)
+                    
+                    if missing_tables or new_fields_detected or field_changes:
+                        print(f"\n[MIGRATION] PostgreSQL schema changes detected. Migration options:")
+                        print(f"  1. Direct SQL migration (DDL commands)")
+                        print(f"  2. Reset PostgreSQL database (recreate all tables)")
+                        print(f"  3. Proceed with code generation only (no database changes)")
+                        print(f"  4. Run Alembic migration with impact handling")
+                        
+                        while True:
+                            user_choice = input(f"\nEnter your choice (1, 2, 3, or 4): ").strip()
+                            if user_choice == '1':
+                                print(f"[MIGRATION] Applying PostgreSQL schema changes using direct SQL...")
+                                
+                                # For PostgreSQL, we'll use native SQL DDL commands
+                                conn = psycopg2.connect(
+                                    host="localhost",
+                                    port=5432,
+                                    user="postgres",
+                                    password="password",
+                                    database="nsi_app"
+                                )
+                                cursor = conn.cursor()
+                                
+                                # Add missing tables
+                                for table_name in missing_tables:
+                                    entity_config = None
+                                    for entity in app_config.get('entities', []):
+                                        if entity['table_name'].lower() == table_name:
+                                            entity_config = entity
+                                            break
+                                    
+                                    if entity_config:
+                                        print(f"[MIGRATION] Creating missing table: {table_name}")
+                                        fields = entity_config.get('fields', [])
+                                        column_defs = []
+                                        
+                                        for field in fields:
+                                            field_name = field['name']
+                                            field_type = field.get('type', 'TEXT').upper()
+                                            
+                                            # PostgreSQL type mapping
+                                            if field_type in ['INTEGER', 'INT', 'SERIAL']:
+                                                if field.get('auto_increment', False):
+                                                    pg_type = "SERIAL"
+                                                else:
+                                                    pg_type = "INTEGER"
+                                            elif field_type in ['BIGSERIAL']:
+                                                pg_type = "BIGSERIAL"
+                                            elif field_type in ['VARCHAR', 'STR', 'STRING']:
+                                                length = field.get('length', 255)
+                                                pg_type = f"VARCHAR({length})"
+                                            elif field_type in ['TEXT']:
+                                                pg_type = "TEXT"
+                                            elif field_type in ['BOOLEAN', 'BOOL']:
+                                                pg_type = "BOOLEAN"
+                                            elif field_type in ['TIMESTAMP', 'DATETIME']:
+                                                pg_type = "TIMESTAMP"
+                                            elif field_type in ['DECIMAL', 'NUMERIC']:
+                                                precision = field.get('precision', 10)
+                                                scale = field.get('scale', 2)
+                                                pg_type = f"NUMERIC({precision},{scale})"
+                                            elif field_type in ['FLOAT', 'REAL']:
+                                                pg_type = "REAL"
+                                            else:
+                                                pg_type = "TEXT"
+                                            
+                                            col_def = f"{field_name} {pg_type}"
+                                            
+                                            if field.get('primary_key', False):
+                                                col_def += " PRIMARY KEY"
+                                            
+                                            if not field.get('nullable', True):
+                                                col_def += " NOT NULL"
+                                            
+                                            if field.get('default') is not None:
+                                                default_val = field['default']
+                                                if field_type in ['VARCHAR', 'TEXT', 'STR', 'STRING']:
+                                                    col_def += f" DEFAULT '{default_val}'"
+                                                else:
+                                                    col_def += f" DEFAULT {default_val}"
+                                            
+                                            column_defs.append(col_def)
+                                        
+                                        create_table_sql = f"CREATE TABLE {table_name} ({', '.join(column_defs)})"
+                                        try:
+                                            cursor.execute(create_table_sql)
+                                            print(f"[MIGRATION] Created table: {table_name}")
+                                        except Exception as e:
+                                            print(f"[MIGRATION] Error creating table {table_name}: {e}")
+                                
+                                # Add missing fields to existing tables
+                                for table_name, missing_field_names in new_fields.items():
+                                    entity_config = None
+                                    for entity in app_config.get('entities', []):
+                                        if entity['table_name'].lower() == table_name:
+                                            entity_config = entity
+                                            break
+                                    
+                                    if entity_config:
+                                        fields = entity_config.get('fields', [])
+                                        for field in fields:
+                                            if field['name'] in missing_field_names:
+                                                field_name = field['name']
+                                                field_type = field.get('type', 'TEXT').upper()
+                                                
+                                                # PostgreSQL type mapping (same as above)
+                                                if field_type in ['INTEGER', 'INT', 'SERIAL']:
+                                                    pg_type = "INTEGER"
+                                                elif field_type in ['BIGSERIAL']:
+                                                    pg_type = "BIGINT"
+                                                elif field_type in ['VARCHAR', 'STR', 'STRING']:
+                                                    length = field.get('length', 255)
+                                                    pg_type = f"VARCHAR({length})"
+                                                elif field_type in ['TEXT']:
+                                                    pg_type = "TEXT"
+                                                elif field_type in ['BOOLEAN', 'BOOL']:
+                                                    pg_type = "BOOLEAN"
+                                                elif field_type in ['TIMESTAMP', 'DATETIME']:
+                                                    pg_type = "TIMESTAMP"
+                                                elif field_type in ['DECIMAL', 'NUMERIC']:
+                                                    precision = field.get('precision', 10)
+                                                    scale = field.get('scale', 2)
+                                                    pg_type = f"NUMERIC({precision},{scale})"
+                                                elif field_type in ['FLOAT', 'REAL']:
+                                                    pg_type = "REAL"
+                                                else:
+                                                    pg_type = "TEXT"
+                                                
+                                                alter_sql = f"ALTER TABLE {table_name} ADD COLUMN {field_name} {pg_type}"
+                                                
+                                                if field.get('default') is not None:
+                                                    default_val = field['default']
+                                                    if field_type in ['VARCHAR', 'TEXT', 'STR', 'STRING']:
+                                                        alter_sql += f" DEFAULT '{default_val}'"
+                                                    else:
+                                                        alter_sql += f" DEFAULT {default_val}"
+                                                
+                                                if not field.get('nullable', True):
+                                                    alter_sql += " NOT NULL"
+                                                
+                                                try:
+                                                    cursor.execute(alter_sql)
+                                                    print(f"[MIGRATION] Added column {field_name} to table {table_name}")
+                                                except Exception as e:
+                                                    print(f"[MIGRATION] Error adding column {field_name}: {e}")
+                                
+                                conn.commit()
+                                cursor.close()
+                                conn.close()
+                                
+                                print("[MIGRATION] PostgreSQL direct SQL migration complete!")
+                                
+                                # Generate backend code and update dependency graph
+                                generator = BackendGenerator({}, templates_dir)
+                                result = generator.generate(app_config, output_dir)
+                                dependency_result = generator.update_dependency_graph(app_config, output_dir)
+                                
+                                # Change to generated backend directory to use Alembic
+                                original_cwd = os.getcwd()
+                                os.chdir(output_dir)
+                                
+                                try:
+                                    # Initialize Alembic if not already done
+                                    alembic_dir = Path('alembic')
+                                    if not alembic_dir.exists():
+                                        print("[ALEMBIC] Initializing Alembic for PostgreSQL...")
+                                        subprocess.run([sys.executable, '-m', 'alembic', 'init', 'alembic'], check=True)
+                                        
+                                        # Update alembic.ini with correct PostgreSQL URL
+                                        alembic_ini = Path('alembic.ini')
+                                        if alembic_ini.exists():
+                                            ini_content = alembic_ini.read_text()
+                                            # Replace the placeholder URL with actual PostgreSQL URL
+                                            old_url = 'sqlalchemy.url = driver://user:pass@localhost/dbname'
+                                            new_url = 'sqlalchemy.url = postgresql://postgres:password@localhost:5432/nsi_app'
+                                            ini_content = ini_content.replace(old_url, new_url)
+                                            alembic_ini.write_text(ini_content)
+                                            print("[ALEMBIC] Updated alembic.ini with PostgreSQL connection string")
+                                        
+                                        # Update alembic/env.py to import our models
+                                        env_py = alembic_dir / 'env.py'
+                                        if env_py.exists():
+                                            env_content = env_py.read_text()
+                                            old_import_section = '''from alembic import context
+
+# this is the Alembic Config object, which provides
+# access to the values within the .ini file in use.
+config = context.config'''
+                                            
+                                            new_import_section = '''from alembic import context
+import sys
+from pathlib import Path
+sys.path.append(str(Path(__file__).parent.parent))
+
+from database import Base
+from models import *
+
+# this is the Alembic Config object, which provides
+# access to the values within the .ini file in use.
+config = context.config
+target_metadata = Base.metadata'''
+                                            
+                                            if old_import_section in env_content:
+                                                env_content = env_content.replace(old_import_section, new_import_section)
+                                                env_content = env_content.replace('target_metadata = None', '')
+                                                env_py.write_text(env_content)
+                                                print("[ALEMBIC] Updated env.py to import models")
+                                    
+                                    # Generate migration for current changes
+                                    print("[ALEMBIC] Generating migration for PostgreSQL schema changes...")
+                                    try:
+                                        # Create a new migration
+                                        subprocess.run([sys.executable, '-m', 'alembic', 'revision', '--autogenerate', '-m', 'PostgreSQL schema update'], check=True)
+                                        print("[ALEMBIC] Generated migration file")
+                                        
+                                        # Apply the migration
+                                        subprocess.run([sys.executable, '-m', 'alembic', 'upgrade', 'head'], check=True)
+                                        print("[ALEMBIC] Applied PostgreSQL migration successfully!")
+                                        
+                                    except subprocess.CalledProcessError as e:
+                                        print(f"[ALEMBIC] Migration error: {e}")
+                                        print("[ALEMBIC] Attempting to resolve migration conflicts...")
+                                        
+                                        # Check if this is a revision conflict
+                                        try:
+                                            # Try to stamp the current state
+                                            subprocess.run([sys.executable, '-m', 'alembic', 'stamp', 'head'], check=True)
+                                            print("[ALEMBIC] Stamped PostgreSQL database as current")
+                                            
+                                            # Now generate the migration again
+                                            subprocess.run([sys.executable, '-m', 'alembic', 'revision', '--autogenerate', '-m', 'PostgreSQL schema update'], check=True)
+                                            subprocess.run([sys.executable, '-m', 'alembic', 'upgrade', 'head'], check=True)
+                                            print("[ALEMBIC] PostgreSQL migration completed after conflict resolution")
+                                            
+                                        except subprocess.CalledProcessError as e2:
+                                            print(f"[ALEMBIC] Could not resolve PostgreSQL migration: {e2}")
+                                            print("[ALEMBIC] You may need to manually review the migration files")
+                                
+                                finally:
+                                    os.chdir(original_cwd)
+                                
+                                print("\n" + "="*80)
+                                print("[DONE] POSTGRESQL BACKEND GENERATION AND ALEMBIC MIGRATION COMPLETE!")
+                                print("="*80)
+                                print(f"[DEPENDENCY] Graph updated: {dependency_result['changes_made']} changes tracked")
+                                sys.exit(0)
+                                
+                            elif user_choice == '2':
+                                print("[MIGRATION] Resetting PostgreSQL database (recreate all tables)...")
+                                
+                                # Use direct SQL for complete database reset
+                                conn = psycopg2.connect(
+                                    host="localhost",
+                                    port=5432,
+                                    user="postgres",
+                                    password="password",
+                                    database="nsi_app"
+                                )
+                                cursor = conn.cursor()
+                                
+                                # Add missing tables
+                                for table_name in missing_tables:
+                                    entity_config = None
+                                    for entity in app_config.get('entities', []):
+                                        if entity['table_name'].lower() == table_name:
+                                            entity_config = entity
+                                            break
+                                    
+                                    if entity_config:
+                                        print(f"[MIGRATION] Creating missing table: {table_name}")
+                                        fields = entity_config.get('fields', [])
+                                        column_defs = []
+                                        
+                                        for field in fields:
+                                            field_name = field['name']
+                                            field_type = field.get('type', 'TEXT').upper()
+                                            
+                                            # PostgreSQL type mapping
+                                            if field_type in ['INTEGER', 'INT', 'SERIAL']:
+                                                if field.get('auto_increment', False):
+                                                    pg_type = "SERIAL"
+                                                else:
+                                                    pg_type = "INTEGER"
+                                            elif field_type in ['BIGSERIAL']:
+                                                pg_type = "BIGSERIAL"
+                                            elif field_type in ['VARCHAR', 'STR', 'STRING']:
+                                                length = field.get('length', 255)
+                                                pg_type = f"VARCHAR({length})"
+                                            elif field_type in ['TEXT']:
+                                                pg_type = "TEXT"
+                                            elif field_type in ['BOOLEAN', 'BOOL']:
+                                                pg_type = "BOOLEAN"
+                                            elif field_type in ['TIMESTAMP', 'DATETIME']:
+                                                pg_type = "TIMESTAMP"
+                                            elif field_type in ['DECIMAL', 'NUMERIC']:
+                                                precision = field.get('precision', 10)
+                                                scale = field.get('scale', 2)
+                                                pg_type = f"NUMERIC({precision},{scale})"
+                                            elif field_type in ['FLOAT', 'REAL']:
+                                                pg_type = "REAL"
+                                            else:
+                                                pg_type = "TEXT"
+                                            
+                                            col_def = f"{field_name} {pg_type}"
+                                            
+                                            if field.get('primary_key', False):
+                                                col_def += " PRIMARY KEY"
+                                            
+                                            if not field.get('nullable', True):
+                                                col_def += " NOT NULL"
+                                            
+                                            if field.get('default') is not None:
+                                                default_val = field['default']
+                                                if field_type in ['VARCHAR', 'TEXT', 'STR', 'STRING']:
+                                                    col_def += f" DEFAULT '{default_val}'"
+                                                else:
+                                                    col_def += f" DEFAULT {default_val}"
+                                            
+                                            column_defs.append(col_def)
+                                        
+                                        create_table_sql = f"CREATE TABLE {table_name} ({', '.join(column_defs)})"
+                                        try:
+                                            cursor.execute(create_table_sql)
+                                            print(f"[MIGRATION] Created table: {table_name}")
+                                        except Exception as e:
+                                            print(f"[MIGRATION] Error creating table {table_name}: {e}")
+                                
+                                # Add missing fields to existing tables
+                                for table_name, missing_field_names in new_fields.items():
+                                    entity_config = None
+                                    for entity in app_config.get('entities', []):
+                                        if entity['table_name'].lower() == table_name:
+                                            entity_config = entity
+                                            break
+                                    
+                                    if entity_config:
+                                        fields = entity_config.get('fields', [])
+                                        for field in fields:
+                                            if field['name'] in missing_field_names:
+                                                field_name = field['name']
+                                                field_type = field.get('type', 'TEXT').upper()
+                                                
+                                                # PostgreSQL type mapping (same as above)
+                                                if field_type in ['INTEGER', 'INT', 'SERIAL']:
+                                                    pg_type = "INTEGER"
+                                                elif field_type in ['BIGSERIAL']:
+                                                    pg_type = "BIGINT"
+                                                elif field_type in ['VARCHAR', 'STR', 'STRING']:
+                                                    length = field.get('length', 255)
+                                                    pg_type = f"VARCHAR({length})"
+                                                elif field_type in ['TEXT']:
+                                                    pg_type = "TEXT"
+                                                elif field_type in ['BOOLEAN', 'BOOL']:
+                                                    pg_type = "BOOLEAN"
+                                                elif field_type in ['TIMESTAMP', 'DATETIME']:
+                                                    pg_type = "TIMESTAMP"
+                                                elif field_type in ['DECIMAL', 'NUMERIC']:
+                                                    precision = field.get('precision', 10)
+                                                    scale = field.get('scale', 2)
+                                                    pg_type = f"NUMERIC({precision},{scale})"
+                                                elif field_type in ['FLOAT', 'REAL']:
+                                                    pg_type = "REAL"
+                                                else:
+                                                    pg_type = "TEXT"
+                                                
+                                                alter_sql = f"ALTER TABLE {table_name} ADD COLUMN {field_name} {pg_type}"
+                                                
+                                                if field.get('default') is not None:
+                                                    default_val = field['default']
+                                                    if field_type in ['VARCHAR', 'TEXT', 'STR', 'STRING']:
+                                                        alter_sql += f" DEFAULT '{default_val}'"
+                                                    else:
+                                                        alter_sql += f" DEFAULT {default_val}"
+                                                
+                                                if not field.get('nullable', True):
+                                                    alter_sql += " NOT NULL"
+                                                
+                                                try:
+                                                    cursor.execute(alter_sql)
+                                                    print(f"[MIGRATION] Added column {field_name} to table {table_name}")
+                                                except Exception as e:
+                                                    print(f"[MIGRATION] Error adding column {field_name}: {e}")
+                                
+                                conn.commit()
+                                cursor.close()
+                                conn.close()
+                                
+                                print("[MIGRATION] PostgreSQL schema migration complete!")
+                                
+                                # Generate backend code and update dependency graph
+                                generator = BackendGenerator({}, templates_dir)
+                                result = generator.generate(app_config, output_dir)
+                                dependency_result = generator.update_dependency_graph(app_config, output_dir)
+                                
+                                print("\n" + "="*80)
+                                print("[DONE] POSTGRESQL BACKEND GENERATION AND MIGRATION COMPLETE!")
+                                print("="*80)
+                                print(f"[DEPENDENCY] Graph updated: {dependency_result['changes_made']} changes tracked")
+                                sys.exit(0)
+                                
+                            elif user_choice == '2':
+                                print("[MIGRATION] Resetting PostgreSQL database (recreating all tables)...")
+                                
+                                conn = psycopg2.connect(
+                                    host="localhost",
+                                    port=5432,
+                                    user="postgres",
+                                    password="password",
+                                    database="nsi_app"
+                                )
+                                cursor = conn.cursor()
+                                
+                                # Drop all existing tables
+                                cursor.execute("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public';")
+                                existing_tables = [row[0] for row in cursor.fetchall()]
+                                
+                                for table_name in existing_tables:
+                                    try:
+                                        cursor.execute(f"DROP TABLE IF EXISTS {table_name} CASCADE")
+                                        print(f"[MIGRATION] Dropped table: {table_name}")
+                                    except Exception as e:
+                                        print(f"[MIGRATION] Error dropping table {table_name}: {e}")
+                                
+                                conn.commit()
+                                cursor.close()
+                                conn.close()
+                                
+                                print("[MIGRATION] PostgreSQL database reset complete!")
+                                
+                                # Generate backend code which will create tables
+                                generator = BackendGenerator({}, templates_dir)
+                                result = generator.generate(app_config, output_dir)
+                                dependency_result = generator.update_dependency_graph(app_config, output_dir)
+                                
+                                print("\n" + "="*80)
+                                print("[DONE] POSTGRESQL BACKEND GENERATION AND RESET COMPLETE!")
+                                print("="*80)
+                                print(f"[DEPENDENCY] Graph updated: {dependency_result['changes_made']} changes tracked")
+                                sys.exit(0)
+                                
+                            elif user_choice == '3':
+                                print("[INFO] Proceeding with PostgreSQL code generation only (no database changes).")
+                                break
+                            elif user_choice == '4':
+                                print(f"[ALEMBIC] Running PostgreSQL schema migration with Alembic...")
+                                
+                                # First generate backend code so Alembic can import the models
+                                print("[INFO] Generating backend code first for Alembic to use...")
+                                generator = BackendGenerator({}, templates_dir)
+                                result = generator.generate(app_config, output_dir)
+                                dependency_result = generator.update_dependency_graph(app_config, output_dir)
+                                
+                                # Stay in project root directory where alembic.ini is located
+                                project_root = Path.cwd()
+                                
+                                try:
+                                    # Initialize Alembic if not already done (should already exist in project root)
+                                    alembic_dir = project_root / 'alembic'
+                                    if not alembic_dir.exists():
+                                        print("[ALEMBIC] Initializing Alembic for PostgreSQL...")
+                                        subprocess.run([sys.executable, '-m', 'alembic', 'init', 'alembic'], check=True, cwd=project_root)
+                                        
+                                        # Update alembic.ini with correct PostgreSQL URL
+                                        alembic_ini = project_root / 'alembic.ini'
+                                        if alembic_ini.exists():
+                                            ini_content = alembic_ini.read_text()
+                                            # Replace the placeholder URL with actual PostgreSQL URL
+                                            old_url = 'sqlalchemy.url = driver://user:pass@localhost/dbname'
+                                            new_url = 'sqlalchemy.url = postgresql://postgres:password@localhost:5432/nsi_app'
+                                            ini_content = ini_content.replace(old_url, new_url)
+                                            alembic_ini.write_text(ini_content)
+                                            print("[ALEMBIC] Updated alembic.ini with PostgreSQL connection string")
+                                        
+                                        # Update alembic/env.py to import our models
+                                        env_py = alembic_dir / 'env.py'
+                                        if env_py.exists():
+                                            env_content = env_py.read_text()
+                                            old_import_section = '''from alembic import context
+
+# this is the Alembic Config object, which provides
+# access to the values within the .ini file in use.
+config = context.config
+
+# Interpret the config file for Python logging.
+# This line sets up loggers basically.
+if config.config_file_name is not None:
+    fileConfig(config.config_file_name)
+
+# add your model's MetaData object here
+# for 'autogenerate' support
+# from myapp import mymodel
+# target_metadata = mymodel.Base.metadata
+target_metadata = None'''
+                                            
+                                            new_import_section = '''from alembic import context
+from database import Base
+from models import *  # Import all models
+
+# this is the Alembic Config object, which provides
+# access to the values within the .ini file in use.
+config = context.config
+
+# Interpret the config file for Python logging.
+# This line sets up loggers basically.
+if config.config_file_name is not None:
+    fileConfig(config.config_file_name)
+
+# add your model's MetaData object here
+# for 'autogenerate' support
+target_metadata = Base.metadata'''
+                                            
+                                            env_content = env_content.replace(old_import_section, new_import_section)
+                                            env_py.write_text(env_content)
+                                            print("[ALEMBIC] Updated env.py to import models for PostgreSQL")
+                                    
+                                    # Create initial migration if none exist
+                                    versions_dir = alembic_dir / 'versions'
+                                    if not any(versions_dir.glob('*.py')):
+                                        print("[ALEMBIC] Creating initial migration for PostgreSQL...")
+                                        subprocess.run([sys.executable, '-m', 'alembic', 'revision', '--autogenerate', '-m', 'Initial migration'], check=True, cwd=project_root)
+                                    
+                                    # Apply migrations
+                                    print("[ALEMBIC] Applying PostgreSQL migrations...")
+                                    subprocess.run([sys.executable, '-m', 'alembic', 'upgrade', 'head'], check=True, cwd=project_root)
+                                    
+                                    print("[ALEMBIC] PostgreSQL Alembic migration complete!")
+                                    
+                                except subprocess.CalledProcessError as e:
+                                    print(f"[ALEMBIC] Error running Alembic for PostgreSQL: {e}")
+                                
+                                print("\n" + "="*80)
+                                print("[DONE] POSTGRESQL BACKEND GENERATION AND ALEMBIC MIGRATION COMPLETE!")
+                                print("="*80)
+                                print(f"[DEPENDENCY] Graph updated: {dependency_result['changes_made']} changes tracked")
+                                sys.exit(0)
+                            else:
+                                print("Invalid input. Please enter 1, 2, 3, or 4.")
+                else:
+                    print(f"[DB] PostgreSQL database 'nsi_app' schema is up to date.")
+                    
+            except Exception as e:
+                print(f"[DB] Error analyzing PostgreSQL database: {e}")
+                db_exists = False
+        else:
+            if db_type == 'sqlite':
+                print(f"[DB] SQLite database file '{db_path.name}' does not exist.")
+            elif db_type == 'postgresql':
+                print(f"[DB] PostgreSQL database 'nsi_app' is not accessible.")
+            else:
+                print(f"[DB] Database type '{db_type}' is not accessible or not supported.")
+    # Ask for user confirmation before backend code generation
+    proceed_codegen = input("\nDo you want to proceed with backend code generation? (y/N): ").strip().lower()
+    if proceed_codegen != 'y':
+        print("[ABORTED] Backend code generation cancelled by user.")
+        sys.exit(0)
+
+    # Create generator (templates optional)
+    templates_dir = Path('./Templates')
+    generator = BackendGenerator({}, templates_dir, project_config)
+
+    # Generate backend
+    result = generator.generate(app_config, output_dir)
+
+    # Generate/Update dependency graph
+    dependency_result = generator.update_dependency_graph(app_config, output_dir)
+    
+    # Print summary
+    print("\n" + "="*80)
+    print("[DONE] BACKEND GENERATION COMPLETE!")
+    print("="*80)
+    print(f"\n[DATA] Statistics:")
+    print(f"  - Files: {result['files_generated']}")
+    print(f"  - Entities: {result['entities']}")
+    print(f"  - APIs: {result['apis']}")
+    print(f"  - Routes: {result['routes']}")
+    print(f"\n[DIR] Output: {result['output_dir']}")
+    print(f"\n[>>] Next Steps:")
+    print(f"  1. cd {result['output_dir']}")
+    print(f"  2. pip install -r requirements.txt")
+    print(f"  3. python main.py")
+    print(f"\n API Docs: http://localhost:8000/docs")
+    
+    # Create backup of generated code as the very last step
+    backup_result = create_backup_of_generated_code(output_dir)
+    if backup_result:
+        print(f"\n[BACKUP] Generated code backup created at: {backup_result}")
+    
+    print("="*80 + "\n")
+
+
+if __name__ == '__main__':
+    main()
+"
