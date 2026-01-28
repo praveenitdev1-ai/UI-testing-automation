@@ -1,0 +1,1403 @@
+"#!/usr/bin/env python3
+"""
+API Registry Manager - Web Mode Version
+======================================
+
+Web-compatible version of the API Registry Management System that supports
+WebSocket/HTTP interactions for use in web workflows.
+
+This version maintains the same functionality as the original but replaces
+interactive input() calls with web-based prompt/response mechanisms.
+
+Features:
+- All original API registry functionality
+- Web-mode support for interactive prompts
+- File-based prompt/response communication
+- Session management for web workflows
+- Fallback to console mode when web mode is disabled
+
+Usage:
+    python step_3b_api_registry_manager_web.py [--config config.json] [--web-mode] [--session-id ID]
+"""
+
+import argparse
+import json
+import logging
+import psycopg2
+from pathlib import Path
+from typing import Dict, List, Any, Optional, Tuple
+from datetime import datetime
+import sys
+import time
+import uuid
+from psycopg2.extras import RealDictCursor
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Global variables for web mode
+web_mode = False
+current_session_id = None
+
+
+class APIRegistryManagerWeb:
+    """Web-compatible API Registry Manager"""
+    
+    def __init__(self):
+        """Initialize database connection"""
+        self.bulk_conflict_action = None  # Track bulk action choice for conflicts
+        self.db_config = {
+            "host": "localhost",
+            "port": 5432,
+            "database": "api_registry",
+            "username": "postgres",
+            "password": "password"
+        }
+        self.nsi_db_config = {
+            "host": "localhost",
+            "port": 5432,
+            "database": "nsi_app",
+            "username": "postgres",
+            "password": "password"
+        }
+        self.conn = None
+        self.nsi_conn = None
+        self.connect_to_db()
+    
+    def connect_to_db(self):
+        """Establish database connections"""
+        try:
+            # Connect to API registry database
+            self.conn = psycopg2.connect(
+                host=self.db_config['host'],
+                port=self.db_config['port'],
+                database=self.db_config['database'],
+                user=self.db_config['username'],
+                password=self.db_config['password']
+            )
+            self.conn.autocommit = False
+            logger.info("Connected to API registry database successfully")
+            
+            # Connect to NSI application database
+            self.nsi_conn = psycopg2.connect(
+                host=self.nsi_db_config['host'],
+                port=self.nsi_db_config['port'],
+                database=self.nsi_db_config['database'],
+                user=self.nsi_db_config['username'],
+                password=self.nsi_db_config['password']
+            )
+            self.nsi_conn.autocommit = False
+            logger.info("Connected to NSI application database successfully")
+        except Exception as e:
+            logger.error(f"Failed to connect to database: {e}")
+            # In web mode, don't exit - just log the error
+            if not web_mode:
+                sys.exit(1)
+    
+    def close_connection(self):
+        """Close database connections"""
+        if self.conn:
+            self.conn.close()
+            logger.info("API registry database connection closed")
+        if self.nsi_conn:
+            self.nsi_conn.close()
+            logger.info("NSI application database connection closed")
+    
+    def enable_web_mode(self, session_id: str = None):
+        """Enable web mode for interactive prompts"""
+        global web_mode, current_session_id
+        web_mode = True
+        current_session_id = session_id or str(uuid.uuid4())
+        logger.info(f"Web mode enabled with session ID: {current_session_id}")
+    
+    def disable_web_mode(self):
+        """Disable web mode"""
+        global web_mode, current_session_id
+        web_mode = False
+        current_session_id = None
+        logger.info("Web mode disabled")
+    
+    def _send_web_prompt(self, prompt_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Send interactive prompt to web interface and wait for response"""
+        global current_session_id
+        
+        try:
+            # Clean up any existing prompt file first
+            prompt_file = Path("temp_api_prompt.json")
+            if prompt_file.exists():
+                prompt_file.unlink()
+                
+            # Generate unique prompt ID
+            prompt_id = str(uuid.uuid4())
+            prompt_data['prompt_id'] = prompt_id
+            prompt_data['session_id'] = current_session_id
+            prompt_data['timestamp'] = datetime.now().isoformat()
+            
+            # Save prompt data to file for web interface to pick up
+            with open(prompt_file, 'w') as f:
+                json.dump(prompt_data, f, indent=2)
+            
+            logger.info(f"Prompt saved to {prompt_file}, waiting for web response...")
+            
+            # Wait for response with timeout
+            timeout = 300  # 5 minutes timeout
+            start_time = time.time()
+            
+            while time.time() - start_time < timeout:
+                response_file = Path(f"temp_api_response_{prompt_id}.json")
+                if response_file.exists():
+                    try:
+                        with open(response_file, 'r') as f:
+                            response = json.load(f)
+                        # Clean up files
+                        response_file.unlink()
+                        if prompt_file.exists():
+                            prompt_file.unlink()
+                        logger.info(f"Received web response: {response}")
+                        return response
+                    except Exception as e:
+                        logger.error(f"Error reading response file: {e}")
+                        # Clean up prompt file even on error
+                        if prompt_file.exists():
+                            prompt_file.unlink()
+                        break
+                
+                time.sleep(1)  # Check every second
+            
+            logger.error("Timeout waiting for web response")
+            # Clean up prompt file on timeout
+            if prompt_file.exists():
+                prompt_file.unlink()
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error sending web prompt: {e}")
+            # Clean up prompt file on exception
+            prompt_file = Path("temp_api_prompt.json")
+            if prompt_file.exists():
+                prompt_file.unlink()
+            return None
+    
+    def _get_user_input(self, prompt: str, options: List[Dict[str, Any]] = None) -> str:
+        """Get user input - web mode or console mode"""
+        global web_mode
+        
+        if web_mode and options:
+            # Create prompt data for web interface
+            prompt_data = {
+                "type": "user_input",
+                "title": "User Input Required",
+                "prompt": prompt,
+                "options": options
+            }
+            
+            response = self._send_web_prompt(prompt_data)
+            if response and response.get('choice'):
+                return response['choice']
+            else:
+                logger.error("No valid response received from web interface")
+                return "2"  # Default safe option
+        else:
+            # Console mode
+            return input(prompt)
+    
+    def load_application_config(self, config_file: str) -> Dict[str, Any]:
+        """Load application configuration from JSON file"""
+        try:
+            with open(config_file, 'r', encoding='utf-8') as f:
+                config = json.load(f)
+            logger.info(f"Loaded configuration from {config_file}")
+            return config
+        except FileNotFoundError:
+            logger.error(f"Configuration file not found: {config_file}")
+            if not web_mode:
+                sys.exit(1)
+            return {}
+        except json.JSONDecodeError as e:
+            logger.error(f"Invalid JSON in configuration file: {e}")
+            if not web_mode:
+                sys.exit(1)
+            return {}
+    
+    def check_existing_api(self, api_id: str, endpoint: str, method: str = None) -> Optional[Dict[str, Any]]:
+        """Check if API already exists - only true conflicts (same endpoint+method)"""
+        try:
+            with self.conn.cursor(cursor_factory=RealDictCursor) as cursor:
+                if method:
+                    cursor.execute("""
+                        SELECT * FROM api_registry 
+                        WHERE endpoint = %s AND method = %s AND is_active = TRUE
+                        ORDER BY created_at DESC 
+                        LIMIT 1
+                    """, (endpoint, method))
+                else:
+                    cursor.execute("""
+                        SELECT * FROM api_registry 
+                        WHERE endpoint = %s AND is_active = TRUE
+                        ORDER BY created_at DESC 
+                        LIMIT 1
+                    """, (endpoint,))
+                
+                result = cursor.fetchone()
+                if result:
+                    return dict(result)
+                return None
+                
+        except Exception as e:
+            logger.error(f"Error checking existing API: {e}")
+            return None
+    
+    def get_user_choice(self, existing_api: Dict[str, Any], new_api: Dict[str, Any]) -> int:
+        """Present options to user for handling API conflicts"""
+        global web_mode
+        
+        if web_mode:
+            # Create prompt data for web interface
+            prompt_data = {
+                "type": "api_conflict",
+                "title": "API Conflict Detected",
+                "description": "An API conflict has been detected. Please select how to proceed.",
+                "existing_api": {
+                    "id": existing_api['id'],
+                    "endpoint": existing_api['endpoint'],
+                    "method": existing_api['method'],
+                    "current_owner": existing_api.get('current_owner', 'Unknown'),
+                    "description": existing_api.get('description', 'N/A')
+                },
+                "new_api": {
+                    "id": new_api['id'],
+                    "endpoint": new_api['endpoint'],
+                    "method": new_api['method'],
+                    "requested_by": new_api['user'],
+                    "description": new_api.get('description', 'N/A')
+                },
+                "options": [
+                    {"id": "1", "label": "Request approval to take ownership", "description": "Submit a request for API ownership approval"},
+                    {"id": "2", "label": "Continue using existing API", "description": "Skip registration and use the existing API"},
+                    {"id": "3", "label": "Continue with creating new API", "description": "Override the existing API and create new one"},
+                    {"id": "4", "label": "Review pending requests", "description": "Open the review interface for pending requests"},
+                    {"id": "5", "label": "Skip ALL remaining conflicts", "description": "Skip all remaining API conflicts in this session"},
+                    {"id": "6", "label": "Override ALL remaining conflicts", "description": "Override all remaining API conflicts in this session"}
+                ]
+            }
+            
+            # Send prompt to web interface and wait for response
+            response = self._send_web_prompt(prompt_data)
+            if response and response.get('choice'):
+                return int(response['choice'])
+            else:
+                logger.error("No valid response received from web interface")
+                return 2  # Default to continue with existing API
+        
+        # Original console mode
+        print("\\n" + "="*80)
+        print("API CONFLICT DETECTED")
+        print("="*80)
+        print(f"Existing API:")
+        print(f"  ID: {existing_api['id']}")
+        print(f"  Endpoint: {existing_api['endpoint']}")
+        print(f"  Method: {existing_api['method']}")
+        print(f"  Current Owner: {existing_api.get('current_owner', 'Unknown')}")
+        print(f"  Description: {existing_api.get('description', 'N/A')}")
+        
+        print(f"\\nNew API:")
+        print(f"  ID: {new_api['id']}")
+        print(f"  Endpoint: {new_api['endpoint']}")
+        print(f"  Method: {new_api['method']}")
+        print(f"  Requested By: {new_api['user']}")
+        print(f"  Description: {new_api.get('description', 'N/A')}")
+        
+        print(f"\\nOptions:")
+        print(f"  1. Request approval to take ownership")
+        print(f"  2. Continue using existing API (skip registration)")
+        print(f"  3. Continue with creating new API (override)")
+        print(f"  4. Review pending requests")
+        print(f"  5. Skip ALL remaining conflicting APIs")
+        print(f"  6. Override ALL remaining conflicting APIs")
+        
+        while True:
+            try:
+                choice = int(input("\\nEnter your choice (1-6): "))
+                if 1 <= choice <= 6:
+                    return choice
+                else:
+                    print("Please enter a valid choice (1-6)")
+            except ValueError:
+                print("Please enter a valid number")
+    
+    def create_review_request(self, existing_api: Dict[str, Any], new_api: Dict[str, Any], description: str = None) -> bool:
+        """Create a review request for API ownership change"""
+        try:
+            with self.conn.cursor() as cursor:
+                cursor.execute("""
+                    INSERT INTO api_review (
+                        existing_api_id, requested_api_id, requester, 
+                        description, status, created_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s)
+                """, (
+                    existing_api['id'],
+                    new_api['id'],
+                    new_api['user'],
+                    description or f"Request to take ownership of {existing_api['endpoint']}",
+                    'PENDING',
+                    datetime.now()
+                ))
+                self.conn.commit()
+                logger.info(f"Review request created for API {existing_api['id']}")
+                return True
+        except Exception as e:
+            logger.error(f"Error creating review request: {e}")
+            self.conn.rollback()
+            return False
+    
+    def insert_api_registry(self, api_data: Dict[str, Any]) -> bool:
+        """Insert API data into registry table"""
+        try:
+            with self.conn.cursor() as cursor:
+                cursor.execute("""
+                    INSERT INTO api_registry (
+                        id, endpoint, method, entity, user_id, version, 
+                        description, created_at, is_active
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """, (
+                    api_data['id'],
+                    api_data['endpoint'],
+                    api_data.get('method', 'GET'),
+                    api_data.get('entity', ''),
+                    api_data['user'],
+                    api_data.get('version', 'v1'),
+                    api_data.get('description', ''),
+                    datetime.now(),
+                    True
+                ))
+                return True
+        except Exception as e:
+            logger.error(f"Error inserting API registry: {e}")
+            return False
+    
+    def insert_api_ownership(self, api_id: str, endpoint: str, user_id: str) -> bool:
+        """Insert API ownership record"""
+        try:
+            with self.conn.cursor() as cursor:
+                cursor.execute("""
+                    INSERT INTO api_ownership (api_id, endpoint, user_id, created_at)
+                    VALUES (%s, %s, %s, %s)
+                """, (api_id, endpoint, user_id, datetime.now()))
+                return True
+        except Exception as e:
+            logger.error(f"Error inserting API ownership: {e}")
+            return False
+    
+    def process_api_registration(self, api_data: Dict[str, Any], current_version: str) -> bool:
+        """Process single API registration with conflict handling"""
+        api_id = api_data['id']
+        original_endpoint = api_data['endpoint']
+        
+        # Create a copy for database operations
+        db_api_data = api_data.copy()
+        db_api_data['version'] = current_version
+        
+        # Update endpoint with current version if it contains version info
+        if '/api/v' in original_endpoint:
+            parts = original_endpoint.split('/')
+            if len(parts) >= 3 and parts[2].startswith('v'):
+                parts[2] = current_version
+                db_api_data['endpoint'] = '/'.join(parts)
+        
+        # Check for conflicts
+        existing_api = self.check_existing_api(api_id, original_endpoint, api_data.get('method'))
+        
+        if existing_api:
+            # Check bulk actions
+            if self.bulk_conflict_action == 'skip_all':
+                print(f"⚠ Skipping registration for API {api_id} - using existing (bulk action)")
+                return True
+            elif self.bulk_conflict_action == 'override_all':
+                print(f"⚠ Overriding existing API {api_id} (bulk action)")
+            else:
+                choice = self.get_user_choice(existing_api, db_api_data)
+                
+                if choice == 1:  # Request approval
+                    description = "API ownership request submitted via web interface" if web_mode else self._get_user_input("Enter description for the approval request (optional): ")
+                    if self.create_review_request(existing_api, db_api_data, description):
+                        print(f"✅ Review request submitted for API {api_id}")
+                        return True
+                    else:
+                        print(f"❌ Failed to create review request for API {api_id}")
+                        return False
+                
+                elif choice == 2:  # Continue using existing
+                    print(f"⚠ Skipping registration for API {api_id} - using existing")
+                    return True
+                
+                elif choice == 3:  # Override
+                    print(f"⚠ Overriding existing API {api_id}")
+                
+                elif choice == 4:  # Review pending
+                    self.show_review_menu()
+                    return self.process_api_registration(api_data, current_version)
+                
+                elif choice == 5:  # Skip all remaining
+                    self.bulk_conflict_action = 'skip_all'
+                    print(f"⚠ Skipping registration for API {api_id} - using existing (will skip all remaining conflicts)")
+                    return True
+                
+                elif choice == 6:  # Override all remaining
+                    self.bulk_conflict_action = 'override_all'
+                    print(f"⚠ Overriding existing API {api_id} (will override all remaining conflicts)")
+        
+        # Register the API
+        try:
+            with self.conn.cursor() as cursor:
+                if not self.insert_api_registry(db_api_data):
+                    return False
+                
+                if not self.insert_api_ownership(api_id, db_api_data['endpoint'], db_api_data['user']):
+                    return False
+                
+                self.conn.commit()
+                logger.info(f"Successfully registered API: {api_id}")
+                return True
+                
+        except Exception as e:
+            logger.error(f"Error inserting API registry: {e}")
+            try:
+                self.conn.rollback()
+            except:
+                pass
+            return False
+    
+    def show_review_menu(self):
+        """Show review management menu"""
+        if web_mode:
+            # Send web prompt for review menu options
+            prompt_data = {
+                "type": "menu_selection",
+                "title": "Review Management Options",
+                "description": "Select the type of review operation you want to perform:",
+                "options": [
+                    {
+                        "id": "2.1", 
+                        "label": "Show all pending reviews", 
+                        "description": "Display all pending approval requests",
+                        "icon": "👁️"
+                    },
+                    {
+                        "id": "2.2", 
+                        "label": "Approve specific review", 
+                        "description": "Approve a specific review request by ID",
+                        "icon": "✅"
+                    },
+                    {
+                        "id": "2.3", 
+                        "label": "Reject specific review", 
+                        "description": "Reject a specific review request by ID", 
+                        "icon": "❌"
+                    },
+                    {
+                        "id": "2.4", 
+                        "label": "Bulk approve all pending", 
+                        "description": "Approve all pending review requests at once",
+                        "icon": "✅✅"
+                    },
+                    {
+                        "id": "2.5", 
+                        "label": "Back to main menu", 
+                        "description": "Return to the main API registry menu",
+                        "icon": "🔙"
+                    }
+                ]
+            }
+            
+            response = self._send_web_prompt(prompt_data)
+            if response and response.get('choice'):
+                choice = response['choice']
+                
+                if choice == "2.1":  # Show pending reviews
+                    self.show_pending_reviews()
+                    # Continue loop to show review menu again
+                elif choice == "2.2":  # Approve specific review 
+                    self.approve_review()
+                    # Continue loop to show review menu again
+                elif choice == "2.3":  # Reject specific review
+                    self.reject_review()
+                    # Continue loop to show review menu again
+                elif choice == "2.4":  # Bulk approve all
+                    self.bulk_approve_reviews()
+                    # Continue loop to show review menu again
+                elif choice == "2.5":  # Back to main menu
+                    logger.info("User selected back to main menu")
+                    return  # Exit the review menu
+                else:
+                    logger.warning(f"Unknown review choice: {choice}")
+                    return  # Exit on unknown choice
+                    
+                # If we reach here, continue the review menu loop
+                # (recursive call to show menu again)
+                if choice in ["2.1", "2.2", "2.3", "2.4"]:
+                    self.show_review_menu()
+            return
+            
+        # Original console mode
+        while True:
+            print("\\n" + "="*60)
+            print("API REVIEW MANAGEMENT")
+            print("="*60)
+            print("1. View pending reviews")
+            print("2. Approve a review")
+            print("3. Reject a review")
+            print("4. Back to main menu")
+            
+            try:
+                choice = int(input("\\nEnter your choice (1-4): "))
+                
+                if choice == 1:
+                    self.show_pending_reviews()
+                elif choice == 2:
+                    self.approve_review()
+                elif choice == 3:
+                    self.reject_review()
+                elif choice == 4:
+                    break
+                else:
+                    print("Please enter a valid choice (1-4)")
+                    
+            except ValueError:
+                print("Please enter a valid number")
+    
+    def show_pending_reviews(self):
+        """Show all pending reviews"""
+        try:
+            with self.conn.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute("""
+                    SELECT * FROM api_review 
+                    WHERE status = 'PENDING'
+                    ORDER BY created_at DESC
+                """)
+                reviews = cursor.fetchall()
+                
+                if web_mode:
+                    review_data = []
+                    for review in reviews:
+                        review_data.append({
+                            "id": review['id'],
+                            "existing_api": review['existing_api_id'],
+                            "requested_api": review['requested_api_id'], 
+                            "requester": review['requester'],
+                            "description": review['description'],
+                            "created": review['created_at'].strftime("%Y-%m-%d %H:%M:%S") if review['created_at'] else "Unknown"
+                        })
+                    
+                    prompt_data = {
+                        "type": "info_display",
+                        "title": f"Pending Reviews ({len(review_data)} total)",
+                        "content": {
+                            "reviews": review_data,
+                            "message": "All pending reviews are displayed below. You can approve/reject individual items from the review menu."
+                        },
+                        "back_option": True
+                    }
+                    
+                    self._send_web_prompt(prompt_data)
+                    return
+                
+                # Console mode
+                if not reviews:
+                    print("No pending reviews found.")
+                    return
+                
+                print(f"\\nPending Reviews ({len(reviews)}):")
+                print("-" * 80)
+                for review in reviews:
+                    print(f"ID: {review['id']}")
+                    print(f"Existing API: {review['existing_api_id']}")
+                    print(f"Requested API: {review['requested_api_id']}")
+                    print(f"Requester: {review['requester']}")
+                    print(f"Description: {review['description']}")
+                    print(f"Created: {review['created_at']}")
+                    print("-" * 80)
+                    
+        except Exception as e:
+            logger.error(f"Error showing pending reviews: {e}")
+            if web_mode:
+                error_prompt = {
+                    "type": "error",
+                    "title": "Database Error",
+                    "message": f"Could not retrieve pending reviews: {str(e)}"
+                }
+                self._send_web_prompt(error_prompt)
+    
+    def approve_review(self):
+        """Approve a review request"""
+        if web_mode:
+            # Get list of pending reviews for selection
+            try:
+                with self.conn.cursor(cursor_factory=RealDictCursor) as cursor:
+                    cursor.execute("""
+                        SELECT id, existing_api_id, requested_api_id, requester, description
+                        FROM api_review 
+                        WHERE status = 'PENDING'
+                        ORDER BY created_at DESC
+                    """)
+                    
+                    pending_reviews = cursor.fetchall()
+                    
+                    if not pending_reviews:
+                        prompt_data = {
+                            "type": "info",
+                            "title": "No Pending Reviews",
+                            "message": "There are no pending reviews to approve.",
+                            "back_option": True
+                        }
+                        self._send_web_prompt(prompt_data)
+                        return
+                        
+                    # Create selection options
+                    options = []
+                    for review in pending_reviews:
+                        options.append({
+                            "id": f"approve_{review['id']}",
+                            "label": f"Review #{review['id']} - {review['requester']}",
+                            "description": f"API: {review['requested_api_id']} | {review['description'][:50]}...",
+                            "data": {"review_id": review['id']}
+                        })
+                    
+                    options.append({
+                        "id": "back",
+                        "label": "Back to review menu",
+                        "description": "Return to review management options"
+                    })
+                    
+                    prompt_data = {
+                        "type": "menu_selection",
+                        "title": "Select Review to Approve",
+                        "description": "Choose the API review you want to approve:",
+                        "options": options
+                    }
+                    
+                    response = self._send_web_prompt(prompt_data)
+                    if response and response.get('choice'):
+                        choice = response['choice']
+                        if choice == "back":
+                            return
+                            
+                        # Find selected review
+                        try:
+                            selected_option = next(opt for opt in options if opt['id'] == choice)
+                            review_id = selected_option['data']['review_id']
+                            
+                            # Update status to approved
+                            with self.conn.cursor() as cursor:
+                                cursor.execute("""
+                                    UPDATE api_review 
+                                    SET status = 'APPROVED', reviewer = %s, review_comments = %s, reviewed_at = %s
+                                    WHERE id = %s
+                                """, ("web_admin", "Approved via web interface", datetime.now(), review_id))
+                                
+                                if cursor.rowcount > 0:
+                                    self.conn.commit()
+                                    
+                                    success_prompt = {
+                                        "type": "success",
+                                        "title": "Review Approved",
+                                        "message": f"Successfully approved review #{review_id}",
+                                        "back_option": True
+                                    }
+                                    self._send_web_prompt(success_prompt)
+                                else:
+                                    error_prompt = {
+                                        "type": "error",
+                                        "title": "Approval Failed",
+                                        "message": f"Review #{review_id} not found or already processed"
+                                    }
+                                    self._send_web_prompt(error_prompt)
+                                    
+                        except Exception as e:
+                            error_prompt = {
+                                "type": "error", 
+                                "title": "Approval Failed",
+                                "message": f"Could not approve review: {str(e)}"
+                            }
+                            self._send_web_prompt(error_prompt)
+                            
+            except Exception as e:
+                logger.error(f"Error in approve_review web mode: {e}")
+                error_prompt = {
+                    "type": "error",
+                    "title": "Database Error",
+                    "message": f"Could not retrieve reviews: {str(e)}"
+                }
+                self._send_web_prompt(error_prompt)
+            return
+            
+        # Console mode - original implementation
+        try:
+            review_id = input("Enter review ID to approve: ").strip()
+            if not review_id:
+                print("Review ID is required")
+                return
+            
+            reviewer = input("Enter reviewer name: ").strip() or "admin"
+            comments = input("Enter review comments (optional): ").strip()
+            
+            with self.conn.cursor() as cursor:
+                cursor.execute("""
+                    UPDATE api_review 
+                    SET status = 'APPROVED', reviewer = %s, review_comments = %s, reviewed_at = %s
+                    WHERE id = %s
+                """, (reviewer, comments, datetime.now(), review_id))
+                
+                if cursor.rowcount > 0:
+                    self.conn.commit()
+                    print(f"✅ Review {review_id} approved successfully")
+                else:
+                    print(f"❌ Review {review_id} not found")
+                
+        except Exception as e:
+            logger.error(f"Error approving review: {e}")
+            self.conn.rollback()
+    
+    def reject_review(self):
+        """Reject a review request"""
+        if web_mode:
+            # Get list of pending reviews for selection
+            try:
+                with self.conn.cursor(cursor_factory=RealDictCursor) as cursor:
+                    cursor.execute("""
+                        SELECT id, existing_api_id, requested_api_id, requester, description
+                        FROM api_review 
+                        WHERE status = 'PENDING'
+                        ORDER BY created_at DESC
+                    """)
+                    
+                    pending_reviews = cursor.fetchall()
+                    
+                    if not pending_reviews:
+                        prompt_data = {
+                            "type": "info",
+                            "title": "No Pending Reviews",
+                            "message": "There are no pending reviews to reject.",
+                            "back_option": True
+                        }
+                        self._send_web_prompt(prompt_data)
+                        return
+                        
+                    # Create selection options
+                    options = []
+                    for review in pending_reviews:
+                        options.append({
+                            "id": f"reject_{review['id']}",
+                            "label": f"Review #{review['id']} - {review['requester']}",
+                            "description": f"API: {review['requested_api_id']} | {review['description'][:50]}...",
+                            "data": {"review_id": review['id']}
+                        })
+                    
+                    options.append({
+                        "id": "back",
+                        "label": "Back to review menu",
+                        "description": "Return to review management options"
+                    })
+                    
+                    prompt_data = {
+                        "type": "menu_selection",
+                        "title": "Select Review to Reject", 
+                        "description": "Choose the API review you want to reject:",
+                        "options": options
+                    }
+                    
+                    response = self._send_web_prompt(prompt_data)
+                    if response and response.get('choice'):
+                        choice = response['choice']
+                        if choice == "back":
+                            return
+                            
+                        # Find selected review and reject it
+                        try:
+                            selected_option = next(opt for opt in options if opt['id'] == choice)
+                            review_id = selected_option['data']['review_id']
+                            
+                            # Update status to rejected
+                            with self.conn.cursor() as cursor:
+                                cursor.execute("""
+                                    UPDATE api_review 
+                                    SET status = 'REJECTED', reviewer = %s, review_comments = %s, reviewed_at = %s
+                                    WHERE id = %s
+                                """, ("web_admin", "Rejected via web interface", datetime.now(), review_id))
+                                
+                                if cursor.rowcount > 0:
+                                    self.conn.commit()
+                                    
+                                    success_prompt = {
+                                        "type": "success",
+                                        "title": "Review Rejected",
+                                        "message": f"Successfully rejected review #{review_id}",
+                                        "back_option": True
+                                    }
+                                    self._send_web_prompt(success_prompt)
+                                else:
+                                    error_prompt = {
+                                        "type": "error",
+                                        "title": "Rejection Failed",
+                                        "message": f"Review #{review_id} not found or already processed"
+                                    }
+                                    self._send_web_prompt(error_prompt)
+                                    
+                        except Exception as e:
+                            error_prompt = {
+                                "type": "error",
+                                "title": "Rejection Failed", 
+                                "message": f"Could not reject review: {str(e)}"
+                            }
+                            self._send_web_prompt(error_prompt)
+                            
+            except Exception as e:
+                logger.error(f"Error in reject_review web mode: {e}")
+                error_prompt = {
+                    "type": "error",
+                    "title": "Database Error",
+                    "message": f"Could not retrieve reviews: {str(e)}"
+                }
+                self._send_web_prompt(error_prompt)
+            return
+            
+        # Console mode - original implementation
+        try:
+            review_id = input("Enter review ID to reject: ").strip()
+            if not review_id:
+                print("Review ID is required")
+                return
+            
+            reviewer = input("Enter reviewer name: ").strip() or "admin"
+            comments = input("Enter rejection reason: ").strip() or "Request rejected"
+            
+            with self.conn.cursor() as cursor:
+                cursor.execute("""
+                    UPDATE api_review 
+                    SET status = 'REJECTED', reviewer = %s, review_comments = %s, reviewed_at = %s
+                    WHERE id = %s
+                """, (reviewer, comments, datetime.now(), review_id))
+                
+                if cursor.rowcount > 0:
+                    self.conn.commit()
+                    print(f"✅ Review {review_id} rejected successfully")
+                else:
+                    print(f"❌ Review {review_id} not found")
+                
+        except Exception as e:
+            logger.error(f"Error rejecting review: {e}")
+            self.conn.rollback()
+    
+    def bulk_approve_reviews(self):
+        """Approve all pending reviews at once"""
+        try:
+            with self.conn.cursor(cursor_factory=RealDictCursor) as cursor:
+                # Count pending reviews first
+                cursor.execute("SELECT COUNT(*) as count FROM api_review WHERE status = 'PENDING'")
+                count_result = cursor.fetchone()
+                count = count_result['count'] if count_result else 0
+                
+                if count == 0:
+                    if web_mode:
+                        prompt_data = {
+                            "type": "info",
+                            "title": "No Pending Reviews",
+                            "message": "There are no pending reviews to approve.",
+                            "back_option": True
+                        }
+                        self._send_web_prompt(prompt_data)
+                    else:
+                        print("No pending reviews found.")
+                    return
+                
+                if web_mode:
+                    # Ask for confirmation
+                    confirm_prompt = {
+                        "type": "confirmation",
+                        "title": "Bulk Approve All Reviews",
+                        "message": f"Are you sure you want to approve all {count} pending reviews?",
+                        "confirm_text": "Yes, approve all",
+                        "cancel_text": "Cancel"
+                    }
+                    
+                    response = self._send_web_prompt(confirm_prompt)
+                    if not response or not response.get('confirmed'):
+                        return
+                        
+                # Approve all pending reviews
+                cursor.execute("""
+                    UPDATE api_review 
+                    SET status = 'APPROVED', reviewer = %s, review_comments = %s, reviewed_at = %s
+                    WHERE status = 'PENDING'
+                """, ("web_admin" if web_mode else "admin", "Bulk approved", datetime.now()))
+                
+                self.conn.commit()
+                
+                if web_mode:
+                    success_prompt = {
+                        "type": "success",
+                        "title": "Bulk Approval Complete",
+                        "message": f"Successfully approved {count} pending reviews",
+                        "back_option": True
+                    }
+                    self._send_web_prompt(success_prompt)
+                else:
+                    print(f"Successfully approved {count} pending reviews.")
+                    
+        except Exception as e:
+            logger.error(f"Error in bulk approve: {e}")
+            self.conn.rollback()
+            if web_mode:
+                error_prompt = {
+                    "type": "error",
+                    "title": "Bulk Approval Failed",
+                    "message": f"Could not approve reviews: {str(e)}"
+                }
+                self._send_web_prompt(error_prompt)
+            else:
+                print(f"Error: {e}")
+
+    def process_all_apis(self, config_file: str):
+        """Process all APIs from application configuration"""
+        self.bulk_conflict_action = None
+        
+        # Check for schema changes and update version if needed
+        versions_map = self.check_and_update_version(config_file)
+        logger.info(f"Using API version map: {versions_map}")
+        
+        config = self.load_application_config(config_file)
+        apis = config.get('apis', [])
+        
+        if not apis:
+            logger.warning("No APIs found in configuration file")
+            return
+        
+        logger.info(f"Found {len(apis)} APIs to process")
+        
+        successful = 0
+        failed = 0
+        
+        for api in apis:
+            print(f"\\nProcessing API: {api['id']}")
+            # Determine per-API version: use versions_map for entity if present, otherwise use api.version or v1
+            entity = api.get('entity')
+            per_api_version = versions_map.get(entity) if isinstance(versions_map, dict) and entity in versions_map else api.get('version', 'v1')
+            
+            if self.process_api_registration(api, per_api_version):
+                successful += 1
+            else:
+                failed += 1
+        
+        print(f"\\n" + "="*80)
+        print("REGISTRATION SUMMARY")
+        print("="*80)
+        print(f"Total APIs: {len(apis)}")
+        print(f"Successful: {successful}")
+        print(f"Failed: {failed}")
+        print("="*80)
+    
+    def get_registry_stats(self):
+        """Get registry statistics"""
+        try:
+            with self.conn.cursor(cursor_factory=RealDictCursor) as cursor:
+                # Get total APIs
+                cursor.execute("SELECT COUNT(*) as total FROM api_registry WHERE is_active = TRUE")
+                total_apis = cursor.fetchone()['total']
+                
+                # Get APIs by user
+                cursor.execute("""
+                    SELECT user_id, COUNT(*) as count 
+                    FROM api_registry 
+                    WHERE is_active = TRUE 
+                    GROUP BY user_id 
+                    ORDER BY count DESC
+                """)
+                apis_by_user = cursor.fetchall()
+                
+                # Get pending reviews
+                cursor.execute("SELECT COUNT(*) as pending FROM api_review WHERE status = 'PENDING'")
+                pending_reviews = cursor.fetchone()['pending']
+                
+                print(f"\\n" + "="*50)
+                print("API REGISTRY STATISTICS")
+                print("="*50)
+                print(f"Total Active APIs: {total_apis}")
+                print(f"Pending Reviews: {pending_reviews}")
+                print(f"\\nAPIs by User:")
+                for user_stat in apis_by_user:
+                    print(f"  {user_stat['user_id']}: {user_stat['count']} APIs")
+                print("="*50)
+                
+        except Exception as e:
+            logger.error(f"Error getting registry stats: {e}")
+
+    # Missing methods from original - adding them for complete compatibility
+    
+    def load_database_schema(self, schema_file: str = "JSON/database_schema.json") -> Dict[str, Any]:
+        """Load database schema from JSON file"""
+        try:
+            with open(schema_file, 'r', encoding='utf-8') as f:
+                schema = json.load(f)
+            logger.info(f"Loaded database schema from {schema_file}")
+            return schema
+        except FileNotFoundError:
+            logger.warning(f"Database schema file not found: {schema_file}")
+            return {"tables": []}
+        except json.JSONDecodeError as e:
+            logger.error(f"Invalid JSON in schema file: {e}")
+            return {"tables": []}
+    
+    def get_nsi_database_schema(self) -> Dict[str, Any]:
+        """Get current NSI database schema from PostgreSQL"""
+        try:
+            with self.nsi_conn.cursor(cursor_factory=RealDictCursor) as cursor:
+                # Get all tables and their columns with detailed type information
+                cursor.execute("""
+                    SELECT 
+                        t.table_name,
+                        c.column_name,
+                        c.data_type,
+                        c.is_nullable,
+                        c.column_default,
+                        c.character_maximum_length,
+                        c.numeric_precision,
+                        c.numeric_scale
+                    FROM information_schema.tables t
+                    LEFT JOIN information_schema.columns c ON t.table_name = c.table_name
+                    WHERE t.table_schema = 'public' 
+                    AND t.table_type = 'BASE TABLE'
+                    ORDER BY t.table_name, c.ordinal_position
+                """)
+                
+                rows = cursor.fetchall()
+                tables = {}
+                
+                for row in rows:
+                    table_name = row['table_name']
+                    if table_name not in tables:
+                        tables[table_name] = {
+                            'name': table_name,
+                            'columns': []
+                        }
+                    
+                    if row['column_name']:  # Only add if column exists
+                        column_info = {
+                            'name': row['column_name'],
+                            'type': row['data_type'],
+                            'nullable': row['is_nullable'] == 'YES',
+                            'default': row['column_default']
+                        }
+                        
+                        # Add length info for character types
+                        if row['character_maximum_length']:
+                            column_info['max_length'] = row['character_maximum_length']
+                        
+                        # Add precision info for numeric types
+                        if row['numeric_precision']:
+                            column_info['precision'] = row['numeric_precision']
+                        if row['numeric_scale']:
+                            column_info['scale'] = row['numeric_scale']
+                        
+                        tables[table_name]['columns'].append(column_info)
+                
+                return {'tables': list(tables.values())}
+                
+        except Exception as e:
+            logger.error(f"Error getting NSI database schema: {e}")
+            return {'tables': []}
+    
+    def normalize_data_type(self, data_type: str) -> str:
+        """Normalize data types for comparison between JSON schema and PostgreSQL"""
+        if not data_type:
+            return ""
+        
+        # Convert to uppercase for comparison
+        data_type = data_type.upper().strip()
+        
+        # Normalize common PostgreSQL type variations
+        type_mappings = {
+            # Integer types
+            'CHARACTER VARYING': 'TEXT',
+            'BIGINT': 'INTEGER',
+            'INT8': 'INTEGER',
+            'INT4': 'INTEGER',
+            'INT2': 'INTEGER',
+            'SMALLINT': 'INTEGER',
+            'SERIAL': 'INTEGER',
+            'BIGSERIAL': 'INTEGER',
+            
+            # Timestamp types
+            'TIMESTAMP WITHOUT TIME ZONE': 'TIMESTAMP',
+            'TIMESTAMP WITH TIME ZONE': 'TIMESTAMP',
+            'TIMESTAMPTZ': 'TIMESTAMP',
+            
+            # Numeric types
+            'DECIMAL': 'NUMERIC',
+            'FLOAT': 'NUMERIC',
+            'FLOAT8': 'NUMERIC',
+            'FLOAT4': 'NUMERIC',
+            'DOUBLE PRECISION': 'NUMERIC',
+            'REAL': 'NUMERIC',
+            'MONEY': 'NUMERIC',
+            
+            # Text types
+            'JSONB': 'TEXT',
+            'JSON': 'TEXT',
+            'VARCHAR': 'TEXT',
+            'CHAR': 'TEXT',
+            'CHARACTER': 'TEXT',
+            'UUID': 'TEXT',
+            
+            # Boolean types
+            'BOOL': 'BOOLEAN'
+        }
+        
+        # Handle VARCHAR with length specifications
+        if data_type.startswith('VARCHAR(') or data_type.startswith('CHARACTER VARYING('):
+            return 'TEXT'
+        
+        # Handle other types with specifications
+        for pg_type, normalized_type in type_mappings.items():
+            if data_type.startswith(pg_type):
+                return normalized_type
+        
+        # Additional normalization for text-based types
+        result = type_mappings.get(data_type, data_type)
+        if result in ['VARCHAR', 'CHAR', 'CHARACTER', 'CHARACTER VARYING']:
+            result = 'TEXT'
+            
+        return result
+    
+    def compare_schemas(self, json_schema: Dict[str, Any], db_schema: Dict[str, Any]) -> bool:
+        """Compare JSON schema with database schema to detect changes"""
+        # If no json_schema provided, load from JSON/database_schema.json
+        if not json_schema or not json_schema.get('tables'):
+            try:
+                json_schema = self.load_database_schema()
+            except Exception as e:
+                logger.error(f"Could not load JSON schema: {e}")
+                return False
+        
+        json_tables = {table['name']: table for table in json_schema.get('tables', [])}
+        db_tables = {table['name']: table for table in db_schema.get('tables', [])}
+        
+        changes_detected = False
+        
+        logger.info(f"Comparing schemas - JSON tables: {len(json_tables)}, DB tables: {len(db_tables)}")
+        
+        # Check for new tables in JSON
+        for table_name in json_tables:
+            if table_name not in db_tables:
+                logger.info(f"✓ New table detected in JSON: {table_name}")
+                changes_detected = True
+        
+        # Check for removed tables (in DB but not JSON)
+        for table_name in db_tables:
+            if table_name not in json_tables:
+                logger.info(f"✓ Table removed from JSON: {table_name}")
+                changes_detected = True
+        
+        # Check for column differences in existing tables
+        for table_name in json_tables.keys() & db_tables.keys():
+            json_table = json_tables[table_name]
+            db_table = db_tables[table_name]
+            
+            json_columns = {col['name']: col for col in json_table.get('columns', [])}
+            db_columns = {col['name']: col for col in db_table.get('columns', [])}
+            
+            # Check for new columns in JSON
+            for col_name in json_columns:
+                if col_name not in db_columns:
+                    logger.info(f"✓ New column detected in {table_name}: {col_name}")
+                    changes_detected = True
+            
+            # Check for removed columns (in DB but not JSON)
+            for col_name in db_columns:
+                if col_name not in json_columns:
+                    logger.info(f"✓ Column removed from {table_name}: {col_name}")
+                    changes_detected = True
+            
+            # Check for type changes in existing columns
+            for col_name in json_columns.keys() & db_columns.keys():
+                json_col = json_columns[col_name]
+                db_col = db_columns[col_name]
+                
+                json_type = self.normalize_data_type(json_col.get('type', ''))
+                db_type = self.normalize_data_type(db_col.get('type', ''))
+                
+                if json_type != db_type:
+                    logger.info(f"✓ Column type change in {table_name}.{col_name}: {db_type} -> {json_type}")
+                    changes_detected = True
+        
+        if not changes_detected:
+            logger.info("✓ Schema comparison complete - no differences found")
+        
+        return changes_detected
+    
+    def increment_version(self, current_version: str) -> str:
+        """Increment version number (e.g., v1 -> v2)"""
+        if current_version.startswith('v'):
+            try:
+                version_num = int(current_version[1:]) + 1
+                return f"v{version_num}"
+            except ValueError:
+                return "v2"
+        return "v2"
+    
+    def get_schema_changes_by_entity(self, config_file: str) -> List[str]:
+        """Get list of entities that have schema changes"""
+        try:
+            # Load the JSON database schema file (not application config)
+            schema_file = "JSON/database_schema.json"
+            logger.info(f"Comparing against schema file: {schema_file}")
+            
+            json_schema = self.load_database_schema(schema_file)
+            db_schema = self.get_nsi_database_schema()
+            
+            json_tables = {table['name']: table for table in json_schema.get('tables', [])}
+            db_tables = {table['name']: table for table in db_schema.get('tables', [])}
+            
+            logger.info(f"JSON schema has {len(json_tables)} tables: {list(json_tables.keys())}")
+            logger.info(f"DB schema has {len(db_tables)} tables: {list(db_tables.keys())}")
+            
+            affected_entities = set()
+            
+            # Check for new tables in JSON that don't exist in DB
+            for table_name in json_tables:
+                if table_name not in db_tables:
+                    affected_entities.add(table_name)
+                    logger.info(f"New table (affects entity): {table_name}")
+            
+            # Check for tables that exist in DB but not in JSON (removed tables)
+            for table_name in db_tables:
+                if table_name not in json_tables:
+                    affected_entities.add(table_name)
+                    logger.info(f"Removed table (affects entity): {table_name}")
+            
+            # Check tables that exist in both JSON and DB for column differences
+            for table_name in json_tables.keys() & db_tables.keys():
+                json_table = json_tables[table_name]
+                db_table = db_tables[table_name]
+                
+                json_columns = {col['name']: col for col in json_table.get('columns', [])}
+                db_columns = {col['name']: col for col in db_table.get('columns', [])}
+                
+                # Check for new columns in JSON
+                for col_name in json_columns:
+                    if col_name not in db_columns:
+                        affected_entities.add(table_name)
+                        logger.info(f"New column in {table_name}.{col_name} (affects entity)")
+                
+                # Check for removed columns (in DB but not JSON)
+                for col_name in db_columns:
+                    if col_name not in json_columns:
+                        affected_entities.add(table_name)
+                        logger.info(f"Removed column {table_name}.{col_name} (affects entity)")
+                
+                # Check for type changes in existing columns
+                for col_name in json_columns.keys() & db_columns.keys():
+                    json_col = json_columns[col_name]
+                    db_col = db_columns[col_name]
+                    
+                    json_type = self.normalize_data_type(json_col.get('type', ''))
+                    db_type = self.normalize_data_type(db_col.get('type', ''))
+                    
+                    if json_type != db_type:
+                        affected_entities.add(table_name)
+                        logger.info(f"Type change in {table_name}.{col_name}: {db_type} -> {json_type} (affects entity)")
+            
+            if not affected_entities:
+                logger.info("✓ No schema changes detected - no entities affected")
+            
+            return list(affected_entities)
+        
+        except Exception as e:
+            logger.error(f"Error getting schema changes by entity: {e}")
+            return []
+    
+    def check_and_update_version(self, config_file: str) -> Dict[str, str]:
+        """Check for schema changes and update version if needed"""
+        # Check for schema changes and get affected entities
+        affected_entities = self.get_schema_changes_by_entity(config_file)
+        if affected_entities:
+            logger.info(f"Database schema changes detected for entities: {', '.join(affected_entities)}")
+            # Create version mapping for affected entities
+            new_versions = {}
+            for entity in affected_entities:
+                new_versions[entity] = "v2"  # Simplified version increment
+            return new_versions
+        else:
+            logger.info("✓ No version increment needed - database schema is current")
+            return {}
+
+
+def main():
+    """Main function"""
+    parser = argparse.ArgumentParser(
+        description="API Registry Management System - Web Mode",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python step_3b_api_registry_manager_web.py
+  python step_3b_api_registry_manager_web.py --config config_output/application_config.json
+  python step_3b_api_registry_manager_web.py --web-mode --session-id web_session_123
+        """
+    )
+    
+    parser.add_argument(
+        '--config',
+        default='config_output/application_config.json',
+        help='Path to application configuration JSON file'
+    )
+    
+    parser.add_argument(
+        '--stats-only',
+        action='store_true',
+        help='Only show registry statistics without processing APIs'
+    )
+    
+    parser.add_argument(
+        '--review-only',
+        action='store_true',
+        help='Only show review management interface'
+    )
+    
+    parser.add_argument(
+        '--web-mode',
+        action='store_true',
+        help='Enable web mode for interactive prompts'
+    )
+    
+    parser.add_argument(
+        '--session-id',
+        type=str,
+        help='Session ID for web mode'
+    )
+    
+    args = parser.parse_args()
+    
+    # Create registry manager
+    registry_manager = APIRegistryManagerWeb()
+    
+    # Enable web mode if requested
+    if args.web_mode:
+        registry_manager.enable_web_mode(args.session_id)
+    
+    try:
+        if args.stats_only:
+            registry_manager.get_registry_stats()
+        elif args.review_only:
+            registry_manager.show_review_menu()
+        else:
+            # Process APIs
+            registry_manager.process_all_apis(args.config)
+            
+            # Show stats after processing
+            registry_manager.get_registry_stats()
+            
+    finally:
+        registry_manager.close_connection()
+
+
+if __name__ == '__main__':
+    main()"
