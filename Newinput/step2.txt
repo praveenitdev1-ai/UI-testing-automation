@@ -1,0 +1,1650 @@
+"#!/usr/bin/env python3
+"""
+Application Configuration Generator - ENHANCED VERSION
+=====================================================
+Generates comprehensive application configuration from SDLC analysis outputs.
+
+REQUIRED INPUT FILES (Fixed Names):
+1. user_story_analysis_llm.json    - User stories with acceptance criteria
+2. ui_component_analysis_llm.json  - UI component analysis with screens/elements  
+3. database_schema.json            - Database schema with tables/relationships
+
+GENERATED OUTPUT:
+- application_config.yaml - YAML configuration file
+- application_config.json - JSON configuration file
+
+USAGE:
+    python application_config_generator.py [input_dir] [output_dir]
+    
+    input_dir:  Directory containing the 3 JSON files (default: ./JSON)
+    output_dir: Directory for generated config files (default: ./output)
+
+EXAMPLES:
+    # Use default directories (JSON/ and output/)
+    python application_config_generator.py
+    
+    # Specify custom directories
+    python application_config_generator.py ./data ./configs
+
+ENHANCEMENTS:
+1. Extracts enums from user story dropdown options
+2. Extracts enums from UI component dropdowns  
+3. Infers business rules from acceptance criteria "then" clauses
+4. Infers enums from VARCHAR field patterns (status, type, etc.)
+5. Extracts validation rules from field definitions
+
+Author: NSI SDLC Team (Enhanced)
+Version: 2.2
+"""
+
+import json
+import yaml
+import re
+import sys
+from typing import Dict, List, Any, Set, Optional
+from pathlib import Path
+import logging
+from datetime import datetime
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+class ConfigGenerator:
+    """Enhanced Config Generator with comprehensive data extraction"""
+    
+    # Pattern for identifying enum-like fields
+    ENUM_FIELD_PATTERNS = [
+        r'.*_type$',
+        r'.*_status$', 
+        r'^status$',
+        r'.*_stage$',
+        r'^stage$',
+        r'^disposition$',
+        r'.*_priority$',
+        r'^priority$',
+        r'.*_category$',
+        r'.*_action$',
+        r'^request_type$'
+    ]
+    
+    def __init__(self, config: Dict[str, Any] = None, templates_dir: Path = None):
+        self.config = config or {}
+        self.templates_dir = Path(templates_dir) if templates_dir else Path('./templates')
+        self.project_config = self._load_project_config()
+    
+    def load_input_files(self, user_story_file: Path = None, ui_component_file: Path = None, 
+                         database_schema_file: Path = None, input_dir: Path = None) -> Dict[str, Any]:
+        """Load the three required input files: user stories, UI components, and database schema."""
+        # If individual files are provided, use them; otherwise fall back to directory-based approach
+        if user_story_file and ui_component_file and database_schema_file:
+            pass  # Use provided file paths
+        elif input_dir:
+            # Fall back to directory-based approach for backward compatibility
+            user_story_file = input_dir / "user_story_analysis_llm.json"
+            ui_component_file = input_dir / "ui_component_analysis_llm.json"
+            database_schema_file = input_dir / "database_schema.json"
+        else:
+            # Default fallback
+            default_dir = Path("./JSON")
+            user_story_file = default_dir / "user_story_analysis_llm.json"
+            ui_component_file = default_dir / "ui_component_analysis_llm.json"
+            database_schema_file = default_dir / "database_schema.json"
+        
+        logger.info("[LOAD] Loading input files...")
+        logger.info(f"  - User Stories: {user_story_file}")
+        logger.info(f"  - UI Components: {ui_component_file}")
+        logger.info(f"  - Database Schema: {database_schema_file}")
+        
+        # Load and validate each file
+        try:
+            with open(user_story_file, 'r', encoding='utf-8') as f:
+                user_story_data = json.load(f)
+            
+            with open(ui_component_file, 'r', encoding='utf-8') as f:
+                ui_component_data = json.load(f)
+                
+            with open(database_schema_file, 'r', encoding='utf-8') as f:
+                database_data = json.load(f)
+                
+        except FileNotFoundError as e:
+            logger.error(f"Required input file not found: {e}")
+            raise
+        except json.JSONDecodeError as e:
+            logger.error(f"Invalid JSON in input file: {e}")
+            raise
+            
+        logger.info(f"  [LOADED] Files loaded successfully:")
+        logger.info(f"     - User Stories: {len(user_story_data.get('user_stories', []))} stories")
+        logger.info(f"     - UI Screens: {len(ui_component_data.get('screens', []))} screens")
+        logger.info(f"     - Database Tables: {len(database_data.get('tables', []))} tables")
+        
+        return {
+            'user_stories': user_story_data.get('user_stories', []),
+            'ui_components': ui_component_data.get('screens', []),
+            'database': database_data,
+            'project_name': ui_component_data.get('component_name', 'NSI Management System')
+        }
+
+    def generate_config(self, fixed_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Generate comprehensive application configuration."""
+        logger.info("[TOOL] Step 04: Generating Application Config (ENHANCED)...")
+        
+        # Extract data sections
+        user_stories = fixed_data.get('user_stories', [])
+        database = fixed_data.get('database', {})
+        ui_components = fixed_data.get('ui_components', [])
+        
+        logger.info(f"  [DATA] Input Stats:")
+        logger.info(f"     - User Stories: {len(user_stories)}")
+        logger.info(f"     - Database Tables: {len(database.get('tables', []))}")
+        logger.info(f"     - UI Components: {len(ui_components)}")
+        
+        # === PRESERVE: Existing functionality ===
+        database_schema = self._prepare_database_schema(database)
+        entities = self._generate_entities(database)
+        apis = self._generate_crud_apis(database)
+        type_mappings = self._generate_type_mappings()
+        relationships = self._extract_relationships(database)
+        ui_mappings = self._generate_ui_mappings(ui_components, database)
+        
+        # === ENHANCED: New extraction methods ===
+        enums = self._extract_enums_enhanced(database, user_stories, ui_components)
+        business_rules = self._extract_business_rules_enhanced(user_stories, database)
+        acceptance_criteria = self._extract_acceptance_criteria(user_stories)
+        field_validations = self._extract_field_validations(user_stories)
+        
+        # === NEW: Extract screen layouts and RAG enhancements ===
+        screen_layouts = self._extract_screen_layouts(user_stories)
+        validation_rules = self._extract_validation_rules(user_stories)
+        error_messages = self._extract_error_messages(user_stories)
+        rag_enhancements = self._extract_rag_enhancements(fixed_data)
+        
+        # === NEW: Extract workflow and API details ===
+        workflow_definitions = self._extract_workflow_definitions(user_stories)
+        api_specifications = self._extract_api_specifications(user_stories)
+        audit_configurations = self._extract_audit_configurations(user_stories)
+        
+        # Build complete config
+        config = {
+            'metadata': self._generate_metadata(fixed_data),
+
+            'database_schema': database_schema,
+            'entities': entities,
+            'enums': enums,
+            'apis': apis,
+            'type_mappings': type_mappings,
+            'business_rules': business_rules,
+            'acceptance_criteria': acceptance_criteria,
+            'field_validations': field_validations,
+            'relationships': relationships,
+            'ui_mappings': ui_mappings,
+            
+            # NEW: Screen and RAG enhancements
+            'screen_layouts': screen_layouts,
+            'validation_rules': validation_rules,
+            'error_messages': error_messages,
+            'rag_enhancements': rag_enhancements,
+            
+            # NEW: Workflow, API, and Audit configurations
+            'workflow_definitions': workflow_definitions,
+            'api_specifications': api_specifications,
+            'audit_configurations': audit_configurations,
+            
+            # Statistics
+            'statistics': {
+                'total_entities': len(entities),
+                'total_tables': len(database_schema.get('tables', [])),
+                'total_apis': len(apis),
+                'total_enums': len(enums),
+                'total_business_rules': len(business_rules),
+                'total_field_validations': len(field_validations),
+                'total_screen_layouts': len(screen_layouts),
+                'total_validation_rules': len(validation_rules),
+                'total_error_messages': len(error_messages),
+                'total_workflow_definitions': len(workflow_definitions),
+                'total_api_specifications': len(api_specifications),
+                'total_audit_configurations': len(audit_configurations),
+                'rag_enabled': len(rag_enhancements) > 0,
+                'generated_at': datetime.utcnow().isoformat()
+            }
+        }
+        
+        logger.info(f"Generated Config:")
+        logger.info(f"Database Tables: {len(database_schema.get('tables', []))}")
+        logger.info(f"Entities: {len(entities)}")
+        logger.info(f"APIs: {len(apis)}")
+        logger.info(f"Enums: {len(enums)} (ENHANCED)")
+        logger.info(f"Business Rules: {len(business_rules)} (ENHANCED)")
+        logger.info(f"Field Validations: {len(field_validations)} (NEW)")
+        
+        return config
+    
+    # ========================================================================
+    # PRESERVED METHODS - No changes to maintain compatibility
+    # ========================================================================
+    
+    def _prepare_database_schema(self, database: Dict[str, Any]) -> Dict[str, Any]:
+        """Prepare database schema in format expected by Step 05"""
+        return {
+            'tables': database.get('tables', []),
+            'relationships': database.get('relationships', []),
+            'constraints': database.get('constraints', []),
+            'indexes': []
+        }
+    
+    def _generate_entities(self, database: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Generate entities with complete field information"""
+        entities = []
+        tables = database.get('tables', [])
+        
+        for table in tables:
+            # Find primary key
+            primary_key = None
+            primary_key_type = 'str'
+            
+            for column in table.get('columns', []):
+                if column.get('primary_key'):
+                    primary_key = column.get('name', 'id')
+                    primary_key_type = self._map_sql_to_python_type(column.get('data_type', 'VARCHAR'))
+                    break
+            
+            if not primary_key:
+                primary_key = 'id'
+                primary_key_type = 'int'
+            
+            entity = {
+                'name': self._to_class_name(table.get('name', '')),
+                'table_name': table.get('name', ''),
+                'description': table.get('description', f"Entity for {table.get('name', '')}"),
+                'primary_key': primary_key,
+                'primary_key_type': primary_key_type,
+                'fields': []
+            }
+            
+            # Convert columns to fields with type mappings
+            for column in table.get('columns', []):
+                field = {
+                    'name': column.get('name', ''),
+                    'type': column.get('data_type', 'VARCHAR'),
+                    'python_type': self._map_sql_to_python_type(column.get('data_type', 'VARCHAR')),
+                    'typescript_type': self._map_sql_to_typescript_type(column.get('data_type', 'VARCHAR')),
+                    'nullable': column.get('nullable', True),
+                    'primary_key': column.get('primary_key', False),
+                    'auto_increment': column.get('auto_increment', False),
+                    'unique': column.get('unique', False),
+                    'default': column.get('default'),
+                    'length': column.get('length'),
+                }
+                
+                # Add enum reference if exists
+                if column.get('check_constraint'):
+                    field['enum'] = self._extract_enum_name_from_constraint(
+                        column.get('check_constraint'), column.get('name')
+                    )
+                
+                entity['fields'].append(field)
+            
+            entities.append(entity)
+        
+        return entities
+    
+    def _generate_crud_apis(self, database: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Generate complete CRUD APIs for all entities with versioning"""
+        apis = []
+        tables = database.get('tables', [])
+        
+        # Get version and user from project config
+        version = self.project_config.get('version', 'v1')
+        user = self.project_config.get('user', 'system')
+        
+        for table in tables:
+            table_name = table.get('name', '')
+            entity_name = self._to_class_name(table_name)
+            
+            # Find primary key
+            pk_column = 'id'
+            for column in table.get('columns', []):
+                if column.get('primary_key'):
+                    pk_column = column.get('name', 'id')
+                    break
+            
+            # Generate 5 CRUD operations with versioning
+            base_path = f"/api/{version}/{table_name}"
+            
+            # GET ALL
+            apis.append({
+                'id': f"{table_name}_list",
+                'endpoint': base_path,
+                'method': 'GET',
+                'description': f"Get all {entity_name} records",
+                'entity': entity_name,
+                'operation': 'list',
+                'response_type': f"List[{entity_name}]",
+                'version': version,
+                'user': user
+            })
+            
+            # GET ONE
+            apis.append({
+                'id': f"{table_name}_get",
+                'endpoint': f"{base_path}/{{{pk_column}}}",
+                'method': 'GET',
+                'description': f"Get single {entity_name} by {pk_column}",
+                'entity': entity_name,
+                'operation': 'get',
+                'path_params': [pk_column],
+                'response_type': entity_name,
+                'version': version,
+                'user': user
+            })
+            
+            # CREATE
+            apis.append({
+                'id': f"{table_name}_create",
+                'endpoint': base_path,
+                'method': 'POST',
+                'description': f"Create new {entity_name}",
+                'entity': entity_name,
+                'operation': 'create',
+                'request_body': f"{entity_name}Create",
+                'response_type': entity_name,
+                'version': version,
+                'user': user
+            })
+            
+            # UPDATE
+            apis.append({
+                'id': f"{table_name}_update",
+                'endpoint': f"{base_path}/{{{pk_column}}}",
+                'method': 'PUT',
+                'description': f"Update {entity_name}",
+                'entity': entity_name,
+                'operation': 'update',
+                'path_params': [pk_column],
+                'request_body': f"{entity_name}Update",
+                'response_type': entity_name,
+                'version': version,
+                'user': user
+            })
+            
+            # DELETE
+            apis.append({
+                'id': f"{table_name}_delete",
+                'endpoint': f"{base_path}/{{{pk_column}}}",
+                'method': 'DELETE',
+                'description': f"Delete {entity_name}",
+                'entity': entity_name,
+                'operation': 'delete',
+                'path_params': [pk_column],
+                'response_type': 'bool',
+                'version': version,
+                'user': user
+            })
+        
+        return apis
+    
+    def _generate_type_mappings(self) -> Dict[str, Any]:
+        """Generate type conversion mappings"""
+        return {
+            'sql_to_python': {
+                'VARCHAR': 'str',
+                'TEXT': 'str',
+                'INTEGER': 'int',
+                'BIGINT': 'int',
+                'SERIAL': 'int',
+                'BOOLEAN': 'bool',
+                'TIMESTAMP': 'datetime',
+                'DATE': 'date',
+                'FLOAT': 'float',
+                'DECIMAL': 'Decimal',
+                'UUID': 'UUID',
+            },
+            'sql_to_typescript': {
+                'VARCHAR': 'string',
+                'TEXT': 'string',
+                'INTEGER': 'number',
+                'BIGINT': 'number',
+                'SERIAL': 'number',
+                'BOOLEAN': 'boolean',
+                'TIMESTAMP': 'Date',
+                'DATE': 'Date',
+                'FLOAT': 'number',
+                'DECIMAL': 'number',
+                'UUID': 'string',
+            }
+        }
+    
+    def _map_sql_to_python_type(self, sql_type: str) -> str:
+        """Map SQL type to Python type"""
+        type_map = {
+            'VARCHAR': 'str',
+            'TEXT': 'str',
+            'INTEGER': 'int',
+            'BIGINT': 'int',
+            'SERIAL': 'int',
+            'BOOLEAN': 'bool',
+            'TIMESTAMP': 'datetime',
+            'DATE': 'date',
+            'FLOAT': 'float',
+            'DECIMAL': 'Decimal',
+            'UUID': 'UUID',
+        }
+        return type_map.get(sql_type.upper(), 'str')
+    
+    def _map_sql_to_typescript_type(self, sql_type: str) -> str:
+        """Map SQL type to TypeScript type"""
+        type_map = {
+            'VARCHAR': 'string',
+            'TEXT': 'string',
+            'INTEGER': 'number',
+            'BIGINT': 'number',
+            'SERIAL': 'number',
+            'BOOLEAN': 'boolean',
+            'TIMESTAMP': 'Date',
+            'DATE': 'Date',
+            'FLOAT': 'number',
+            'DECIMAL': 'number',
+            'UUID': 'string',
+        }
+        return type_map.get(sql_type.upper(), 'string')
+    
+    def _extract_enum_name_from_constraint(self, constraint: str, column_name: str) -> str:
+        """Extract enum name from constraint"""
+        return f"{column_name}_type"
+    
+    def _generate_metadata(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Generate metadata section from project_configuration.json"""
+        import json
+        from pathlib import Path
+        config_path = Path('project_configuration.json')
+        if config_path.exists():
+            with open(config_path) as f:
+                config = json.load(f)
+        else:
+            config = {}
+        return {
+            'project_name': config.get('project_name', 'NSI Management System'),
+            'app_name': config.get('app_name', 'NSI Management System'),
+            'version': config.get('version', '1.0.0'),
+            'description': config.get('description', 'Auto-generated configuration from SDLC pipeline'),
+            'backend_framework': config.get('backend_framework', 'fastapi'),
+            'frontend_framework': config.get('frontend_framework', 'react'),
+            'database': {
+                'type': config.get('database', {}).get('type', 'postgresql'),
+                'name': config.get('database', {}).get('name', 'nsi_app.db')
+            },
+            'generated_at': datetime.utcnow().isoformat()
+        }
+    
+    def _extract_acceptance_criteria(self, user_stories: List[Dict]) -> List[Dict[str, Any]]:
+        """Extract acceptance criteria from user stories"""
+        criteria = []
+        for story in user_stories:
+            # Handle the nested structure: story['user_story']['acceptance_criteria']
+            user_story_data = story.get('user_story', {})
+            story_criteria = user_story_data.get('acceptance_criteria', [])
+            story_id = user_story_data.get('id', '')
+            story_title = user_story_data.get('title', '')
+            
+            for ac in story_criteria:
+                criteria.append({
+                    'id': ac.get('id', ''),
+                    'title': ac.get('title', ''),
+                    'given': ac.get('given', ''),
+                    'when': ac.get('when', ''),
+                    'then': ac.get('then', []),
+                    'additional_details': ac.get('additional_details', ''),
+                    'source_story_id': story_id,
+                    'source_story_title': story_title,
+                    'module': story.get('module', '')
+                })
+        return criteria
+    
+    def _extract_relationships(self, database: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Extract entity relationships from database schema"""
+        relationships = []
+        tables = database.get('tables', [])
+        
+        for table in tables:
+            table_name = table.get('name', '')
+            foreign_keys = table.get('foreign_keys', [])
+            
+            for fk in foreign_keys:
+                relationships.append({
+                    'from_entity': self._to_class_name(table_name),
+                    'from_columns': fk.get('columns', []),
+                    'to_entity': self._to_class_name(fk.get('reference_table', '')),
+                    'to_columns': fk.get('reference_columns', []),
+                    'type': 'foreign_key',
+                    'on_delete': fk.get('on_delete', 'CASCADE'),
+                    'on_update': fk.get('on_update', 'CASCADE')
+                })
+        
+        return relationships
+    
+    def _generate_ui_mappings(self, ui_components: List[Dict], 
+                              database: Dict[str, Any]) -> Dict[str, Any]:
+        """Generate UI to entity mappings from screen data"""
+        mappings = {}
+        
+        for screen in ui_components:
+            screen_name = screen.get('name', '')
+            component_name = screen.get('component_name', '')
+            screen_id = screen_name or component_name
+            
+            if screen_id:
+                # Extract entity mappings from screen elements
+                elements = screen.get('elements', [])
+                entities_used = set()
+                actions = []
+                
+                # Analyze elements to find data bindings and entity references
+                for element in elements:
+                    business_context = element.get('business_context', {})
+                    element_type = element.get('element_type', '')
+                    
+                    # Extract entity references from business context
+                    if business_context:
+                        description = business_context.get('description', '')
+                        # Look for entity references in descriptions
+                        for table in database.get('tables', []):
+                            table_name = table.get('name', '')
+                            if table_name.lower() in description.lower():
+                                entities_used.add(table_name)
+                    
+                    # Add common actions based on element types
+                    if element_type in ['button', 'input']:
+                        validations = element.get('validations', [])
+                        if validations:
+                            actions.extend(['validate', 'submit'])
+                        elif element_type == 'button':
+                            actions.extend(['click', 'navigate'])
+                
+                if entities_used or actions:
+                    mappings[screen_id] = {
+                        'type': 'screen',
+                        'description': screen.get('description', ''),
+                        'entities': list(entities_used),
+                        'actions': list(set(actions)),  # Remove duplicates
+                        'element_count': len(elements)
+                    }
+        
+        logger.info(f"  [UI_MAPPINGS] Generated {len(mappings)} UI mappings")
+        return mappings
+    
+    def _to_class_name(self, name: str) -> str:
+    #    """Convert snake_case to PascalCase"""
+    #    return ''.join(word.capitalize() for word in name.split('_'))
+         """Return the name as-is, no conversion"""
+         return name
+    
+    def _load_project_config(self) -> Dict[str, Any]:
+        """Load project configuration from project_configuration.json"""
+        try:
+            config_path = Path('project_configuration.json')
+            if config_path.exists():
+                with open(config_path, 'r') as f:
+                    return json.load(f)
+            else:
+                return {"version": "v1", "user": "system"}
+        except Exception as e:
+            logger.warning(f"Could not load project configuration: {e}")
+            return {"version": "v1", "user": "system"}
+    
+    # ========================================================================
+    # ENHANCED METHODS - New functionality for better extraction
+    # ========================================================================
+    
+    def _extract_enums_enhanced(self, database: Dict[str, Any], 
+                                user_stories: List[Dict[str, Any]],
+                                ui_components: List[Dict[str, Any]]) -> Dict[str, List[str]]:
+        """
+        ENHANCED: Extract enums from multiple sources with smart merging
+        1. Database check constraints (original)
+        2. User story dropdown options (NEW)
+        3. UI component dropdown options (NEW)
+        4. Inferred from VARCHAR field patterns (NEW) - only if no values found
+        """
+        enums = {}
+        
+        # PHASE 1: Collect enums WITH values from all sources
+        db_enums = self._extract_enums_from_database(database)
+        us_enums = self._extract_enums_from_user_stories(user_stories)
+        ui_enums = self._extract_enums_from_ui_components(ui_components)
+        
+        logger.info(f"  [ENUM] Collected from sources - DB:{len(db_enums)}, US:{len(us_enums)}, UI:{len(ui_enums)}")
+        
+        # PHASE 2: Merge (prioritize sources with actual values)
+        enums.update(db_enums)
+        enums.update(us_enums)
+        enums.update(ui_enums)
+        
+        # PHASE 3: Try to rename generic names from Step 1
+        enums = self._rename_generic_enum_names(enums)
+        
+        # PHASE 4: Infer from schema patterns - but DON'T overwrite existing
+        inferred = self._infer_enums_from_schema(database)
+        for enum_name, values in inferred.items():
+            # Only add if not already present (including variant names)
+            if enum_name not in enums:
+                base_name = enum_name.replace('_enum', '')
+                # Check if we have this field under a different name
+                if base_name not in enums:
+                    # No existing enum found - skip adding empty placeholder
+                    # enums[enum_name] = values  # DON'T ADD EMPTY PLACEHOLDERS
+                    pass
+        
+        # PHASE 5: CRITICAL - Remove empty enums (0 values)
+        enums = {k: v for k, v in enums.items() if v}
+        
+        logger.info(f"  [ENUM] Extracted {len(enums)} enums from all sources (non-empty only)")
+        for enum_name, values in enums.items():
+            logger.info(f"     - {enum_name}: {len(values)} values")
+        
+        return enums
+    
+    def _rename_generic_enum_names(self, enums: Dict[str, List[str]]) -> Dict[str, List[str]]:
+        """
+        Rename generic names like 'select_field_1' to meaningful names
+        based on the values they contain
+        """
+        renamed = {}
+        
+        for enum_name, values in enums.items():
+            # Check if this is a generic name
+            if enum_name.startswith('select_field_'):
+                # Try to infer real name from values
+                inferred_name = self._infer_enum_name_from_values(values)
+                if inferred_name:
+                    logger.info(f"  [ENUM] Renamed '{enum_name}' -> '{inferred_name}' based on values")
+                    renamed[inferred_name] = values
+                else:
+                    # Keep generic name if can't infer
+                    renamed[enum_name] = values
+            else:
+                renamed[enum_name] = values
+        
+        return renamed
+    
+    def _infer_enum_name_from_values(self, values: List[str]) -> Optional[str]:
+        """
+        Infer enum field name from its values.
+        Example: ['RTV', 'RTD', 'Destroy'] -> 'disposition'
+        """
+        # Known patterns - lowercase for comparison
+        patterns = {
+            'disposition': ['rtv', 'rtd', 'destroy', 'salvage', 'return', 'vendor hold', 'out for repair', 'recall', 'hazmat'],
+            'status': ['pending', 'complete', 'in progress', 'active', 'inactive', 'closed', 'open'],
+            'priority': ['high', 'medium', 'low', 'critical', 'urgent'],
+            'stage': ['intake', 'processing', 'review', 'complete', 'approved', 'rejected'],
+            'auditStatus': ['pass', 'fail', 'pending', 'reviewed'],
+        }
+        
+        if not values:
+            return None
+        
+        values_lower = [v.lower() for v in values]
+        
+        # Check each pattern
+        for field_name, keywords in patterns.items():
+            # Count how many values match known keywords
+            matches = 0
+            for val in values_lower:
+                if any(keyword in val or val in keyword for keyword in keywords):
+                    matches += 1
+            
+            # If 40%+ match, this is likely the field
+            if matches >= len(values) * 0.4:
+                return field_name
+        
+        return None
+    
+    def _extract_enums_from_database(self, database: Dict[str, Any]) -> Dict[str, List[str]]:
+        """Extract enums from database CHECK constraints"""
+        enums = {}
+        tables = database.get('tables', [])
+        
+        for table in tables:
+            for column in table.get('columns', []):
+                constraint = column.get('check_constraint', '')
+                if constraint and 'IN' in constraint.upper():
+                    enum_name = f"{column.get('name')}_type"
+                    values = self._extract_enum_values_from_constraint(constraint)
+                    if values:
+                        enums[enum_name] = values
+        
+        return enums
+    
+    def _extract_enum_values_from_constraint(self, constraint: str) -> List[str]:
+        """Extract enum values from CHECK constraint"""
+        match = re.search(r"IN\s*\((.*?)\)", constraint, re.IGNORECASE)
+        if match:
+            values_str = match.group(1)
+            values = re.findall(r"'([^']*)'", values_str)
+            return values
+        return []
+    
+    def _extract_enums_from_user_stories(self, user_stories: List[Dict[str, Any]]) -> Dict[str, List[str]]:
+        """
+        NEW: Extract enums from user story dropdown fields
+        Example: disposition_type with options: ["Salvage", "Destroy", "Return"]
+        """
+        enums = {}
+        
+        for story in user_stories:
+            # Navigate through screen structure
+            screen = story.get('screen', {})
+            layout = screen.get('layout', {})
+            sections = layout.get('sections', [])
+            
+            for section in sections:
+                fields = section.get('fields', [])
+                for field in fields:
+                    # Check if field is a dropdown with options
+                    if field.get('type') == 'dropdown':
+                        options = field.get('options', [])
+                        if options:
+                            field_id = field.get('id', '')
+                            # Create enum name from field id
+                            enum_name = f"{field_id}_enum" if field_id else None
+                            if enum_name:
+                                enums[enum_name] = options
+                                logger.info(f"  [ENUM] Found in user story: {enum_name} = {options}")
+        
+        return enums
+    
+    def _extract_enums_from_ui_components(self, ui_components: List[Dict[str, Any]]) -> Dict[str, List[str]]:
+        """
+        NEW: Extract enums from UI component definitions
+        Looks for 'enums' key in ui_components
+        """
+        enums = {}
+        
+        for component in ui_components:
+            # Check for explicit enums section
+            component_enums = component.get('enums', {})
+            if component_enums:
+                enums.update(component_enums)
+                logger.info(f"  [ENUM] Found in UI component: {list(component_enums.keys())}")
+            
+            # Also check fields for dropdown options
+            fields = component.get('fields', [])
+            for field in fields:
+                if field.get('type') == 'dropdown':
+                    options = field.get('options', [])
+                    if options:
+                        field_name = field.get('name', field.get('id', ''))
+                        if field_name:
+                            enum_name = f"{field_name}_enum"
+                            enums[enum_name] = options
+        
+        return enums
+    
+    def _infer_enums_from_schema(self, database: Dict[str, Any]) -> Dict[str, List[str]]:
+        """
+        NEW: Infer potential enums from VARCHAR field patterns
+        Fields like 'status', 'disposition', 'priority' are likely enums
+        """
+        inferred_enums = {}
+        tables = database.get('tables', [])
+        
+        for table in tables:
+            for column in table.get('columns', []):
+                column_name = column.get('name', '')
+                data_type = column.get('data_type', '').upper()
+                length = column.get('length', 0)
+                
+                # Check if field matches enum patterns
+                if data_type == 'VARCHAR' and length and length <= 100:
+                    if self._is_likely_enum_field(column_name):
+                        # Create placeholder - will be filled from other sources or remain empty
+                        enum_name = f"{column_name}_enum"
+                        if enum_name not in inferred_enums:
+                            # Mark as inferred but empty - can be populated from UI or user stories
+                            inferred_enums[enum_name] = []
+                            logger.info(f"  [ENUM] Inferred potential enum field: {enum_name}")
+        
+        return inferred_enums
+    
+    def _is_likely_enum_field(self, field_name: str) -> bool:
+        """Check if field name matches enum patterns"""
+        for pattern in self.ENUM_FIELD_PATTERNS:
+            if re.match(pattern, field_name, re.IGNORECASE):
+                return True
+        return False
+    
+    def _extract_business_rules_enhanced(self, user_stories: List[Dict[str, Any]], 
+                                        database: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """
+        ENHANCED: Extract business rules from multiple sources
+        1. Explicit business_rules arrays (original)
+        2. Acceptance criteria "then" clauses (NEW)
+        3. Field validation rules (NEW)
+        4. Database constraints (NEW)
+        """
+        rules = []
+        
+        # Source 1: Explicit business rules (original)
+        rules.extend(self._extract_explicit_business_rules(user_stories))
+        
+        # Source 2: Infer from acceptance criteria
+        rules.extend(self._infer_business_rules_from_ac(user_stories))
+        
+        # Source 3: Extract from field validations
+        rules.extend(self._extract_business_rules_from_validations(user_stories))
+        
+        # Source 4: Extract from database constraints
+        rules.extend(self._extract_business_rules_from_db_constraints(database))
+        
+        logger.info(f"  [RULES] Extracted {len(rules)} business rules from all sources")
+        
+        return rules
+    
+    def _extract_explicit_business_rules(self, user_stories: List[Dict]) -> List[Dict[str, Any]]:
+        """Extract explicit business_rules arrays (original method)"""
+        rules = []
+        for story in user_stories:
+            story_rules = story.get('business_rules', [])
+            for rule in story_rules:
+                rules.append({
+                    'id': rule.get('id', ''),
+                    'description': rule.get('description', ''),
+                    'condition': rule.get('condition', ''),
+                    'action': rule.get('action', ''),
+                    'source': 'explicit',
+                    'source_story': story.get('id', '')
+                })
+        return rules
+    
+    def _infer_business_rules_from_ac(self, user_stories: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        NEW: Infer business rules from acceptance criteria "then" clauses
+        Example: "then": ["Error message displayed", "Field cleared"]
+        """
+        rules = []
+        rule_counter = 1
+        
+        for story in user_stories:
+            acceptance_criteria = story.get('acceptance_criteria', [])
+            
+            for ac in acceptance_criteria:
+                when_condition = ac.get('when', '')
+                then_actions = ac.get('then', [])
+                
+                # Each "then" clause becomes a business rule
+                for action in then_actions:
+                    # Skip generic UI updates, focus on business logic
+                    if self._is_business_logic_action(action):
+                        rule_id = f"BR-{rule_counter:03d}"
+                        rules.append({
+                            'id': rule_id,
+                            'description': action,
+                            'condition': when_condition,
+                            'action': action,
+                            'source': 'inferred_from_ac',
+                            'source_story': story.get('id', ''),
+                            'acceptance_criteria_id': ac.get('id', '')
+                        })
+                        rule_counter += 1
+        
+        return rules
+    
+    def _is_business_logic_action(self, action: str) -> bool:
+        """Determine if an action represents business logic vs pure UI"""
+        business_keywords = [
+            'validate', 'check', 'verify', 'ensure',
+            'calculate', 'update', 'create', 'delete',
+            'send', 'notify', 'log', 'audit',
+            'error', 'warning', 'prevent', 'allow',
+            'required', 'must', 'cannot', 'should'
+        ]
+        
+        action_lower = action.lower()
+        return any(keyword in action_lower for keyword in business_keywords)
+    
+    def _extract_business_rules_from_validations(self, user_stories: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        NEW: Extract business rules from field validation definitions
+        Example: validation.rules: ["must_exist_in_inventory", "not_duplicate_in_worklist"]
+        """
+        rules = []
+        rule_counter = 1000  # Start at 1000 to avoid conflicts
+        
+        for story in user_stories:
+            screen = story.get('screen', {})
+            layout = screen.get('layout', {})
+            sections = layout.get('sections', [])
+            
+            for section in sections:
+                fields = section.get('fields', [])
+                for field in fields:
+                    validation = field.get('validation', {})
+                    validation_rules = validation.get('rules', [])
+                    error_messages = validation.get('error_messages', {})
+                    
+                    for rule_name in validation_rules:
+                        rule_id = f"BR-{rule_counter:03d}"
+                        error_msg = error_messages.get(rule_name, '')
+                        
+                        rules.append({
+                            'id': rule_id,
+                            'description': error_msg or self._humanize_rule_name(rule_name),
+                            'condition': f"Field '{field.get('id', '')}' validation",
+                            'action': rule_name,
+                            'source': 'field_validation',
+                            'source_story': story.get('id', ''),
+                            'field': field.get('id', '')
+                        })
+                        rule_counter += 1
+        
+        return rules
+    
+    def _humanize_rule_name(self, rule_name: str) -> str:
+        """Convert rule_name like 'must_exist_in_inventory' to readable text"""
+        return rule_name.replace('_', ' ').capitalize()
+    
+    def _extract_business_rules_from_db_constraints(self, database: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """
+        NEW: Extract business rules from database constraints
+        Example: NOT NULL, UNIQUE, CHECK constraints
+        """
+        rules = []
+        rule_counter = 2000  # Start at 2000 to avoid conflicts
+        tables = database.get('tables', [])
+        
+        for table in tables:
+            table_name = table.get('name', '')
+            
+            for column in table.get('columns', []):
+                column_name = column.get('name', '')
+                
+                # NOT NULL constraint
+                if not column.get('nullable', True):
+                    rule_id = f"BR-{rule_counter:03d}"
+                    rules.append({
+                        'id': rule_id,
+                        'description': f"Field '{column_name}' is required",
+                        'condition': f"Creating or updating {table_name}",
+                        'action': f"Validate {column_name} is not null",
+                        'source': 'database_constraint',
+                        'constraint_type': 'NOT NULL',
+                        'table': table_name,
+                        'column': column_name
+                    })
+                    rule_counter += 1
+                
+                # UNIQUE constraint
+                if column.get('unique', False):
+                    rule_id = f"BR-{rule_counter:03d}"
+                    rules.append({
+                        'id': rule_id,
+                        'description': f"Field '{column_name}' must be unique",
+                        'condition': f"Creating or updating {table_name}",
+                        'action': f"Validate {column_name} uniqueness",
+                        'source': 'database_constraint',
+                        'constraint_type': 'UNIQUE',
+                        'table': table_name,
+                        'column': column_name
+                    })
+                    rule_counter += 1
+        
+        return rules
+    
+    def _extract_field_validations(self, user_stories: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        NEW: Extract field-level validation rules for frontend use
+        Returns: List of field validation configs
+        """
+        validations = []
+        
+        for story in user_stories:
+            # FIX: Access nested structure properly - story['user_story']['screen']
+            user_story = story.get('user_story', {})
+            screen = user_story.get('screen', {})
+            layout = screen.get('layout', {})
+            sections = layout.get('sections', [])
+            story_id = user_story.get('id', '')
+            
+            for section in sections:
+                fields = section.get('fields', [])
+                for field in fields:
+                    field_id = field.get('id', '')
+                    validation = field.get('validation', {})
+                    
+                    if validation or field.get('required', False):
+                        validation_config = {
+                            'field_id': field_id,
+                            'field_label': field.get('label', ''),
+                            'required': field.get('required', False),
+                            'rules': validation.get('rules', []),
+                            'error_messages': validation.get('error_messages', {}),
+                            'data_type': field.get('type', ''),
+                            'binding': field.get('binding', ''),
+                            'source_story': story_id
+                        }
+                        validations.append(validation_config)
+        
+        logger.info(f"  [VALIDATION] Extracted {len(validations)} field validations")
+        return validations
+    
+    # ========================================================================
+    # PRESERVED SAVE METHOD
+    # ========================================================================
+    
+    def save_config(self, config: Dict[str, Any], output_dir: Path):
+        """Save configuration in both YAML and JSON formats"""
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Save as YAML
+        yaml_path = output_dir / 'application_config.yaml'
+        with open(yaml_path, 'w') as f:
+            yaml.dump(config, f, default_flow_style=False, sort_keys=False, indent=2)
+        logger.info(f"  [DONE] Saved: {yaml_path}")
+        
+        # Save as JSON
+        json_path = output_dir / 'application_config.json'
+        with open(json_path, 'w') as f:
+            json.dump(config, f, indent=2)
+        logger.info(f"  [DONE] Saved: {json_path}")
+        
+        return {
+            'yaml_path': str(yaml_path),
+            'json_path': str(json_path),
+            'entities_count': len(config.get('entities', [])),
+            'tables_count': len(config.get('database_schema', {}).get('tables', [])),
+            'apis_count': len(config.get('apis', [])),
+            'enums_count': len(config.get('enums', {})),
+            'business_rules_count': len(config.get('business_rules', []))
+        }
+
+    def _extract_screen_layouts(self, user_stories: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Extract comprehensive screen layout information from user stories."""
+        logger.info("  [EXTRACT] Screen layouts from user stories...")
+        layouts = []
+        
+        try:
+            for story in user_stories:
+                # Access the nested user_story structure
+                user_story = story.get('user_story', {})
+                story_id = user_story.get('id', 'unknown')
+                title = user_story.get('title', 'Unknown Story')
+                
+                # Extract screen information
+                screen = user_story.get('screen', {})
+                screen_name = screen.get('name', '')
+                screen_layout = screen.get('layout', {})
+                sections = screen_layout.get('sections', [])
+                
+                # Extract APIs
+                apis = user_story.get('apis', [])
+                
+                # Extract workflow information
+                workflow = user_story.get('workflow', {})
+                
+                # Extract audit information
+                audit = user_story.get('audit', {})
+                
+                if screen_name or sections or apis or workflow or audit:
+                    layout_data = {
+                        'story_id': story_id,
+                        'story_title': title,
+                        'screen_name': screen_name,
+                        'layout_sections': sections,
+                        'module': story.get('module', 'Unknown Module'),
+                        'persona': user_story.get('persona', ''),
+                        'goal': user_story.get('goal', ''),
+                        'business_value': user_story.get('business_value', ''),
+                        'apis': apis,
+                        'workflow': workflow,
+                        'audit': audit,
+                        'extracted_from': 'user_story'
+                    }
+                    
+                    # Extract field-level validation and error details
+                    field_validations = []
+                    field_errors = []
+                    
+                    for section in sections:
+                        section_fields = section.get('fields', [])
+                        for field in section_fields:
+                            field_id = field.get('id', '')
+                            validation = field.get('validation', {})
+                            
+                            if validation:
+                                field_validations.append({
+                                    'field_id': field_id,
+                                    'field_label': field.get('label', ''),
+                                    'section_id': section.get('id', ''),
+                                    'validation_rules': validation.get('rules', []),
+                                    'error_messages': validation.get('error_messages', {}),
+                                    'story_id': story_id
+                                })
+                                
+                                # Extract error messages
+                                error_messages = validation.get('error_messages', {})
+                                for rule, message in error_messages.items():
+                                    field_errors.append({
+                                        'field_id': field_id,
+                                        'rule': rule,
+                                        'message': message,
+                                        'story_id': story_id,
+                                        'section_id': section.get('id', '')
+                                    })
+                    
+                    layout_data['field_validations'] = field_validations
+                    layout_data['field_errors'] = field_errors
+                    
+                    layouts.append(layout_data)
+                    
+        except Exception as e:
+            logger.warning(f"Error extracting screen layouts: {e}")
+            
+        logger.info(f"  [RESULT] Found {len(layouts)} screen layouts")
+        return layouts
+
+    def _extract_screen_references(self, description: str, acceptance_criteria: List) -> List[str]:
+        """Extract screen/page references from text."""
+        screens = set()
+        
+        # Common screen/page patterns
+        patterns = [
+            r'\b(\w+)\s+(?:screen|page|form|dialog|modal)\b',
+            r'\bon\s+the\s+(\w+)\s+(?:screen|page)\b',
+            r'\b(\w+)\s+(?:UI|interface)\b',
+            r'\bnavigate\s+to\s+(\w+)\b'
+        ]
+        
+        # Search in description
+        for pattern in patterns:
+            matches = re.findall(pattern, description, re.IGNORECASE)
+            screens.update(match.lower() for match in matches)
+        
+        # Search in acceptance criteria
+        for criteria in acceptance_criteria:
+            criteria_text = criteria.get('description', '') if isinstance(criteria, dict) else str(criteria)
+            for pattern in patterns:
+                matches = re.findall(pattern, criteria_text, re.IGNORECASE)
+                screens.update(match.lower() for match in matches)
+        
+        return list(screens)
+
+    def _extract_layout_sections(self, acceptance_criteria: List) -> List[Dict[str, Any]]:
+        """Extract layout sections from acceptance criteria."""
+        sections = []
+        
+        try:
+            for criteria in acceptance_criteria:
+                criteria_text = criteria.get('description', '') if isinstance(criteria, dict) else str(criteria)
+                
+                # Look for section patterns
+                section_patterns = [
+                    r'\b(?:header|footer|sidebar|main|content|navigation|nav)\b',
+                    r'\b(?:top|bottom|left|right)\s+(?:section|panel|area)\b',
+                    r'\b(?:form|table|grid|list|card)\s+(?:section|area)\b'
+                ]
+                
+                for pattern in section_patterns:
+                    matches = re.findall(pattern, criteria_text, re.IGNORECASE)
+                    for match in matches:
+                        sections.append({
+                            'name': match.lower(),
+                            'type': 'layout_section',
+                            'source': criteria_text[:100] + '...' if len(criteria_text) > 100 else criteria_text
+                        })
+        except Exception as e:
+            logger.warning(f"Error extracting layout sections: {e}")
+        
+        return sections
+
+    def _extract_validation_rules(self, user_stories: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Extract validation rules from user stories and field definitions."""
+        logger.info("  [EXTRACT] Validation rules from user stories...")
+        rules = []
+        
+        try:
+            for story in user_stories:
+                user_story = story.get('user_story', {})
+                story_id = user_story.get('id', 'unknown')
+                
+                # Extract field-level validation rules from screen layout
+                screen = user_story.get('screen', {})
+                layout = screen.get('layout', {})
+                sections = layout.get('sections', [])
+                
+                for section in sections:
+                    section_id = section.get('id', '')
+                    fields = section.get('fields', [])
+                    
+                    for field in fields:
+                        field_id = field.get('id', '')
+                        validation = field.get('validation', {})
+                        
+                        if validation:
+                            validation_rules = validation.get('rules', [])
+                            error_messages = validation.get('error_messages', {})
+                            
+                            for rule in validation_rules:
+                                rules.append({
+                                    'story_id': story_id,
+                                    'field_id': field_id,
+                                    'field_label': field.get('label', ''),
+                                    'section_id': section_id,
+                                    'rule': rule,
+                                    'error_message': error_messages.get(rule, ''),
+                                    'field_type': field.get('type', ''),
+                                    'required': field.get('required', False),
+                                    'binding': field.get('binding', ''),
+                                    'source': 'field_validation'
+                                })
+                
+                # Also extract validation from acceptance criteria
+                acceptance_criteria = user_story.get('acceptance_criteria', [])
+                
+                for criteria in acceptance_criteria:
+                    then_conditions = criteria.get('then', [])
+                    
+                    for condition in then_conditions:
+                        if 'validate' in condition.lower() or 'must' in condition.lower():
+                            validation_patterns = [
+                                (r'must\s+be\s+(?:at\s+least|minimum)\s+(\d+)\s+characters?', 'min_length'),
+                                (r'must\s+be\s+(?:at\s+most|maximum)\s+(\d+)\s+characters?', 'max_length'),
+                                (r'must\s+be\s+a\s+valid\s+(\w+)', 'format_validation'),
+                                (r'(?:cannot|must\s+not)\s+be\s+empty', 'required'),
+                                (r'validate\s+(?:that\s+)?(.+)', 'validation_rule'),
+                                (r'required\s+fields?\s+(.+)', 'required_fields')
+                            ]
+                            
+                            for pattern, rule_type in validation_patterns:
+                                matches = re.findall(pattern, condition, re.IGNORECASE)
+                                for match in matches:
+                                    rules.append({
+                                        'story_id': story_id,
+                                        'criteria_id': criteria.get('id', ''),
+                                        'type': rule_type,
+                                        'value': match if isinstance(match, str) else str(match),
+                                        'description': condition,
+                                        'source': 'acceptance_criteria'
+                                    })
+                            
+        except Exception as e:
+            logger.warning(f"Error extracting validation rules: {e}")
+            
+        logger.info(f"  [RESULT] Found {len(rules)} validation rules")
+        return rules
+
+    def _extract_error_messages(self, user_stories: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Extract error messages from field validations and acceptance criteria."""
+        logger.info("  [EXTRACT] Error messages from user stories...")
+        messages = []
+        
+        try:
+            for story in user_stories:
+                user_story = story.get('user_story', {})
+                story_id = user_story.get('id', 'unknown')
+                
+                # Extract field-level error messages from screen layout
+                screen = user_story.get('screen', {})
+                layout = screen.get('layout', {})
+                sections = layout.get('sections', [])
+                
+                for section in sections:
+                    section_id = section.get('id', '')
+                    fields = section.get('fields', [])
+                    
+                    for field in fields:
+                        field_id = field.get('id', '')
+                        validation = field.get('validation', {})
+                        error_messages = validation.get('error_messages', {})
+                        
+                        for rule, message in error_messages.items():
+                            messages.append({
+                                'story_id': story_id,
+                                'field_id': field_id,
+                                'field_label': field.get('label', ''),
+                                'section_id': section_id,
+                                'rule': rule,
+                                'message': message,
+                                'type': 'field_validation_error',
+                                'context': f"Field validation error for {field.get('label', field_id)}",
+                                'source': 'field_error_message'
+                            })
+                
+                # Also extract from acceptance criteria
+                acceptance_criteria = user_story.get('acceptance_criteria', [])
+                
+                for criteria in acceptance_criteria:
+                    then_conditions = criteria.get('then', [])
+                    
+                    for condition in then_conditions:
+                        # Extract error message patterns
+                        error_patterns = [
+                            (r'(?:show|display)\s+(?:an?\s+)?error\s+(?:message\s+)?["\']([^"\']+)["\']', 'explicit_error'),
+                            (r'error\s+message:\s*["\']([^"\']+)["\']', 'explicit_error'),
+                            (r'(?:validation|error)\s+message\s+(?:should\s+be|is)\s+["\']([^"\']+)["\']', 'validation_error'),
+                            (r'(?:alert|notify)\s+(?:user\s+)?["\']([^"\']+)["\']', 'notification'),
+                            (r'warn\s+(?:user\s+)?["\']([^"\']+)["\']', 'warning'),
+                        ]
+                        
+                        for pattern, msg_type in error_patterns:
+                            matches = re.findall(pattern, condition, re.IGNORECASE)
+                            for match in matches:
+                                messages.append({
+                                    'story_id': story_id,
+                                    'criteria_id': criteria.get('id', ''),
+                                    'message': match.strip(),
+                                    'type': msg_type,
+                                    'context': condition,
+                                    'source': 'acceptance_criteria'
+                                })
+                        
+                        # Also look for general error/invalid scenarios
+                        if any(keyword in condition.lower() for keyword in ['error', 'invalid', 'fail', 'reject']):
+                            messages.append({
+                                'story_id': story_id,
+                                'criteria_id': criteria.get('id', ''),
+                                'message': condition,
+                                'type': 'error_scenario',
+                                'context': condition,
+                                'source': 'acceptance_criteria'
+                            })
+                        
+        except Exception as e:
+            logger.warning(f"Error extracting error messages: {e}")
+            
+        logger.info(f"  [RESULT] Found {len(messages)} error messages")
+        return messages
+
+    def _extract_rag_enhancements(self, fixed_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Extract RAG enhancement details from UI component analysis."""
+        logger.info("  [EXTRACT] RAG enhancements from UI component analysis...")
+        enhancements = {}
+        
+        try:
+            # First, extract from the existing rag_enhancements section if available
+            raw_ui_data = None
+            
+            # Try to get the original UI component data (not just the screens array)
+            # We need to access the full ui_component_analysis_llm.json structure
+            input_dir = Path("./JSON")
+            ui_component_file = input_dir / "ui_component_analysis_llm.json"
+            
+            if ui_component_file.exists():
+                with open(ui_component_file, 'r', encoding='utf-8') as f:
+                    raw_ui_data = json.load(f)
+            
+            if raw_ui_data and 'rag_enhancements' in raw_ui_data:
+                rag_data = raw_ui_data['rag_enhancements']
+                
+                # Extract business terms
+                business_terms = rag_data.get('business_terms_identified', [])
+                enhancements['business_terms'] = {
+                    'terms': [term for term in business_terms if isinstance(term, dict)],
+                    'count': len(business_terms),
+                    'type': 'business_context'
+                }
+                
+                # Extract process workflows
+                workflows = rag_data.get('process_workflows', [])
+                enhancements['process_workflows'] = {
+                    'workflows': workflows,
+                    'count': len(workflows),
+                    'type': 'process_enhancement'
+                }
+                
+                # Extract enhancement suggestions
+                suggestions = rag_data.get('enhancement_suggestions', [])
+                enhancements['enhancement_suggestions'] = {
+                    'suggestions': suggestions,
+                    'count': len(suggestions),
+                    'type': 'improvement_recommendations'
+                }
+                
+                # Extract RAG metadata
+                if 'rag_metadata' in raw_ui_data:
+                    metadata = raw_ui_data['rag_metadata']
+                    enhancements['metadata'] = {
+                        'relevance_score': metadata.get('relevance_score', 0),
+                        'business_terms_used': metadata.get('business_terms_used', 0),
+                        'context_applied': metadata.get('context_applied', False),
+                        'enhancement_timestamp': metadata.get('enhancement_timestamp', ''),
+                        'total_insights': metadata.get('total_insights', 0),
+                        'type': 'rag_metadata'
+                    }
+                
+                # Extract business glossary
+                if 'business_glossary' in raw_ui_data:
+                    glossary = raw_ui_data['business_glossary']
+                    enhancements['business_glossary'] = {
+                        'definitions': glossary,
+                        'count': len(glossary),
+                        'type': 'business_definitions'
+                    }
+            
+            # Also extract from UI components for additional context
+            ui_components = fixed_data.get('ui_components', [])
+            for component in ui_components:
+                component_name = component.get('name', 'unknown')
+                
+                # Extract business context from each screen
+                business_context = component.get('business_context', {})
+                if business_context:
+                    enhancements[f"{component_name}_context"] = {
+                        'type': 'screen_business_context',
+                        'component': component_name,
+                        'context': business_context,
+                        'source': 'ui_component_analysis'
+                    }
+            
+            # Add summary metadata
+            if enhancements:
+                enhancements['_summary'] = {
+                    'total_enhancements': len([k for k in enhancements.keys() if not k.startswith('_')]),
+                    'rag_enabled': True,
+                    'enhancement_types': list(set(
+                        enh.get('type', 'unknown') for key, enh in enhancements.items() 
+                        if not key.startswith('_')
+                    )),
+                    'extracted_at': datetime.utcnow().isoformat()
+                }
+                
+        except Exception as e:
+            logger.warning(f"Error extracting RAG enhancements: {e}")
+            
+        logger.info(f"  [RESULT] Found {len(enhancements)} RAG enhancements")
+        return enhancements
+
+    def _extract_workflow_definitions(self, user_stories: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Extract workflow definitions from user stories."""
+        logger.info("  [EXTRACT] Workflow definitions from user stories...")
+        workflows = []
+        
+        try:
+            for story in user_stories:
+                user_story = story.get('user_story', {})
+                story_id = user_story.get('id', 'unknown')
+                workflow = user_story.get('workflow', {})
+                
+                if workflow:
+                    workflows.append({
+                        'story_id': story_id,
+                        'story_title': user_story.get('title', ''),
+                        'module': story.get('module', ''),
+                        'initial_state': workflow.get('initial_state', ''),
+                        'success_transition': workflow.get('success_transition', ''),
+                        'failure_transition': workflow.get('failure_transition', ''),
+                        'audit_logging': workflow.get('audit_logging', False),
+                        'history_table': workflow.get('history_table', ''),
+                        'source': 'user_story_workflow'
+                    })
+                    
+        except Exception as e:
+            logger.warning(f"Error extracting workflow definitions: {e}")
+            
+        logger.info(f"  [RESULT] Found {len(workflows)} workflow definitions")
+        return workflows
+
+    def _extract_api_specifications(self, user_stories: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Extract API specifications from user stories."""
+        logger.info("  [EXTRACT] API specifications from user stories...")
+        api_specs = []
+        
+        try:
+            for story in user_stories:
+                user_story = story.get('user_story', {})
+                story_id = user_story.get('id', 'unknown')
+                apis = user_story.get('apis', [])
+                
+                for api in apis:
+                    api_specs.append({
+                        'story_id': story_id,
+                        'story_title': user_story.get('title', ''),
+                        'module': story.get('module', ''),
+                        'endpoint': api.get('endpoint', ''),
+                        'method': api.get('method', ''),
+                        'input_parameters': api.get('input', []),
+                        'output_parameters': api.get('output', []),
+                        'business_logic': api.get('logic', []),
+                        'on_success': api.get('on_success', ''),
+                        'on_error': api.get('on_error', ''),
+                        'source': 'user_story_api'
+                    })
+                    
+        except Exception as e:
+            logger.warning(f"Error extracting API specifications: {e}")
+            
+        logger.info(f"  [RESULT] Found {len(api_specs)} API specifications")
+        return api_specs
+
+    def _extract_audit_configurations(self, user_stories: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Extract audit configurations from user stories."""
+        logger.info("  [EXTRACT] Audit configurations from user stories...")
+        audit_configs = []
+        
+        try:
+            for story in user_stories:
+                user_story = story.get('user_story', {})
+                story_id = user_story.get('id', 'unknown')
+                audit = user_story.get('audit', {})
+                
+                if audit:
+                    audit_configs.append({
+                        'story_id': story_id,
+                        'story_title': user_story.get('title', ''),
+                        'module': story.get('module', ''),
+                        'enabled': audit.get('enabled', False),
+                        'log_events': audit.get('log_events', []),
+                        'log_table': audit.get('log_table', ''),
+                        'source': 'user_story_audit'
+                    })
+                    
+        except Exception as e:
+            logger.warning(f"Error extracting audit configurations: {e}")
+            
+        logger.info(f"  [RESULT] Found {len(audit_configs)} audit configurations")
+        return audit_configs
+
+
+def main():
+    """Main entry point for standalone execution"""
+    import sys
+    import argparse
+    
+    parser = argparse.ArgumentParser(
+        description="Generate application configuration from SDLC analysis outputs",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python step_2_application_config_generator.py -u JSON/user_story_analysis_llm.json -i JSON/ui_component_analysis_llm.json -d JSON/database_schema.json
+  python step_2_application_config_generator.py --user-story path/to/user_stories.json --ui-component path/to/ui.json --database path/to/db.json --output config_output
+        """
+    )
+    
+    parser.add_argument(
+        '-u', '--user-story',
+        type=str,
+        help='Path to the user story analysis JSON file'
+    )
+    
+    parser.add_argument(
+        '-i', '--ui-component',
+        type=str,
+        help='Path to the UI component analysis JSON file'
+    )
+    
+    parser.add_argument(
+        '-d', '--database',
+        type=str,
+        help='Path to the database schema JSON file'
+    )
+    
+    parser.add_argument(
+        '-o', '--output',
+        type=str,
+        default='./config_output',
+        help='Output directory for generated config files (default: ./config_output)'
+    )
+    
+    args = parser.parse_args()
+    
+    # Validate required arguments
+    if not all([args.user_story, args.ui_component, args.database]):
+        print("Error: All input file arguments are required: -u, -i, -d")
+        print("Use --help for more information.")
+        sys.exit(1)
+    
+    # Convert to Path objects
+    user_story_file = Path(args.user_story)
+    ui_component_file = Path(args.ui_component)
+    database_schema_file = Path(args.database)
+    output_dir = Path(args.output)
+    
+    print("="*80)
+    print("APPLICATION CONFIG GENERATOR - ENHANCED VERSION")
+    print("="*80)
+    print(f"Input Files:")
+    print(f"  - User Story: {user_story_file.absolute()}")
+    print(f"  - UI Component: {ui_component_file.absolute()}")
+    print(f"  - Database Schema: {database_schema_file.absolute()}")
+    print(f"Output Directory: {output_dir.absolute()}")
+    print("-" * 80)
+    
+    generator = ConfigGenerator()
+    
+    try:
+        # Load the three required input files
+        fixed_data = generator.load_input_files(user_story_file, ui_component_file, database_schema_file)
+        
+        # Generate comprehensive configuration
+        config = generator.generate_config(fixed_data)
+        
+        # Save the configuration
+        result = generator.save_config(config, output_dir)
+        
+        print("\n" + "="*80)
+        print("[SUCCESS] Application Configuration Generated!")
+        print("="*80)
+        print(f"[STATISTICS]")
+        print(f"Database Tables: {result['tables_count']}")
+        print(f"Entities: {result['entities_count']}")
+        print(f"APIs: {result['apis_count']}")
+        print(f"Enums: {result['enums_count']} (ENHANCED)")
+        print(f"Business Rules: {result['business_rules_count']} (ENHANCED)")
+        print(f"\n[OUTPUT FILES]")
+        print(f"YAML Config: {result['yaml_path']}")
+        print(f"JSON Config: {result['json_path']}")
+        print("="*80)
+        
+    except Exception as e:
+        print(f"\n[ERROR] Configuration generation failed: {str(e)}")
+        print("\n[HELP] Make sure the following files exist in the input directory:")
+        print("   - user_story_analysis_llm.json")
+        print("   - ui_component_analysis_llm.json") 
+        print("   - database_schema.json")
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()
+"
