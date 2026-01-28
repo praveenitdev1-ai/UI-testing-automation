@@ -1,0 +1,45 @@
+User Story 1: Enter Tracking Number to Add Item
+
+As a RTV Area warehouse clerk
+I want to scan a Tracking Number to quickly add an item to the worklist
+So that I can efficiently process returned items without manual data entry
+
+Description
+When processing returned items in the RTV area, warehouse clerks need to quickly add items to the system for tracking and disposition.
+The system should auto-populate available item details when a valid Tracking Number is entered, reducing the amount of manual data entry required and speeding up the intake process.
+Acceptance Criteria
+AC1: Successful Scan and Item Addition
+Given I am on the "NSI Item Entry" screen
+When I enter a valid Tracking Number and click on Scan button 
+Then the system retrieves and displays available item information from inventory table
+And I can complete any remaining required fields
+And I can click "Add Item" to successfully add the item
+AC2: Invalid Tracking Number Handling
+Given I am on the "NSI Item Entry" screen
+When I enter an non-existent Tracking Number and click on Scan Button, tracking number which doesn't exist in inventory table
+Then the system displays an error message "Invalid tracking number - please verify and try again"
+And the tracking number field is cleared
+And I can attempt to enter again
+AC3: Duplicate Item Prevention
+Given I am on the "NSI Item Entry" screen
+When I scan a Tracking Number that already exists in the current worklist which is in nsi_items table
+Then the system displays a warning message "Item already in worklist"
+And the item is not duplicated in the worklist
+AC4: Auto-Population of Item Details
+Given I enter a valid Tracking Number and click on Scan button
+When the system finds matching item information from Inventory table
+Then the following fields are automatically populated from inventory table:
+inventory.item_id
+inventory.description
+inventory.quantity
+inventory.value 
+And I can edit the following fields in the "NSI Item Entry" screen if needed
+nsi_items.disposition
+nsi_items.vendor_id
+nsi_items.quantity
+nsi_items.location_id
+AC7: Required Field Validation
+Given I have entered a Tracking Number and auto-populated available fields
+When I click "Add Item"
+Then the system validates that all required fields are complete
+And displays specific error messages for any missing required fields
