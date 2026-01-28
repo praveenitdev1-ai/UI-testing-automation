@@ -1,0 +1,340 @@
+"#!/usr/bin/env python3
+"""
+generate_validation_html.py
+Standalone script to generate HTML validation report from JSON files
+"""
+
+import json
+import sys
+from pathlib import Path
+from datetime import datetime
+from typing import Dict, List, Any
+
+def parse_json_files(json_dir: Path) -> Dict[str, List[Dict]]:
+    """
+    Parse all JSON files in the directory and categorize by severity
+    """
+    violations = {
+        'critical': [],
+        'high': [],
+        'medium': [],
+        'low': [],
+        'info': []
+    }
+    
+    json_files = list(json_dir.glob("*.json"))
+    print(f"Found {len(json_files)} JSON files in {json_dir}")
+    
+    for json_file in json_files:
+        try:
+            print(f"Processing: {json_file.name}")
+            with open(json_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                
+                # Handle different JSON structures
+                # Adjust this based on your actual JSON format
+                
+                # If it's a list of violations
+                if isinstance(data, list):
+                    for item in data:
+                        add_violation(violations, item, json_file.name)
+                
+                # If it's a dict with a violations key
+                elif isinstance(data, dict):
+                    if 'violations' in data:
+                        for item in data['violations']:
+                            add_violation(violations, item, json_file.name)
+                    elif 'issues' in data:
+                        for item in data['issues']:
+                            add_violation(violations, item, json_file.name)
+                    else:
+                        # Treat the whole dict as a single violation
+                        add_violation(violations, data, json_file.name)
+                        
+        except json.JSONDecodeError as e:
+            print(f"Error parsing {json_file.name}: {e}")
+        except Exception as e:
+            print(f"Error processing {json_file.name}: {e}")
+    
+    return violations
+
+def add_violation(violations: Dict, item: Dict, source_file: str):
+    """
+    Add a violation to the appropriate severity category
+    """
+    # Determine severity - adjust field names based on your JSON structure
+    severity = (item.get('severity') or 
+                item.get('level') or 
+                item.get('type') or 
+                'info').lower()
+    
+    # Map to our categories
+    severity_map = {
+        'error': 'critical',
+        'critical': 'critical',
+        'high': 'high',
+        'warning': 'medium',
+        'medium': 'medium',
+        'low': 'low',
+        'info': 'info',
+        'information': 'info'
+    }
+    
+    severity = severity_map.get(severity, 'info')
+    
+    # Add source file info
+    item['source_file'] = source_file
+    
+    if severity in violations:
+        violations[severity].append(item)
+
+def generate_html_report(violations: Dict, output_file: Path):
+    """
+    Generate HTML report from violations
+    """
+    # Generate sections HTML
+    sections_html = ""
+    
+    for severity in ['critical', 'high', 'medium', 'low', 'info']:
+        if violations[severity]:
+            sections_html += f"""
+            <div class="section {severity}">
+                <h2>{severity.upper()} ({len(violations[severity])} issues)</h2>
+                <div class="violations">
+            """
+            
+            for violation in violations[severity]:
+                # Extract relevant fields - adjust based on your JSON structure
+                file_path = violation.get('file') or violation.get('filename') or violation.get('path', 'N/A')
+                line_num = violation.get('line') or violation.get('line_number', 'N/A')
+                message = violation.get('message') or violation.get('description') or violation.get('issue', 'N/A')
+                rule = violation.get('rule') or violation.get('rule_id') or violation.get('check', 'N/A')
+                source = violation.get('source_file', 'Unknown')
+                
+                sections_html += f"""
+                <div class="violation {severity}">
+                    <div class="violation-header">
+                        <strong>File:</strong> {file_path} (Line: {line_num})
+                    </div>
+                    <div class="violation-body">
+                        <p><strong>Issue:</strong> {message}</p>
+                        <p><strong>Rule:</strong> {rule}</p>
+                        <p class="source">Source: {source}</p>
+                    </div>
+                </div>
+                """
+            
+            sections_html += "</div></div>"
+    
+    # If no violations found
+    if not sections_html:
+        sections_html = """
+        <div class="section success">
+            <h2>✓ No Validation Issues Found</h2>
+            <p>All code passed validation checks successfully.</p>
+        </div>
+        """
+    
+    # Generate complete HTML
+    html_content = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Code Validation Report</title>
+        <meta charset="UTF-8">
+        <style>
+            body {{ 
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+                margin: 0;
+                padding: 20px;
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                min-height: 100vh;
+            }}
+            .container {{
+                max-width: 1200px;
+                margin: 0 auto;
+                background: white;
+                border-radius: 10px;
+                box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+                overflow: hidden;
+            }}
+            .header {{
+                background: linear-gradient(135deg, #2C3E50 0%, #34495E 100%);
+                color: white;
+                padding: 30px;
+            }}
+            h1 {{ 
+                margin: 0;
+                font-size: 2.5em;
+            }}
+            .summary {{ 
+                background: #f8f9fa;
+                padding: 20px 30px;
+                border-bottom: 1px solid #dee2e6;
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+                gap: 15px;
+            }}
+            .summary-item {{
+                text-align: center;
+                padding: 10px;
+                background: white;
+                border-radius: 5px;
+                box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            }}
+            .summary-number {{
+                font-size: 2em;
+                font-weight: bold;
+                margin-bottom: 5px;
+            }}
+            .content {{
+                padding: 30px;
+            }}
+            .section {{
+                margin-bottom: 30px;
+            }}
+            .section h2 {{
+                padding: 10px 15px;
+                border-radius: 5px;
+                margin-bottom: 15px;
+            }}
+            .violation {{
+                margin-bottom: 15px;
+                border-left: 4px solid;
+                border-radius: 5px;
+                background: #f8f9fa;
+                overflow: hidden;
+            }}
+            .violation-header {{
+                padding: 10px 15px;
+                background: rgba(0,0,0,0.05);
+                font-size: 0.9em;
+            }}
+            .violation-body {{
+                padding: 15px;
+            }}
+            .violation-body p {{
+                margin: 5px 0;
+            }}
+            .source {{
+                font-size: 0.85em;
+                color: #6c757d;
+                font-style: italic;
+            }}
+            
+            /* Severity colors */
+            .critical {{ border-left-color: #dc3545; }}
+            .critical h2 {{ color: #dc3545; background: rgba(220, 53, 69, 0.1); }}
+            .summary .critical {{ color: #dc3545; }}
+            
+            .high {{ border-left-color: #fd7e14; }}
+            .high h2 {{ color: #fd7e14; background: rgba(253, 126, 20, 0.1); }}
+            .summary .high {{ color: #fd7e14; }}
+            
+            .medium {{ border-left-color: #ffc107; }}
+            .medium h2 {{ color: #ff9800; background: rgba(255, 193, 7, 0.1); }}
+            .summary .medium {{ color: #ff9800; }}
+            
+            .low {{ border-left-color: #0dcaf0; }}
+            .low h2 {{ color: #0dcaf0; background: rgba(13, 202, 240, 0.1); }}
+            .summary .low {{ color: #0dcaf0; }}
+            
+            .info {{ border-left-color: #198754; }}
+            .info h2 {{ color: #198754; background: rgba(25, 135, 84, 0.1); }}
+            .summary .info {{ color: #198754; }}
+            
+            .success {{ border-left-color: #198754; }}
+            .success h2 {{ color: #198754; background: rgba(25, 135, 84, 0.1); }}
+            
+            .footer {{
+                background: #f8f9fa;
+                padding: 20px 30px;
+                border-top: 1px solid #dee2e6;
+                color: #6c757d;
+                font-size: 0.9em;
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="header">
+                <h1>🔍 Code Validation Report</h1>
+            </div>
+            
+            <div class="summary">
+                <div class="summary-item critical">
+                    <div class="summary-number">{len(violations['critical'])}</div>
+                    <div>Critical</div>
+                </div>
+                <div class="summary-item high">
+                    <div class="summary-number">{len(violations['high'])}</div>
+                    <div>High</div>
+                </div>
+                <div class="summary-item medium">
+                    <div class="summary-number">{len(violations['medium'])}</div>
+                    <div>Medium</div>
+                </div>
+                <div class="summary-item low">
+                    <div class="summary-number">{len(violations['low'])}</div>
+                    <div>Low</div>
+                </div>
+                <div class="summary-item info">
+                    <div class="summary-number">{len(violations['info'])}</div>
+                    <div>Info</div>
+                </div>
+            </div>
+            
+            <div class="content">
+                {sections_html}
+            </div>
+            
+            <div class="footer">
+                <p>Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+                <p>Total issues found: {sum(len(v) for v in violations.values())}</p>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+    
+    # Write the file
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    output_file.write_text(html_content, encoding='utf-8')
+    print(f"\n✅ HTML report generated: {output_file}")
+    print(f"   Total issues: {sum(len(v) for v in violations.values())}")
+
+def main():
+    """Main function"""
+    # You can customize these paths
+    if len(sys.argv) > 1:
+        json_dir = Path(sys.argv[1])
+    else:
+        json_dir = Path("secure_code_validation")
+    
+    if len(sys.argv) > 2:
+        output_file = Path(sys.argv[2])
+    else:
+        output_file = json_dir / "validation_report.html"
+    
+    if not json_dir.exists():
+        print(f"Error: Directory {json_dir} does not exist")
+        sys.exit(1)
+    
+    print(f"Reading JSON files from: {json_dir}")
+    print(f"Output will be saved to: {output_file}")
+    
+    # Parse JSON files
+    violations = parse_json_files(json_dir)
+    
+    # Generate HTML report
+    generate_html_report(violations, output_file)
+    
+    # Print summary
+    print("\nSummary:")
+    for severity in ['critical', 'high', 'medium', 'low', 'info']:
+        count = len(violations[severity])
+        if count > 0:
+            print(f"  {severity.upper()}: {count}")
+
+if __name__ == "__main__":
+    main()"
