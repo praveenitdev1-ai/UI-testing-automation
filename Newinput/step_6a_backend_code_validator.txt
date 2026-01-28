@@ -1,0 +1,1695 @@
+"#!/usr/bin/env python3
+"""
+Comprehensive Code Validation Tool
+
+This tool reads program code, detects the programming language,
+and validates against:
+- OWASP Secure Coding Practices (Security vulnerabilities)
+- Programming Best Practices (Code quality, maintainability, performance)
+- Language-specific conventions and patterns
+
+Generates detailed reports in secure_code_validation folder.
+"""
+
+import os
+import re
+import json
+import argparse
+import asyncio
+from datetime import datetime
+from pathlib import Path
+import hashlib
+from typing import Dict, List, Tuple, Optional
+import logging
+import subprocess
+import glob
+
+# Azure Key Vault imports
+try:
+    from azure.keyvault.secrets import SecretClient
+    from azure.identity import DefaultAzureCredential
+    from azure.core.exceptions import ClientAuthenticationError
+    AZURE_KEYVAULT_AVAILABLE = True
+except ImportError:
+    AZURE_KEYVAULT_AVAILABLE = False
+    # Define dummy exception for type catching if needed, though we check the flag first
+    class ClientAuthenticationError(Exception): pass
+
+# Simplified - only need basic file reading for guidelines.txt
+# Setup logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Suppress verbose logging from Azure libraries
+logging.getLogger('azure').setLevel(logging.ERROR)
+logging.getLogger('azure.core').setLevel(logging.ERROR) 
+logging.getLogger('azure.identity').setLevel(logging.ERROR)
+logging.getLogger('azure.keyvault').setLevel(logging.ERROR)
+logging.getLogger('openai').setLevel(logging.ERROR)
+logging.getLogger('httpx').setLevel(logging.ERROR)
+logging.getLogger('urllib3').setLevel(logging.ERROR)
+
+# Load environment variables from .env file
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+    logger.debug("Loaded environment variables from .env file")
+except ImportError:
+    logger.debug("python-dotenv not available, using system environment variables")
+
+# Built-in LLM client implementation
+import requests
+LLM_AVAILABLE = True  # Always available now since we handle it internally
+
+class SimpleLLMClient:
+    """Simple built-in LLM client for Azure OpenAI"""
+    
+    def __init__(self, config: Dict):
+        self.endpoint = config.get('endpoint')
+        self.api_key = config.get('api_key')
+        self.deployment_name = config.get('deployment_name')
+        self.api_version = config.get('api_version', '2024-02-15-preview')
+        
+        # Build the full URL - check if endpoint already contains the full path
+        if self.endpoint:
+            if '/chat/completions' in self.endpoint:
+                # Endpoint already contains the full path, use as-is
+                self.url = self.endpoint
+            elif self.deployment_name:
+                # Build the full URL from base endpoint
+                base_endpoint = self.endpoint.rstrip('/')
+                if '/openai/deployments/' in base_endpoint:
+                    # Endpoint already has deployments path, just add chat/completions
+                    self.url = f"{base_endpoint}/chat/completions?api-version={self.api_version}"
+                else:
+                    # Standard Azure OpenAI endpoint format
+                    self.url = f"{base_endpoint}/openai/deployments/{self.deployment_name}/chat/completions?api-version={self.api_version}"
+            else:
+                self.url = None
+        else:
+            self.url = None
+    
+    def get_provider_name(self) -> str:
+        return "Azure OpenAI (Built-in)"
+    
+    def is_configured(self) -> bool:
+        return bool(self.endpoint and self.api_key and self.deployment_name)
+    
+    def chat_completion(self, messages: List[Dict], temperature: float = 0.3, max_tokens: int = 1000) -> Dict:
+        """Send chat completion request to Azure OpenAI"""
+        if not self.is_configured():
+            raise ValueError("LLM client not properly configured")
+        
+        headers = {
+            "Content-Type": "application/json",
+            "api-key": self.api_key
+        }
+        
+        payload = {
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens
+        }
+        
+        try:
+            response = requests.post(self.url, headers=headers, json=payload, timeout=30)
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.RequestException as e:
+            logger.error(f"LLM request failed: {e}")
+            return {"error": str(e)}
+
+class LLMProvider:
+    """Simple LLM provider for compatibility"""
+    
+    def __init__(self, provider_type: str):
+        self.provider_type = provider_type
+
+class LLMClientFactory:
+    """Simple LLM client factory for compatibility"""
+    
+    @staticmethod
+    def create_client(provider: LLMProvider, config: Dict) -> SimpleLLMClient:
+        return SimpleLLMClient(config)
+
+class LLMSecurityValidator:
+    """Built-in LLM-based security validator"""
+    
+    def __init__(self, llm_client: SimpleLLMClient, guidelines_text: str = None):
+        self.llm_client = llm_client
+        self.guidelines_text = guidelines_text or ""
+    
+    def validate_code(self, language: str, code: str, filename: str, guidelines: str = None) -> Dict:
+        """Validate code using LLM"""
+        try:
+            # Prepare the security analysis prompt
+            guidelines_section = ""
+            if guidelines or self.guidelines_text:
+                guidelines_section = f"\n\nCoding Guidelines to follow:\n{guidelines or self.guidelines_text}"
+            
+            messages = [
+                {
+                    "role": "system",
+                    "content": f"""You are a security-focused code reviewer. Analyze the provided {language} code for:
+1. OWASP security vulnerabilities
+2. Programming best practices violations
+3. Code quality issues
+
+Return your analysis in this exact JSON format:
+{{
+    "violations": [
+        {{
+            "type": "security|quality",
+            "category": "category_name",
+            "severity": "HIGH|MEDIUM|LOW",
+            "line": line_number,
+            "message": "description",
+            "code_snippet": "relevant code"
+        }}
+    ],
+    "risk_score": score_0_to_10,
+    "summary": "brief_summary"
+}}{guidelines_section}"""
+                },
+                {
+                    "role": "user", 
+                    "content": f"Analyze this {language} code from file '{filename}':\n\n```{language}\n{code}\n```"
+                }
+            ]
+            
+            # Call LLM
+            response = self.llm_client.chat_completion(messages, temperature=0.1, max_tokens=2000)
+            
+            if "error" in response:
+                return {
+                    "violations": [],
+                    "risk_score": 0,
+                    "summary": f"LLM analysis failed: {response['error']}",
+                    "llm_metadata": {"error": response["error"]}
+                }
+            
+            # Parse LLM response
+            if "choices" in response and len(response["choices"]) > 0:
+                content = response["choices"][0]["message"]["content"]
+                
+                # Try to extract JSON from the response
+                try:
+                    import json
+                    import re
+                    
+                    # Find JSON in the response
+                    json_match = re.search(r'\{.*\}', content, re.DOTALL)
+                    if json_match:
+                        result = json.loads(json_match.group())
+                        result["llm_metadata"] = {
+                            "model_used": "Azure OpenAI",
+                            "response_tokens": response.get("usage", {}).get("completion_tokens", 0)
+                        }
+                        return result
+                    else:
+                        return {
+                            "violations": [],
+                            "risk_score": 0,
+                            "summary": "Could not parse LLM response as JSON",
+                            "llm_metadata": {"raw_response": content}
+                        }
+                        
+                except json.JSONDecodeError as e:
+                    return {
+                        "violations": [],
+                        "risk_score": 0,
+                        "summary": f"JSON parse error: {e}",
+                        "llm_metadata": {"raw_response": content, "parse_error": str(e)}
+                    }
+            else:
+                return {
+                    "violations": [],
+                    "risk_score": 0,
+                    "summary": "No response from LLM",
+                    "llm_metadata": {"response": response}
+                }
+        
+        except Exception as e:
+            logger.error(f"LLM validation error: {e}")
+            return {
+                "violations": [],
+                "risk_score": 0,
+                "summary": f"LLM validation failed: {e}",
+                "llm_metadata": {"error": str(e)}
+            }
+
+# --- Azure CLI Path Configuration ---
+def _ensure_azure_cli_available():
+    """Ensure Azure CLI is available and add to PATH if needed"""
+    
+    # Check if 'az' command is available in current PATH
+    try:
+        subprocess.run(['az', '--version'], capture_output=True, check=True)
+        return True
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        pass
+    
+    # If not available, check AZURE_CLI_PATH environment variable
+    azure_cli_path = os.environ.get('AZURE_CLI_PATH')
+    if azure_cli_path:
+        if os.path.exists(azure_cli_path):
+            # Add to PATH for this session
+            current_path = os.environ.get('PATH', '')
+            if azure_cli_path not in current_path:
+                os.environ['PATH'] = azure_cli_path + os.pathsep + current_path
+            
+            # Test again after adding to PATH
+            for az_command in ['az', 'az.cmd', 'az.exe']:
+                try:
+                    subprocess.run([az_command, '--version'], capture_output=True, check=True)
+                    return True
+                except (subprocess.CalledProcessError, FileNotFoundError):
+                    continue
+    
+    # Try common Azure CLI installation paths as fallback
+    common_paths = [
+        r"C:\Program Files\Microsoft SDKs\Azure\CLI2\wbin",
+        r"C:\Program Files (x86)\Microsoft SDKs\Azure\CLI2\wbin"
+    ]
+    
+    for path in common_paths:
+        if os.path.exists(path):
+            for az_file in ['az.cmd', 'az.exe']:
+                az_full_path = os.path.join(path, az_file)
+                if os.path.exists(az_full_path):
+                    return True
+    
+    return False
+
+# --- Azure Key Vault functions ---
+def get_azure_openai_api_key_from_keyvault():
+    """Get only the Azure OpenAI API key from Azure Key Vault"""
+    if not AZURE_KEYVAULT_AVAILABLE:
+        print("Azure libraries not installed. Skipping Key Vault authentication.")
+        return None
+
+    keyvault_url = "https://kv-sdlc-pipeline.vault.azure.net/"
+    secret_name = "GPT41"
+    
+    print("=Azure Authentication Details:")
+    
+    # Ensure Azure CLI is available before attempting authentication
+    if not _ensure_azure_cli_available():
+        print("Azure CLI not available - cannot authenticate with Key Vault")
+        print("Authentication Method: None (Azure CLI required)")
+        print("Fallback: Using .env file for API key")
+        return None
+    
+    try:
+        credential = DefaultAzureCredential()
+        client = SecretClient(vault_url=keyvault_url, credential=credential)
+        
+        # Get only the API key from Key Vault
+        print("Attempting to retrieve secret from Key Vault...")
+        secret = client.get_secret(secret_name)
+        
+        print("Successfully authenticated with Azure Key Vault")
+        
+        return secret.value
+        
+    except ClientAuthenticationError as e:
+        print(f"Key Vault authentication failed: {str(e)}")
+        print("Fallback: Using .env file for API key")
+        return None
+    except Exception as e:
+        print(f"Key Vault error: {str(e)}")
+        print("Fallback: Using .env file for API key")
+        return None
+
+class LanguageDetector:
+    """Detects programming language based on file extension and code patterns"""
+    
+    LANGUAGE_PATTERNS = {
+        'python': {
+            'extensions': ['.py', '.pyw', '.pyc', '.pyo'],
+            'patterns': [
+                r'import\s+\w+',
+                r'from\s+\w+\s+import',
+                r'def\s+\w+\s*\(',
+                r'class\s+\w+\s*\(',
+                r'if\s+__name__\s*==\s*["\']__main__["\']'
+            ]
+        },
+        'javascript': {
+            'extensions': ['.js', '.jsx', '.mjs', '.ts', '.tsx'],
+            'patterns': [
+                r'function\s+\w+\s*\(',
+                r'const\s+\w+\s*=',
+                r'let\s+\w+\s*=',
+                r'var\s+\w+\s*=',
+                r'require\s*\(',
+                r'import\s+.*from'
+            ]
+        },
+        'java': {
+            'extensions': ['.java'],
+            'patterns': [
+                r'public\s+class\s+\w+',
+                r'public\s+static\s+void\s+main',
+                r'import\s+java\.',
+                r'package\s+\w+'
+            ]
+        },
+        'csharp': {
+            'extensions': ['.cs'],
+            'patterns': [
+                r'using\s+System',
+                r'namespace\s+\w+',
+                r'public\s+class\s+\w+',
+                r'static\s+void\s+Main'
+            ]
+        },
+        'cpp': {
+            'extensions': ['.cpp', '.cc', '.cxx', '.c++', '.hpp', '.h'],
+            'patterns': [
+                r'#include\s*<.*>',
+                r'#include\s*".*"',
+                r'int\s+main\s*\(',
+                r'std::'
+            ]
+        },
+        'php': {
+            'extensions': ['.php', '.phtml'],
+            'patterns': [
+                r'<\?php',
+                r'\$\w+\s*=',
+                r'function\s+\w+\s*\(',
+                r'class\s+\w+'
+            ]
+        },
+        'ruby': {
+            'extensions': ['.rb'],
+            'patterns': [
+                r'def\s+\w+',
+                r'class\s+\w+',
+                r'require\s+[\'"]',
+                r'end\s*$'
+            ]
+        },
+        'go': {
+            'extensions': ['.go'],
+            'patterns': [
+                r'package\s+\w+',
+                r'import\s+[\'"]',
+                r'func\s+\w+\s*\(',
+                r'func\s+main\s*\('
+            ]
+        },
+        'sql': {
+            'extensions': ['.sql'],
+            'patterns': [
+                r'SELECT\s+.*FROM',
+                r'INSERT\s+INTO',
+                r'UPDATE\s+.*SET',
+                r'DELETE\s+FROM',
+                r'CREATE\s+TABLE'
+            ]
+        }
+    }
+    
+    def detect_language(self, file_path: str, content: str) -> str:
+        """Detect programming language from file extension and content"""
+        
+        # First try file extension
+        file_ext = Path(file_path).suffix.lower()
+        for lang, config in self.LANGUAGE_PATTERNS.items():
+            if file_ext in config['extensions']:
+                # Verify with pattern matching
+                pattern_matches = 0
+                for pattern in config['patterns']:
+                    if re.search(pattern, content, re.IGNORECASE | re.MULTILINE):
+                        pattern_matches += 1
+                
+                if pattern_matches >= 1:  # At least one pattern should match
+                    return lang
+        
+        # If extension doesn't match, try pattern matching
+        best_match = 'unknown'
+        max_matches = 0
+        
+        for lang, config in self.LANGUAGE_PATTERNS.items():
+            pattern_matches = 0
+            for pattern in config['patterns']:
+                if re.search(pattern, content, re.IGNORECASE | re.MULTILINE):
+                    pattern_matches += 1
+            
+            if pattern_matches > max_matches:
+                max_matches = pattern_matches
+                best_match = lang
+        
+        return best_match if max_matches > 0 else 'unknown'
+
+class ComprehensiveCodeValidator:
+    """Comprehensive code validation including OWASP security rules and programming best practices"""
+    
+    def __init__(self):
+        self.security_rules = self._load_security_rules()
+        self.programming_rules = self._load_programming_rules()
+    
+    def _load_security_rules(self) -> Dict:
+        """Load OWASP security validation rules"""
+        return {
+            'common': {
+                'input_validation': [
+                    {
+                        'rule': 'SQL Injection Prevention',
+                        'pattern': r'(SELECT|INSERT|UPDATE|DELETE).*\+.*[\'"]',
+                        'severity': 'HIGH',
+                        'description': 'Potential SQL injection through string concatenation'
+                    },
+                    {
+                        'rule': 'Hardcoded Credentials',
+                        'pattern': r'(password|pwd|pass|secret|key|token)\s*=\s*[\'"][^\'\"]{3,}[\'"]',
+                        'severity': 'HIGH',
+                        'description': 'Hardcoded credentials detected'
+                    },
+                    {
+                        'rule': 'Weak Hash Algorithm',
+                        'pattern': r'(md5|sha1)\s*\(',
+                        'severity': 'MEDIUM',
+                        'description': 'Weak cryptographic hash algorithm'
+                    }
+                ],
+                'authentication': [
+                    {
+                        'rule': 'Session Management',
+                        'pattern': r'session_start\(\)\s*;?\s*$',
+                        'severity': 'LOW',
+                        'description': 'Basic session management detected - ensure secure configuration'
+                    }
+                ],
+                'data_protection': [
+                    {
+                        'rule': 'Unencrypted Sensitive Data',
+                        'pattern': r'(credit_card|ssn|social_security|passport).*=.*[\'"][^\'\"]+[\'"]',
+                        'severity': 'HIGH',
+                        'description': 'Potentially unencrypted sensitive data'
+                    }
+                ]
+            },
+            'python': {
+                'input_validation': [
+                    {
+                        'rule': 'Command Injection',
+                        'pattern': r'os\.system\(.*\+',
+                        'severity': 'HIGH',
+                        'description': 'Potential command injection through os.system'
+                    },
+                    {
+                        'rule': 'SQL Injection - Python',
+                        'pattern': r'cursor\.execute\(.*%.*\)',
+                        'severity': 'HIGH',
+                        'description': 'SQL injection risk in cursor.execute with string formatting'
+                    },
+                    {
+                        'rule': 'Eval Usage',
+                        'pattern': r'eval\s*\(',
+                        'severity': 'HIGH',
+                        'description': 'Use of eval() can lead to code injection'
+                    },
+                    {
+                        'rule': 'Pickle Deserialization',
+                        'pattern': r'pickle\.loads?\(',
+                        'severity': 'HIGH',
+                        'description': 'Unsafe pickle deserialization'
+                    }
+                ],
+                'file_handling': [
+                    {
+                        'rule': 'Path Traversal',
+                        'pattern': r'open\s*\(.*\+.*\)',
+                        'severity': 'MEDIUM',
+                        'description': 'Potential path traversal in file operations'
+                    }
+                ]
+            },
+            'javascript': {
+                'input_validation': [
+                    {
+                        'rule': 'XSS Vulnerability',
+                        'pattern': r'innerHTML\s*=.*\+',
+                        'severity': 'HIGH',
+                        'description': 'Potential XSS through innerHTML manipulation'
+                    },
+                    {
+                        'rule': 'Eval Usage',
+                        'pattern': r'eval\s*\(',
+                        'severity': 'HIGH',
+                        'description': 'Use of eval() can lead to code injection'
+                    },
+                    {
+                        'rule': 'Document.write XSS',
+                        'pattern': r'document\.write\s*\(',
+                        'severity': 'MEDIUM',
+                        'description': 'document.write can lead to XSS vulnerabilities'
+                    }
+                ],
+                'authentication': [
+                    {
+                        'rule': 'Weak Random',
+                        'pattern': r'Math\.random\s*\(\s*\)',
+                        'severity': 'MEDIUM',
+                        'description': 'Math.random() is not cryptographically secure'
+                    }
+                ]
+            },
+            'java': {
+                'input_validation': [
+                    {
+                        'rule': 'SQL Injection - Java',
+                        'pattern': r'Statement.*executeQuery\(.*\+',
+                        'severity': 'HIGH',
+                        'description': 'SQL injection risk with Statement concatenation'
+                    },
+                    {
+                        'rule': 'Path Traversal - Java',
+                        'pattern': r'new\s+File\s*\(.*\+',
+                        'severity': 'MEDIUM',
+                        'description': 'Potential path traversal with File constructor'
+                    }
+                ],
+                'deserialization': [
+                    {
+                        'rule': 'Unsafe Deserialization',
+                        'pattern': r'ObjectInputStream.*readObject',
+                        'severity': 'HIGH',
+                        'description': 'Unsafe object deserialization'
+                    }
+                ]
+            },
+            'php': {
+                'input_validation': [
+                    {
+                        'rule': 'SQL Injection - PHP',
+                        'pattern': r'mysql_query\s*\(.*\$',
+                        'severity': 'HIGH',
+                        'description': 'SQL injection risk with mysql_query'
+                    },
+                    {
+                        'rule': 'Code Injection - PHP',
+                        'pattern': r'eval\s*\(\s*\$',
+                        'severity': 'HIGH',
+                        'description': 'Code injection risk with eval()'
+                    },
+                    {
+                        'rule': 'File Inclusion',
+                        'pattern': r'include\s*\(\s*\$|require\s*\(\s*\$',
+                        'severity': 'HIGH',
+                        'description': 'File inclusion vulnerability'
+                    }
+                ]
+            }
+        }
+    
+    def _load_programming_rules(self) -> Dict:
+        """Load comprehensive programming best practices and quality rules"""
+        return {
+            'common': {
+                'code_quality': [
+
+                    {
+                        'rule': 'Long Line Length',
+                        'pattern': r'^.{121,}$',
+                        'severity': 'LOW',
+                        'description': 'Line length exceeds 120 characters - consider breaking into smaller lines'
+                    },
+                    {
+                        'rule': 'TODO Comments',
+                        'pattern': r'(TODO|FIXME|HACK|XXX)',
+                        'severity': 'LOW',
+                        'description': 'TODO/FIXME comment found - consider addressing or tracking as issue'
+                    },
+                    {
+                        'rule': 'Commented Code',
+                        'pattern': r'^\s*#.*[=\(\)\[\]{}].*$',
+                        'severity': 'LOW',
+                        'description': 'Commented-out code found - consider removing if no longer needed'
+                    }
+                ],
+                'naming_conventions': [
+
+
+                ],
+                'error_handling': [
+                    {
+                        'rule': 'Empty Catch Block',
+                        'pattern': r'(catch|except).*:\s*pass\s*$|catch.*\{\s*\}',
+                        'severity': 'HIGH',
+                        'description': 'Empty catch/except block - errors should be handled properly'
+                    },
+                    {
+                        'rule': 'Generic Exception Catch',
+                        'pattern': r'except\s*:\s*|catch\s*\(\s*Exception\s*\)',
+                        'severity': 'MEDIUM',
+                        'description': 'Catching generic exceptions - be more specific about exception types'
+                    }
+                ],
+                'performance': [
+                    {
+                        'rule': 'String Concatenation in Loop',
+                        'pattern': r'(for|while).*\+.*[\'"]|[\'"].*\+.*(for|while)',
+                        'severity': 'MEDIUM',
+                        'description': 'String concatenation in loop - consider using join() or StringBuilder'
+                    },
+                    {
+                        'rule': 'Inefficient List Operations',
+                        'pattern': r'\.append\(.*\).*for.*in.*range',
+                        'severity': 'LOW',
+                        'description': 'Consider using list comprehension for better performance'
+                    }
+                ]
+            },
+            'python': {
+                'code_quality': [
+                    {
+                        'rule': 'Missing Docstrings',
+                        'pattern': r'(def|class)\s+\w+.*:\s*(?![\s]*[\'\"]{3})',
+                        'severity': 'LOW',
+                        'description': 'Function/class missing docstring documentation'
+                    },
+                    {
+                        'rule': 'Unused Import',
+                        'pattern': r'import\s+(\w+)(?!.*\1)',
+                        'severity': 'LOW',
+                        'description': 'Potentially unused import statement'
+                    },
+                    {
+                        'rule': 'Star Import',
+                        'pattern': r'from\s+\w+\s+import\s+\*',
+                        'severity': 'MEDIUM',
+                        'description': 'Avoid star imports - import specific items instead'
+                    },
+                    {
+                        'rule': 'Complex Function',
+                        'pattern': r'def\s+\w+.*:(?:[^def]){500,}',
+                        'severity': 'MEDIUM',
+                        'description': 'Function appears too long/complex - consider breaking into smaller functions'
+                    }
+                ],
+                'naming_conventions': [
+
+                ],
+                'pythonic_practices': [
+                    {
+                        'rule': 'Not Using Enumerate',
+                        'pattern': r'for\s+\w+\s+in\s+range\(len\(',
+                        'severity': 'LOW',
+                        'description': 'Consider using enumerate() instead of range(len())'
+                    },
+                    {
+                        'rule': 'Not Using Context Manager',
+                        'pattern': r'open\s*\([^)]*\)(?!\s*as\s+\w+:)',
+                        'severity': 'MEDIUM',
+                        'description': 'Use context manager (with statement) for file operations'
+                    },
+                    {
+                        'rule': 'Mutable Default Arguments',
+                        'pattern': r'def\s+\w+.*=\s*(\[\]|\{\})',
+                        'severity': 'HIGH',
+                        'description': 'Mutable default arguments can cause unexpected behavior'
+                    }
+                ],
+                'type_hints': [
+                    {
+                        'rule': 'Missing Type Hints',
+                        'pattern': r'def\s+\w+\s*\([^)]*\)\s*:(?!\s*->)',
+                        'severity': 'LOW',
+                        'description': 'Consider adding type hints for better code documentation'
+                    }
+                ]
+            },
+            'javascript': {
+                'code_quality': [
+                    {
+                        'rule': 'Var Usage',
+                        'pattern': r'\bvar\s+\w+',
+                        'severity': 'MEDIUM',
+                        'description': 'Use let or const instead of var for better scoping'
+                    },
+                    {
+                        'rule': 'Missing Semicolons',
+                        'pattern': r'[^;\s]\s*\n\s*[^{}]',
+                        'severity': 'LOW',
+                        'description': 'Consider adding semicolons for consistency'
+                    },
+                    {
+                        'rule': 'Double Equals',
+                        'pattern': r'[^=!]==[^=]',
+                        'severity': 'MEDIUM',
+                        'description': 'Use === instead of == for strict equality comparison'
+                    },
+                    {
+                        'rule': 'Console.log in Production',
+                        'pattern': r'console\.log\s*\(',
+                        'severity': 'LOW',
+                        'description': 'Remove console.log statements before production deployment'
+                    }
+                ],
+                'modern_javascript': [
+                    {
+                        'rule': 'Arrow Function Opportunities',
+                        'pattern': r'function\s*\([^)]*\)\s*\{[^}]{1,50}\}',
+                        'severity': 'LOW',
+                        'description': 'Consider using arrow functions for short functions'
+                    },
+                    {
+                        'rule': 'Template Literal Opportunities',
+                        'pattern': r'[\'"][^\'\"]*\"\s*\+\s*\w+\s*\+\s*[\'"]',
+                        'severity': 'LOW',
+                        'description': 'Consider using template literals instead of string concatenation'
+                    }
+                ],
+                'async_patterns': [
+                    {
+                        'rule': 'Callback Hell',
+                        'pattern': r'function\s*\([^)]*\)\s*\{[^}]*function\s*\([^)]*\)\s*\{[^}]*function',
+                        'severity': 'HIGH',
+                        'description': 'Nested callbacks detected - consider using Promises or async/await'
+                    },
+                    {
+                        'rule': 'Missing Async Error Handling',
+                        'pattern': r'async\s+function[^{]*\{(?![^}]*try)[^}]*await',
+                        'severity': 'MEDIUM',
+                        'description': 'Async functions should include proper error handling'
+                    }
+                ]
+            },
+            'java': {
+                'code_quality': [
+                    {
+                        'rule': 'System.out.println in Production',
+                        'pattern': r'System\.out\.print',
+                        'severity': 'LOW',
+                        'description': 'Use proper logging instead of System.out.println'
+                    },
+
+                ],
+                'best_practices': [
+                    {
+                        'rule': 'Non-Final Static Fields',
+                        'pattern': r'static\s+(?!final)\w+\s+\w+',
+                        'severity': 'MEDIUM',
+                        'description': 'Static fields should typically be final'
+                    },
+                    {
+                        'rule': 'String Equality with ==',
+                        'pattern': r'==\s*[\'"]|[\'\"]\s*==',
+                        'severity': 'HIGH',
+                        'description': 'Use .equals() method for string comparison, not =='
+                    }
+                ]
+            },
+            'csharp': {
+                'code_quality': [
+                    {
+                        'rule': 'Console.WriteLine in Production',
+                        'pattern': r'Console\.WriteLine',
+                        'severity': 'LOW',
+                        'description': 'Use proper logging instead of Console.WriteLine'
+                    },
+                    {
+                        'rule': 'Non-Async Method Names',
+                        'pattern': r'async\s+\w+\s+\w+(?!Async)\s*\(',
+                        'severity': 'LOW',
+                        'description': 'Async methods should end with "Async" suffix'
+                    }
+                ],
+                'best_practices': [
+                    {
+                        'rule': 'String Concatenation Performance',
+                        'pattern': r'string\s+\w+\s*=.*\+.*\+',
+                        'severity': 'MEDIUM',
+                        'description': 'Consider using StringBuilder for multiple string concatenations'
+                    }
+                ]
+            }
+        }
+    
+    def validate_code(self, language: str, content: str) -> List[Dict]:
+        """Validate code against both OWASP security rules and programming best practices"""
+        violations = []
+        
+        # Check OWASP security rules
+        violations.extend(self._check_rules(content, self.security_rules['common'], 'SECURITY'))
+        if language in self.security_rules:
+            violations.extend(self._check_rules(content, self.security_rules[language], 'SECURITY'))
+        
+        # Check programming best practices
+        violations.extend(self._check_rules(content, self.programming_rules['common'], 'QUALITY'))
+        if language in self.programming_rules:
+            violations.extend(self._check_rules(content, self.programming_rules[language], 'QUALITY'))
+        
+        return violations
+    
+    def _check_rules(self, content: str, rule_categories: Dict, rule_type: str = 'SECURITY') -> List[Dict]:
+        """Check content against a set of rules"""
+        violations = []
+        
+        for category, rules in rule_categories.items():
+            for rule in rules:
+                matches = list(re.finditer(rule['pattern'], content, re.IGNORECASE | re.MULTILINE))
+                for match in matches:
+                    line_number = content[:match.start()].count('\n') + 1
+                    violations.append({
+                        'category': category,
+                        'rule': rule['rule'],
+                        'severity': rule['severity'],
+                        'description': rule['description'],
+                        'line_number': line_number,
+                        'matched_text': match.group(0),
+                        'position': match.span(),
+                        'rule_type': rule_type  # NEW: Track whether this is security or quality rule
+                        })
+        
+        return violations
+
+def load_guidelines_file(file_path: str) -> Optional[str]:
+    """Load coding guidelines from guidelines.txt file."""
+    path = Path(file_path)
+    if not path.exists():
+        logger.error(f"Guidelines file not found: {file_path}")
+        return None
+    
+    try:
+        return path.read_text(encoding="utf-8", errors="ignore")
+    except Exception as e:
+        logger.error(f"Failed to read guidelines file {file_path}: {e}")
+        return None
+
+
+def load_multiple_guidelines_files(file_paths: List[str]) -> Optional[str]:
+    """Load coding guidelines from guidelines.txt file (simplified to single file)."""
+    if not file_paths:
+        return None
+    
+    # Since we only support guidelines.txt now, just load the first file
+    guidelines_path = file_paths[0] if file_paths else "guidelines.txt"
+    logger.info(f"Loading guidelines from: {guidelines_path}")
+    
+    guidelines_content = load_guidelines_file(guidelines_path)
+    
+    if guidelines_content:
+        logger.info(f"Successfully loaded guidelines from {guidelines_path} ({len(guidelines_content)} chars)")
+        return guidelines_content
+    else:
+        logger.warning(f"Failed to load guidelines from {guidelines_path}")
+        return None
+
+
+def parse_guidelines_input(guidelines_input: str) -> List[str]:
+    """Parse guidelines input - simplified to use only guidelines.txt."""
+    if not guidelines_input or not guidelines_input.strip():
+        return ["guidelines.txt"]  # Default to guidelines.txt
+    
+    # Clean up the path
+    path = guidelines_input.strip().strip('"').strip("'")
+    return [path] if path else ["guidelines.txt"]
+
+
+
+class SecurityReportGenerator:
+    """Generate security validation reports"""
+    
+    def __init__(self, output_dir: str):
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(exist_ok=True)
+    
+    def generate_report(self, file_path: str, language: str, violations: List[Dict], 
+                       content_hash: str, format_type: str = 'json', mode: str = 'simple',
+                       llm_metadata: Dict = None) -> str:
+        """Generate security validation report"""
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        file_name = Path(file_path).stem
+        
+        report_data = {
+            'scan_info': {
+                'file_path': file_path,
+                'file_name': file_name,
+                'language': language,
+                'scan_timestamp': datetime.now().isoformat(),
+                'content_hash': content_hash,
+                'total_violations': len(violations),
+                'validation_mode': mode
+            },
+            'severity_summary': self._get_severity_summary(violations),
+            'category_summary': self._get_category_summary(violations),
+            'violations': violations,
+            'recommendations': self._get_recommendations(language, violations, mode)
+        }
+        
+        # Add LLM-specific metadata if available
+        if llm_metadata and mode == 'llm':
+            report_data['llm_analysis'] = llm_metadata
+        
+        mode_suffix = f"_{mode}" if mode != 'simple' else ""
+        
+        if format_type.lower() == 'json':
+            report_filename = f"{file_name}_{timestamp}{mode_suffix}.json"
+            report_path = self.output_dir / report_filename
+            
+            with open(report_path, 'w', encoding='utf-8') as f:
+                json.dump(report_data, f, indent=2, ensure_ascii=False)
+        
+        else:  # txt format
+            report_filename = f"{file_name}_{timestamp}{mode_suffix}.txt"
+            report_path = self.output_dir / report_filename
+            
+            with open(report_path, 'w', encoding='utf-8') as f:
+                f.write(self._format_text_report(report_data, mode))
+        
+        return str(report_path)
+    
+    def _get_severity_summary(self, violations: List[Dict]) -> Dict:
+        """Get summary of violations by severity and type"""
+        summary = {
+            'HIGH': {'total': 0, 'security': 0, 'quality': 0},
+            'MEDIUM': {'total': 0, 'security': 0, 'quality': 0},
+            'LOW': {'total': 0, 'security': 0, 'quality': 0}
+        }
+        for violation in violations:
+            severity = violation.get('severity', 'LOW')
+            rule_type = violation.get('rule_type', 'SECURITY').lower()
+            summary[severity]['total'] += 1
+            summary[severity][rule_type] = summary[severity].get(rule_type, 0) + 1
+        return summary
+    
+    def _get_category_summary(self, violations: List[Dict]) -> Dict:
+        """Get summary of violations by category and type"""
+        summary = {}
+        for violation in violations:
+            category = violation.get('category', 'unknown')
+            rule_type = violation.get('rule_type', 'SECURITY')
+            category_key = f"{category} ({rule_type})"
+            summary[category_key] = summary.get(category_key, 0) + 1
+        return summary
+    
+    def _get_recommendations(self, language: str, violations: List[Dict], mode: str = 'simple') -> List[str]:
+        """Get security and quality recommendations based on violations"""
+        recommendations = []
+        
+        # Security-specific recommendations
+        security_violations = [v for v in violations if v.get('rule_type') == 'SECURITY']
+        quality_violations = [v for v in violations if v.get('rule_type') == 'QUALITY']
+        
+        if any(v['severity'] == 'HIGH' for v in violations):
+            recommendations.append("=4 Address HIGH severity issues immediately")
+        
+        # Security recommendations
+        if security_violations:
+            recommendations.append("=SECURITY RECOMMENDATIONS:")
+            
+            if any('SQL' in v['rule'] for v in security_violations):
+                recommendations.append(" Use parameterized queries to prevent SQL injection")
+            
+            if any('XSS' in v['rule'] for v in security_violations):
+                recommendations.append(" Sanitize and validate all user inputs to prevent XSS")
+            
+            if any('eval' in v['rule'].lower() for v in security_violations):
+                recommendations.append(" Avoid using eval() functions - use safer alternatives")
+            
+            if any('password' in v['rule'].lower() for v in security_violations):
+                recommendations.append(" Store credentials securely using environment variables or secure vaults")
+            
+            recommendations.append(" Implement input validation for all user-provided data")
+            recommendations.append(" Use HTTPS for all data transmission")
+            recommendations.append(" Implement proper error handling to avoid information disclosure")
+        
+        # Quality recommendations
+        if quality_violations:
+            recommendations.append("CODE QUALITY RECOMMENDATIONS:")
+            
+
+            
+            if any('TODO' in v['rule'] for v in quality_violations):
+                recommendations.append(" Address TODO/FIXME comments or track them as issues")
+            
+            if any('Docstring' in v['rule'] for v in quality_violations):
+                recommendations.append(" Add docstrings to functions and classes for better documentation")
+            
+            if any('Type Hints' in v['rule'] for v in quality_violations):
+                recommendations.append(" Add type hints for better code clarity and IDE support")
+            
+            if any('Complex Function' in v['rule'] for v in quality_violations):
+                recommendations.append(" Break down complex functions into smaller, more manageable pieces")
+            
+            if language == 'python':
+                if any('Context Manager' in v['rule'] for v in quality_violations):
+                    recommendations.append(" Use context managers (with statements) for file operations")
+                if any('enumerate' in v['rule'].lower() for v in quality_violations):
+                    recommendations.append(" Use enumerate() instead of range(len()) for cleaner code")
+            
+            elif language == 'javascript':
+                if any('var' in v['rule'].lower() for v in quality_violations):
+                    recommendations.append(" Use let/const instead of var for better scoping")
+                if any('===' in v['description'] for v in quality_violations):
+                    recommendations.append(" Use === for strict equality comparisons")
+        
+        # Add LLM-specific recommendations if available
+        if mode == 'llm':
+            llm_recommendations = set()
+            for violation in violations:
+                if 'llm_analysis' in violation and violation['llm_analysis'].get('remediation'):
+                    llm_recommendations.add(violation['llm_analysis']['remediation'])
+            if llm_recommendations:
+                recommendations.append("LLM ANALYSIS RECOMMENDATIONS:")
+                recommendations.extend([f"   {rec}" for rec in llm_recommendations])
+        
+        return recommendations
+    
+    def _format_text_report(self, report_data: Dict, mode: str = 'simple') -> str:
+        """Format report data as text"""
+        lines = []
+        lines.append("=" * 80)
+        lines.append("COMPREHENSIVE CODE VALIDATION REPORT")
+        lines.append("(OWASP Security + Programming Best Practices)")
+        if mode == 'llm':
+            lines.append("(LLM-Enhanced Analysis)")
+        lines.append("=" * 80)
+        lines.append("")
+        
+        # Scan Info
+        scan_info = report_data['scan_info']
+        lines.append("SCAN INFORMATION:")
+        lines.append("-" * 40)
+        lines.append(f"File: {scan_info['file_path']}")
+        lines.append(f"Language: {scan_info['language']}")
+        lines.append(f"Validation Mode: {scan_info.get('validation_mode', 'simple')}")
+        lines.append(f"Scan Time: {scan_info['scan_timestamp']}")
+        lines.append(f"Total Violations: {scan_info['total_violations']}")
+        
+        # Add LLM analysis summary if available
+        if mode == 'llm' and 'llm_analysis' in report_data:
+            llm_data = report_data['llm_analysis']
+            lines.append(f"Risk Score: {llm_data.get('risk_score', 'N/A')}/10")
+            lines.append(f"LLM Provider: {llm_data.get('provider', 'Unknown')}")
+            if llm_data.get('overall_assessment'):
+                lines.append(f"Assessment: {llm_data['overall_assessment']}")
+        
+        lines.append("")
+        
+        # Severity Summary
+        lines.append("SEVERITY SUMMARY:")
+        lines.append("-" * 40)
+        for severity, counts in report_data['severity_summary'].items():
+            if isinstance(counts, dict):
+                total = counts.get('total', 0)
+                security = counts.get('security', 0)
+                quality = counts.get('quality', 0)
+                lines.append(f"{severity}: {total} (Security: {security}, Quality: {quality})")
+            else:
+                lines.append(f"{severity}: {counts}")
+        lines.append("")
+        
+        # Category Summary
+        lines.append("CATEGORY SUMMARY:")
+        lines.append("-" * 40)
+        for category, count in report_data['category_summary'].items():
+            lines.append(f"{category}: {count}")
+        lines.append("")
+        
+        # Violations
+        if report_data['violations']:
+            lines.append("DETAILED VIOLATIONS:")
+            lines.append("-" * 40)
+            for i, violation in enumerate(report_data['violations'], 1):
+                lines.append(f"{i}. {violation['rule']} (Line {violation['line_number']})")
+                lines.append(f"   Type: {violation.get('rule_type', 'SECURITY')}")
+                lines.append(f"   Severity: {violation['severity']}")
+                lines.append(f"   Category: {violation['category']}")
+                lines.append(f"   Description: {violation['description']}")
+                if violation.get('matched_text'):
+                    lines.append(f"   Code: {violation['matched_text']}")
+                
+                # Add LLM-specific details if available
+                if mode == 'llm' and 'llm_analysis' in violation:
+                    llm_analysis = violation['llm_analysis']
+                    if llm_analysis.get('cwe_id'):
+                        lines.append(f"   CWE ID: {violation.get('cwe_id', 'N/A')}")
+                    if llm_analysis.get('impact'):
+                        lines.append(f"   Impact: {violation.get('impact', 'N/A')}")
+                    if llm_analysis.get('remediation'):
+                        lines.append(f"   Remediation: {violation.get('remediation', 'N/A')}")
+                
+                lines.append("")
+        
+        # Recommendations
+        lines.append("RECOMMENDATIONS:")
+        lines.append("-" * 40)
+        for i, rec in enumerate(report_data['recommendations'], 1):
+            lines.append(f"{i}. {rec}")
+        
+        # Add LLM compliance notes if available
+        if mode == 'llm' and 'llm_analysis' in report_data:
+            llm_data = report_data['llm_analysis']
+            if llm_data.get('compliance_notes'):
+                lines.append("")
+                lines.append("COMPLIANCE NOTES:")
+                lines.append("-" * 40)
+                lines.append(llm_data['compliance_notes'])
+        
+        lines.append("")
+        lines.append("=" * 80)
+        lines.append("End of Report")
+        lines.append("=" * 80)
+        
+        return "\n".join(lines)
+
+class SecureCodeValidator:
+    """Main class for secure code validation with support for simple and LLM modes"""
+    
+    def __init__(self, output_dir: str = "secure_code_validation", mode: str = "simple", llm_config: Dict = None, guidelines_text: str = None):
+        self.mode = mode
+        self.language_detector = LanguageDetector()
+        self.code_validator = ComprehensiveCodeValidator()
+        self.report_generator = SecurityReportGenerator(output_dir)
+        self.guidelines_text = guidelines_text  # NEW: store guidelines
+        
+        # Initialize LLM validator if in LLM or hybrid mode
+        self.llm_validator = None
+        if mode in ["llm", "hybrid"]:
+            
+            print("\n=� Initializing Secure Code Validator with LLM")
+            print("=" * 50)
+            
+            try:
+                if llm_config:
+                    config = llm_config.get('config', {})
+                    
+                    print("\nAzure OpenAI Configuration:")
+                    print(f"   Endpoint: {config.get('endpoint', 'Not configured')}")
+                    print(f"   Deployment: {config.get('deployment_name', 'Not configured')}")
+                    print(f"   API Version: {config.get('api_version', '2024-02-15-preview')}")
+                    print(f"   API Key: {'Available' if config.get('api_key') else 'Missing'}")
+                    
+                    print("\n=🔧 Initializing Built-in LLM Client...")
+                    self.llm_client = SimpleLLMClient(config)
+                    
+                    if self.llm_client.is_configured():
+                        self.llm_validator = LLMSecurityValidator(self.llm_client, guidelines_text)
+                        print(f"✓ LLM Client initialized with {self.llm_client.get_provider_name()}")
+                        logger.info(f"LLM validator initialized with {self.llm_client.get_provider_name()}")
+                        print(f"\n✓ Secure Code Validator Ready (Mode: {mode})")
+                    else:
+                        print("✗ LLM client configuration incomplete")
+                        self.llm_validator = None
+                        
+                        # In hybrid mode, fall back to simple mode
+                        if self.mode == "hybrid":
+                            logger.warning("LLM configuration incomplete. Hybrid mode falling back to simple validation only.")
+                            self.mode = "simple"
+                            return
+                        else:  # LLM mode
+                            raise ValueError("LLM mode requested but configuration is incomplete")
+                else:
+                    raise ValueError("LLM mode requested but no configuration provided")
+                
+            except Exception as e:
+                print(f"✗ LLM Client failed: {str(e)}")
+                logger.error(f"Failed to initialize LLM validator: {e}")
+                if mode == "llm":
+                    raise
+                elif mode == "hybrid":
+                    logger.warning("LLM initialization failed. Hybrid mode falling back to simple validation only.")
+                    self.mode = "simple"
+    
+    def validate_file(self, file_path: str, output_format: str = 'json') -> Dict:
+        """Validate a single file"""
+        try:
+            # Read file content
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                content = f.read()
+            
+            # Generate content hash
+            content_hash = hashlib.sha256(content.encode('utf-8')).hexdigest()[:16]
+            
+            # Detect language
+            language = self.language_detector.detect_language(file_path, content)
+            
+            # Validate security based on mode
+            violations = []
+            llm_metadata = None
+            
+            if self.mode == "simple":
+                violations = self.code_validator.validate_code(language, content)
+            
+            elif self.mode == "llm":
+                if self.llm_validator:
+                    llm_result = self.llm_validator.validate_code(
+                        language, content, Path(file_path).name, self.guidelines_text
+                    )
+                    violations = llm_result.get('violations', [])
+                    llm_metadata = llm_result.get('llm_metadata')
+                else:
+                    logger.warning("LLM validator not available, falling back to simple mode")
+                    violations = self.code_validator.validate_code(language, content)
+            
+            elif self.mode == "hybrid":
+                simple_violations = self.code_validator.validate_code(language, content)
+                if self.llm_validator:
+                    llm_result = self.llm_validator.validate_code(
+                        language, content, Path(file_path).name, self.guidelines_text
+                    )
+                    llm_violations = llm_result.get('violations', [])
+                    llm_metadata = llm_result.get('llm_metadata')
+                    
+                    # Combine violations (LLM violations take precedence)
+                    violations = llm_violations + simple_violations
+                    llm_metadata['simple_violations_count'] = len(simple_violations)
+                else:
+                    violations = simple_violations
+                    logger.warning("LLM validator not available in hybrid mode, using simple mode only")
+            
+            # Generate report
+            report_path = self.report_generator.generate_report(
+                file_path, language, violations, content_hash, output_format, self.mode, llm_metadata
+            )
+            
+            return {
+                'success': True,
+                'file_path': file_path,
+                'language': language,
+                'violations_count': len(violations),
+                'report_path': report_path,
+                'content_hash': content_hash,
+                'validation_mode': self.mode,
+                'llm_metadata': llm_metadata
+            }
+            
+        except Exception as e:
+            logger.error(f"Error validating file {file_path}: {str(e)}")
+            return {
+                'success': False,
+                'file_path': file_path,
+                'error': str(e),
+                'validation_mode': self.mode
+            }
+    
+    def validate_directory(self, directory_path: str, recursive: bool = True, 
+                          output_format: str = 'json') -> List[Dict]:
+        """Validate all code files in a directory"""
+        results = []
+        directory = Path(directory_path)
+        
+        # Common code file extensions
+        code_extensions = {'.py', '.js', '.jsx', '.ts', '.tsx', '.java', '.cs', 
+                          '.cpp', '.c', '.h', '.hpp', '.php', '.rb', '.go', '.sql'}
+        
+        # Log the scanning mode
+        scan_mode = "recursively" if recursive else "non-recursive"
+        logger.info(f"Scanning directory {directory} {scan_mode}")
+        
+        if recursive:
+            files = directory.rglob('*')
+        else:
+            files = directory.iterdir()
+        
+        # Count directories and files for better feedback
+        scanned_dirs = set()
+        
+        for file_path in files:
+            if file_path.is_file() and file_path.suffix.lower() in code_extensions:
+                # Track directories being scanned
+                parent_dir = file_path.parent
+                if recursive and parent_dir != directory:
+                    scanned_dirs.add(str(parent_dir.relative_to(directory)))
+                
+                result = self.validate_file(str(file_path), output_format)
+                results.append(result)
+                
+                if result['success']:
+                    mode_info = f" ({result['validation_mode']})" if result.get('validation_mode') else ""
+                    relative_path = file_path.relative_to(directory)
+                    logger.info(f"Validated {relative_path}{mode_info}: {result['violations_count']} violations found")
+                else:
+                    relative_path = file_path.relative_to(directory)
+                    logger.error(f"Failed to validate {relative_path}: {result['error']}")
+        
+        # Log summary of scanned directories
+        if recursive and scanned_dirs:
+            logger.info(f"Recursively scanned {len(scanned_dirs)} subdirectories: {', '.join(sorted(scanned_dirs))}")
+        
+        return results
+
+    def validate_path(self, input_path: str, output_format: str = 'json') -> List[Dict]:
+        """Validate a file or directory path automatically"""
+        path = Path(input_path)
+        
+        if not path.exists():
+            logger.error(f"Path does not exist: {input_path}")
+            return [{
+                'success': False,
+                'path': input_path,
+                'error': 'Path does not exist',
+                'validation_mode': self.mode
+            }]
+        
+        if path.is_file():
+            logger.info(f"Validating single file: {input_path}")
+            result = self.validate_file(str(path), output_format)
+            return [result]
+        
+        elif path.is_dir():
+            logger.info(f"Validating directory: {input_path}")
+            results = self.validate_directory(str(path), recursive=True, output_format=output_format)
+            
+            # Log summary
+            total_files = len(results)
+            successful_validations = len([r for r in results if r.get('success', False)])
+            total_violations = sum(r.get('violations_count', 0) for r in results if r.get('success', False))
+            
+            logger.info(f"Directory validation complete: {successful_validations}/{total_files} files processed")
+            logger.info(f"Total violations found: {total_violations}")
+            
+            return results
+        
+        else:
+            logger.error(f"Invalid path type: {input_path}")
+            return [{
+                'success': False,
+                'path': input_path,
+                'error': 'Invalid path type (not a file or directory)',
+                'validation_mode': self.mode
+            }]
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Comprehensive Code Validation Tool")
+    parser.add_argument("input_path", nargs='?', default="generated_backend_enhanced", 
+                       help="Path to file or directory containing code to validate (default: generated_backend_enhanced)")
+    parser.add_argument("--mode", choices=["simple", "llm", "hybrid"], default="simple", help="Validation mode")
+    parser.add_argument("--output-dir", default="secure_code_validation", help="Directory to store reports")
+
+    parser.add_argument("--guidelines", type=str, 
+                       help="Path to coding guidelines text file (guidelines.txt). "
+                            "Only plain text format is supported.")
+    parser.add_argument('--format', choices=['json', 'txt'], default='json',
+                       help='Output format for reports (default: json)')
+    parser.add_argument('--recursive', action='store_true', default=True,
+                       help='Recursively scan directories (DEFAULT: enabled)')
+    parser.add_argument('--no-recursive', dest='recursive', action='store_false',
+                       help='Disable recursive scanning (scan only top-level directory)')
+    args = parser.parse_args()
+
+    # Load guidelines if provided
+    guidelines_text = None
+    if args.guidelines and args.mode in ["llm", "hybrid"]:
+        guidelines_paths = parse_guidelines_input(args.guidelines)
+        if guidelines_paths:
+            guidelines_text = load_multiple_guidelines_files(guidelines_paths)
+            if guidelines_text:
+                logger.info(f"Successfully loaded combined guidelines ({len(guidelines_text)} chars)")
+            else:
+                logger.warning("No guidelines could be loaded from the specified files")
+        else:
+            logger.warning("No valid guidelines paths found in input")
+
+    # Check if using default path and provide helpful message
+    path = Path(args.input_path)
+    is_default_path = args.input_path == "generated_backend_enhanced"
+    
+    if not path.exists():
+        if is_default_path:
+            logger.error(f"Default path does not exist: {args.input_path}")
+            print("The default validation target 'generated_backend_enhanced' was not found.")
+            print("Either:")
+            print("1. Run the backend code generation first to create this directory")
+            print("2. Specify a different path: python secure_code_validation_enhanced.py <your_path>")
+            print("3. Create some code files to validate in the current directory")
+        else:
+            logger.error(f"Path does not exist: {args.input_path}")
+        return
+
+    # Load LLM configuration from .env and Azure Key Vault (no separate config file needed)
+    llm_config = None
+    if args.mode in ["llm", "hybrid"]:
+        import os
+        
+        # Get configuration from environment variables (.env file)
+        azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
+        azure_deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME") or os.getenv("AZURE_OPENAI_DEPLOYMENT")
+        azure_api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-15-preview")
+        
+        # Get API key from Azure Key Vault (with fallback to environment)
+        azure_api_key = get_azure_openai_api_key_from_keyvault()
+        if not azure_api_key:
+            azure_api_key = os.getenv("AZURE_OPENAI_API_KEY")
+            logger.info("Using API key from environment variable")
+        else:
+            logger.info("Using API key from Azure Key Vault")
+        
+        if azure_endpoint and azure_api_key:
+            config = {
+                "api_key": azure_api_key,
+                "endpoint": azure_endpoint,
+                "api_version": azure_api_version
+            }
+            # Only add deployment_name if present
+            if azure_deployment:
+                config["deployment_name"] = azure_deployment
+
+            llm_config = {
+                "provider": "azure_openai",
+                "config": config
+            }
+            logger.info(f"LLM config loaded from environment (.env) and Azure Key Vault")
+            logger.info(f"Endpoint: {azure_endpoint}")
+            logger.info(f"Deployment: {azure_deployment or 'Not specified'}")
+            logger.info(f"API Version: {azure_api_version}")
+        else:
+            logger.warning("Missing required Azure OpenAI configuration for LLM mode.")
+            logger.warning(f"Required: AZURE_OPENAI_ENDPOINT ({'✓' if azure_endpoint else '✗'}), API Key ({'✓' if azure_api_key else '✗'})")
+            
+            # In hybrid mode, continue with simple mode if LLM config is missing
+            if args.mode == "hybrid":
+                logger.info("Hybrid mode: Falling back to simple validation mode only")
+                args.mode = "simple"
+
+    try:
+        validator = SecureCodeValidator(args.output_dir, args.mode, llm_config, guidelines_text)
+        
+        # Print detailed header like in old version
+        print("\n" + "=" * 80)
+        print("COMPREHENSIVE CODE VALIDATION TOOL")
+        print("(OWASP Security + Programming Best Practices)")
+        if args.mode == 'llm':
+            print("(LLM-Enhanced Analysis)")
+        elif args.mode == 'hybrid':
+            print("(Hybrid: Pattern-based + LLM Analysis)")
+        print("=" * 80)
+        print(f"   Mode: {args.mode.upper()}")
+        if args.mode in ['llm', 'hybrid'] and validator.llm_validator:
+            print(f"   LLM: {validator.llm_validator.llm_client.get_provider_name()}")
+        print(f"   Format: {args.format}")
+        if is_default_path:
+            print(f"   Target: {args.input_path} (default)")
+        else:
+            print(f"   Target: {args.input_path}")
+        if args.guidelines:
+            print(f"   Guidelines: {args.guidelines}")
+        if path.is_dir():
+            scan_mode = "Recursive" if args.recursive else "Non-recursive"
+            print(f"   Directory Scan: {scan_mode}")
+        print("=" * 80)
+        
+        if path.is_file():
+            # Validate single file
+            print(f"\n[VALIDATING SINGLE FILE: {path.name}]")
+            result = validator.validate_file(str(path), args.format)
+            
+            if result['success']:
+                print(f"\n[SUCCESS] Validation completed")
+                print(f"   File: {path.name}")
+                print(f"   Language: {result['language']}")
+                print(f"   Mode: {result['validation_mode']}")
+                print(f"   Violations: {result['violations_count']}")
+                print(f"   Report: {result['report_path']}")
+                
+                if result.get('llm_metadata'):
+                    llm_data = result['llm_metadata']
+                    if llm_data.get('risk_score'):
+                        print(f"   Risk Score: {llm_data['risk_score']}/10")
+                    if llm_data.get('overall_assessment'):
+                        print(f"   Assessment: {llm_data['overall_assessment']}")
+                
+                # Show violation breakdown if any
+                if result['violations_count'] > 0:
+                    print(f"\n[VIOLATION DETAILS]")
+                    try:
+                        with open(result['report_path'], 'r', encoding='utf-8') as f:
+                            report_data = json.load(f)
+                        
+                        severity_summary = report_data.get('severity_summary', {})
+                        for severity, counts in severity_summary.items():
+                            if isinstance(counts, dict):
+                                total = counts.get('total', 0)
+                                security = counts.get('security', 0)
+                                quality = counts.get('quality', 0)
+                                if total > 0:
+                                    print(f"   {severity}: {total} (Security: {security}, Quality: {quality})")
+                            else:
+                                if counts > 0:
+                                    print(f"   {severity}: {counts}")
+                    except:
+                        pass
+            else:
+                print(f"\n[ERROR] Validation failed: {result['error']}")
+        
+        else:
+            # Validate directory
+            print(f"\n[VALIDATING DIRECTORY: {path}]")
+            results = validator.validate_directory(str(path), args.recursive, args.format)
+            
+            total_files = len(results)
+            successful = sum(1 for r in results if r['success'])
+            total_violations = sum(r.get('violations_count', 0) for r in results if r.get('success', False))
+            
+            print(f"\n[SUCCESS] Directory validation completed")
+            print(f"   Files processed: {successful}/{total_files}")
+            print(f"   Total violations: {total_violations}")
+            print(f"   Reports saved to: {args.output_dir}")
+            
+            # Show breakdown by rule type
+            security_violations = 0
+            quality_violations = 0
+            files_with_violations = 0
+            
+            for result in results:
+                if result['success']:
+                    if result.get('violations_count', 0) > 0:
+                        files_with_violations += 1
+                    
+                    # Get violations from the report data if available
+                    try:
+                        report_path = result.get('report_path')
+                        if report_path and Path(report_path).exists():
+                            with open(report_path, 'r', encoding='utf-8') as f:
+                                report_data = json.load(f)
+                                
+                            for violation in report_data.get('violations', []):
+                                rule_type = violation.get('rule_type', 'SECURITY')
+                                if rule_type == 'SECURITY':
+                                    security_violations += 1
+                                elif rule_type == 'QUALITY':
+                                    quality_violations += 1
+                    except:
+                        # Fallback: assume violations exist but can't categorize
+                        pass
+            
+            print(f"   Files with violations: {files_with_violations}")
+            print(f"   Security Issues: {security_violations}")
+            print(f"   Quality Issues: {quality_violations}")
+            
+            # Show summary by mode
+            if args.mode in ['llm', 'hybrid']:
+                llm_results = [r for r in results if r['success'] and r.get('llm_metadata')]
+                if llm_results:
+                    avg_risk_score = sum(r['llm_metadata'].get('risk_score', 0) for r in llm_results) / len(llm_results)
+                    print(f"   Average Risk Score: {avg_risk_score:.1f}/10")
+            
+            print(f"\n[FILE SUMMARY]")
+            for result in results[:10]:  # Show first 10 files
+                if result['success']:
+                    name = Path(result['file_path']).name
+                    violations = result['violations_count']
+                    mode = result.get('validation_mode', 'simple')
+                    lang = result.get('language', 'unknown')
+                    
+                    # Add color coding for violations
+                    if violations == 0:
+                        status = "CLEAN"
+                    elif violations <= 5:
+                        status = f"{violations} issues"
+                    else:
+                        status = f"{violations} issues"
+                    
+                    print(f"   * {name:<30} {lang:<10} {status:<15} ({mode})")
+            
+            if len(results) > 10:
+                print(f"   ... and {len(results) - 10} more files")
+            
+            # Show severity breakdown summary
+            if total_violations > 0:
+                print(f"\n[SEVERITY BREAKDOWN]")
+                severity_totals = {'HIGH': 0, 'MEDIUM': 0, 'LOW': 0}
+                
+                for result in results:
+                    if result['success']:
+                        try:
+                            report_path = result.get('report_path')
+                            if report_path and Path(report_path).exists():
+                                with open(report_path, 'r', encoding='utf-8') as f:
+                                    report_data = json.load(f)
+                                
+                                severity_summary = report_data.get('severity_summary', {})
+                                for severity, counts in severity_summary.items():
+                                    if isinstance(counts, dict):
+                                        severity_totals[severity] += counts.get('total', 0)
+                                    else:
+                                        severity_totals[severity] += counts
+                        except:
+                            pass
+                
+                for severity, count in severity_totals.items():
+                    if count > 0:
+                        print(f"   {severity}: {count}")
+            
+            # Show top violation categories
+            print(f"\n[TOP VIOLATION CATEGORIES]")
+            category_counts = {}
+            
+            for result in results:
+                if result['success']:
+                    try:
+                        report_path = result.get('report_path')
+                        if report_path and Path(report_path).exists():
+                            with open(report_path, 'r', encoding='utf-8') as f:
+                                report_data = json.load(f)
+                            
+                            for violation in report_data.get('violations', []):
+                                category = violation.get('category', 'unknown')
+                                rule_type = violation.get('rule_type', 'SECURITY')
+                                category_key = f"{category} ({rule_type})"
+                                category_counts[category_key] = category_counts.get(category_key, 0) + 1
+                    except:
+                        pass
+            
+            # Show top 5 categories
+            sorted_categories = sorted(category_counts.items(), key=lambda x: x[1], reverse=True)
+            for category, count in sorted_categories[:5]:
+                print(f"   {category}: {count}")
+            
+            if args.mode in ['llm', 'hybrid'] and llm_results:
+                print(f"\n[LLM ANALYSIS SUMMARY]")
+                high_risk_files = [r for r in llm_results if r['llm_metadata'].get('risk_score', 0) >= 7]
+                if high_risk_files:
+                    print(f"High Risk Files (e7/10): {len(high_risk_files)}")
+                    for result in high_risk_files[:3]:  # Show top 3
+                        name = Path(result['file_path']).name
+                        score = result['llm_metadata'].get('risk_score', 0)
+                        print(f"{name}: {score}/10")
+        
+        print(f"\n{'=' * 80}")
+        print("VALIDATION COMPLETE")
+        print(f"All reports saved to: {args.output_dir}")
+        print(f"{'=' * 80}\n")
+        
+    except Exception as e:
+        logger.error(f"Failed to initialize validator: {e}")
+        if args.mode in ["llm", "hybrid"]:
+            print("\nFor LLM mode, ensure you have:")
+            print("1. Set environment variables in .env file:")
+            print("   - AZURE_OPENAI_ENDPOINT")
+            print("   - AZURE_OPENAI_DEPLOYMENT_NAME (or AZURE_OPENAI_DEPLOYMENT)")
+            print("   - AZURE_OPENAI_API_VERSION (optional, defaults to 2024-02-15-preview)")
+            print("2. Azure Key Vault access for API key (or set AZURE_OPENAI_API_KEY in .env)")
+            print("3. Ensure network connectivity to Azure OpenAI endpoint")
+            print("4. Run 'az login' for Azure Key Vault authentication")
+
+if __name__ == "__main__":
+    main()"
