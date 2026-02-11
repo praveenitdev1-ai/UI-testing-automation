@@ -1,0 +1,604 @@
+"#!/usr/bin/env python3
+"""
+Frontend Template Renderer - Phase 2 Task 4
+============================================
+Renders TypeScript templates using wiring configuration.
+
+This script:
+1. Loads wiring config (wired_ui_ast.json)
+2. Renders hook templates for each entity
+3. Renders service templates
+4. Outputs generated TypeScript files
+
+Usage:
+    python step_7d_frontend_template_renderer.py -w config_output/wired_ui_ast.json -o Generated/frontend/src
+"""
+
+import json
+import argparse
+import logging
+from pathlib import Path
+from datetime import datetime
+from typing import Dict, Any, List
+
+from jinja2 import Environment, FileSystemLoader, select_autoescape
+
+# Setup logging
+
+# ============================================================================
+# Type Mapping: Python → TypeScript
+# ============================================================================
+
+PYTHON_TO_TYPESCRIPT_TYPES = {
+    'int': 'number',
+    'float': 'number',
+    'str': 'string',
+    'bool': 'boolean',
+    'UUID': 'string',
+    'uuid': 'string',
+    'datetime': 'string',
+    'date': 'string',
+    'time': 'string',
+    'Decimal': 'number',
+    'decimal': 'number',
+    'bytes': 'string',
+    'Any': 'any',
+    'None': 'null',
+    'List': 'any[]',
+    'Dict': 'Record<string, any>',
+}
+
+
+def map_to_typescript(python_type: str) -> str:
+    """
+    Jinja2 filter to convert Python types to TypeScript types.
+
+    Usage in templates: {{ entity.primary_key_type | ts_type }}
+    """
+    if not python_type:
+        return 'any'
+
+    # Handle generic types like Optional[str], List[int]
+    if '[' in python_type:
+        base_type = python_type.split('[')[0]
+        if base_type in ('Optional', 'Union'):
+            inner = python_type.split('[')[1].rstrip(']')
+            return f'{map_to_typescript(inner)} | null'
+        elif base_type in ('List', 'list'):
+            inner = python_type.split('[')[1].rstrip(']')
+            return f'{map_to_typescript(inner)}[]'
+
+    return PYTHON_TO_TYPESCRIPT_TYPES.get(python_type, python_type)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+
+class FrontendTemplateRenderer:
+    """
+    Renders TypeScript templates from wiring configuration.
+    """
+
+    def __init__(self, wiring_config_path: str, output_dir: str):
+        self.wiring_config_path = Path(wiring_config_path)
+        self.output_dir = Path(output_dir)
+        self.script_dir = Path(__file__).parent
+        self.templates_dir = self.script_dir / 'Templates'
+        self.config_dir = self.script_dir / 'config_output'
+
+        # Load wiring config
+        with open(self.wiring_config_path) as f:
+            self.wiring_config = json.load(f)
+
+        # Load entity validations for AC-driven features
+        self.entity_validations = {}
+        entity_val_path = self.config_dir / 'entity_validations.json'
+        if entity_val_path.exists():
+            with open(entity_val_path) as f:
+                val_data = json.load(f)
+                self.entity_validations = val_data.get('entity_validations', {})
+            logger.info(f"Loaded entity validations for {len(self.entity_validations)} entities")
+
+        # Setup Jinja2 environment
+        self.env = Environment(
+            loader=FileSystemLoader(str(self.templates_dir)),
+            autoescape=select_autoescape(['html', 'xml']),
+            trim_blocks=True,
+            lstrip_blocks=True
+        )
+
+        # Register custom filters for type mapping
+        self.env.filters['ts_type'] = map_to_typescript
+
+        # Ensure output directories exist
+        self.hooks_dir = self.output_dir / 'hooks'
+        self.services_dir = self.output_dir / 'services'
+        self.hooks_dir.mkdir(parents=True, exist_ok=True)
+        self.services_dir.mkdir(parents=True, exist_ok=True)
+
+    def render_all(self) -> Dict[str, Any]:
+        """
+        Render all templates and return summary.
+        """
+        summary = {
+            'started_at': datetime.now().isoformat(),
+            'files_generated': [],
+            'errors': []
+        }
+
+        try:
+            # Render hooks for each entity
+            hooks = self.render_hooks()
+            summary['files_generated'].extend(hooks)
+
+            # Render user story hooks
+            userstory_hooks = self.render_userstory_hooks()
+            summary['files_generated'].extend(userstory_hooks)
+
+            # Render modal hooks (for US3, US4, etc.)
+            modal_hooks = self.render_modal_hooks()
+            summary['files_generated'].extend(modal_hooks)
+
+            # Render API service
+            service = self.render_service()
+            summary['files_generated'].append(service)
+
+            summary['success'] = True
+
+        except Exception as e:
+            logger.error(f"Template rendering failed: {e}")
+            summary['errors'].append(str(e))
+            summary['success'] = False
+
+        summary['completed_at'] = datetime.now().isoformat()
+        return summary
+
+    def render_hooks(self) -> List[str]:
+        """
+        Render hook templates for each entity.
+        """
+        generated = []
+        entity_services = self.wiring_config.get('entity_services', [])
+
+        template = self.env.get_template('hook_template.ts.j2')
+
+        for entity in entity_services:
+            try:
+                # Enrich entity with AC-driven validation flags
+                entity_name = entity.get('entity_name', '').lower()
+                entity_validations = self.entity_validations.get(entity_name, {})
+
+                # Check for lookup endpoints (AC1, AC4: Auto-populate)
+                lookup_endpoints = entity_validations.get('lookup_endpoints', [])
+                entity['has_lookup'] = len(lookup_endpoints) > 0
+
+                # Check for unique validation (AC3: Duplicate prevention)
+                create_validations = entity_validations.get('create_validations', [])
+                entity['has_duplicate_check'] = any(
+                    v.get('type') == 'unique' for v in create_validations
+                )
+
+                # Check for workflow transitions (AC: Workflow)
+                entity['has_workflow'] = entity_validations.get('workflow_enabled', False)
+
+                # Extract validations for client-side validation (AC7)
+                entity['validations'] = [
+                    v for v in create_validations
+                    if v.get('type') in ['required', 'format', 'positive_integer']
+                ]
+
+                logger.info(f"Entity {entity_name}: has_lookup={entity['has_lookup']}, "
+                           f"has_duplicate_check={entity['has_duplicate_check']}, "
+                           f"has_workflow={entity['has_workflow']}, "
+                           f"validations={len(entity['validations'])}")
+
+                # Render template
+                content = template.render(
+                    entity=entity,
+                    timestamp=datetime.now().isoformat()
+                )
+
+                # Write to file
+                hook_name = entity.get('hook_name', f"use{entity['entity_name'].title()}")
+                filename = f"{hook_name}.ts"
+                output_path = self.hooks_dir / filename
+
+                with open(output_path, 'w') as f:
+                    f.write(content)
+
+                logger.info(f"Generated hook: {output_path}")
+                generated.append(str(output_path))
+
+            except Exception as e:
+                logger.error(f"Failed to render hook for {entity.get('entity_name')}: {e}")
+
+        return generated
+
+    def render_userstory_hooks(self) -> List[str]:
+        """
+        Render user story hooks from screen_mappings.
+
+        Each screen mapping generates a useUserstory{N}Logic.ts hook with:
+        - Form validation based on field_mappings
+        - API integration
+        - Workflow handlers (if workflow_definition exists)
+        - Lookup helpers (entity lookup, duplicate check)
+        """
+        generated = []
+        screen_mappings = self.wiring_config.get('screen_mappings', [])
+        entity_services = self.wiring_config.get('entity_services', [])
+
+        # Check if template exists
+        template_name = 'userstory_hook_ast.ts.j2'
+        try:
+            template = self.env.get_template(template_name)
+        except Exception as e:
+            logger.warning(f"User story hook template not found: {template_name}")
+            return generated
+
+        for screen in screen_mappings:
+            try:
+                story_id = screen.get('story_id', '')
+                story_normalized = story_id.replace('User Story ', 'Userstory').replace(' ', '')
+                hook_name = f"use{story_normalized}Logic"
+
+                # Determine if we need entity lookup or duplicate check
+                needs_inventory_lookup = self._needs_inventory_lookup(screen)
+                needs_duplicate_check = self._needs_duplicate_check(screen)
+
+                # Render template
+                content = template.render(
+                    screen=screen,
+                    entity_services=entity_services,
+                    needs_inventory_lookup=needs_inventory_lookup,
+                    needs_duplicate_check=needs_duplicate_check,
+                    timestamp=datetime.now().isoformat()
+                )
+
+                # Write to file
+                filename = f"{hook_name}.ts"
+                output_path = self.hooks_dir / filename
+
+                with open(output_path, 'w') as f:
+                    f.write(content)
+
+                workflow_str = " [WORKFLOW]" if screen.get('workflow_definition') else ""
+                logger.info(f"Generated user story hook: {hook_name}{workflow_str}")
+                generated.append(str(output_path))
+
+            except Exception as e:
+                logger.error(f"Failed to render user story hook for {screen.get('story_id')}: {e}")
+                import traceback
+                traceback.print_exc()
+
+        return generated
+
+    def _needs_inventory_lookup(self, screen: Dict[str, Any]) -> bool:
+        """Check if screen needs entity lookup helper."""
+        for field in screen.get('field_mappings', []):
+            for validation in field.get('validations', []):
+                rule = validation.get('rule', '').lower()
+                # Check for lookup validation patterns (e.g., "must exist in <entity>")
+                if 'exist' in rule and ('in' in rule or 'valid' in rule):
+                    return True
+                if 'tracking' in field.get('config_field_id', '').lower():
+                    return True
+        return False
+
+    def _needs_duplicate_check(self, screen: Dict[str, Any]) -> bool:
+        """Check if screen needs duplicate check helper."""
+        for field in screen.get('field_mappings', []):
+            for validation in field.get('validations', []):
+                rule = validation.get('rule', '').lower()
+                if 'duplicate' in rule or 'unique' in rule:
+                    return True
+        return False
+
+    def render_modal_hooks(self) -> List[str]:
+        """
+        Render modal hooks by scanning existing modal components.
+
+        This discovers modal components in src/components/modals/ and generates
+        the corresponding hooks they import.
+        """
+        generated = []
+
+        # Find modal components directory
+        src_dir = self.output_dir
+        modals_dir = src_dir.parent / 'src' / 'components' / 'modals'
+
+        # Also check if modals are directly in output_dir's sibling
+        if not modals_dir.exists():
+            modals_dir = self.output_dir / 'components' / 'modals'
+
+        if not modals_dir.exists():
+            # Try one more path - relative to output_dir parent
+            modals_dir = Path(self.output_dir).parent / 'src' / 'components' / 'modals'
+
+        if not modals_dir.exists():
+            logger.info("No modals directory found - skipping modal hook generation")
+            return generated
+
+        # Check if template exists
+        template_name = 'modal_hook_ast.ts.j2'
+        try:
+            template = self.env.get_template(template_name)
+        except Exception as e:
+            logger.warning(f"Modal hook template not found: {template_name}, using inline generation")
+            template = None
+
+        # Scan modal components and extract hook requirements
+        import re
+
+        for modal_file in modals_dir.glob('*.tsx'):
+            if modal_file.name == 'index.ts':
+                continue
+
+            try:
+                content = modal_file.read_text()
+
+                # Extract hook name from import statement
+                hook_match = re.search(r'import\s*{\s*(\w+)\s*}\s*from\s*[\'"].*?/hooks/(\w+)[\'"]', content)
+                if not hook_match:
+                    continue
+
+                hook_name = hook_match.group(1)
+
+                # Extract story info from comments
+                story_match = re.search(r'// Auto-generated modal component for (User Story \d+)', content)
+                story_id = story_match.group(1) if story_match else 'Unknown'
+
+                title_match = re.search(r'// Modal: (.+)', content)
+                title = title_match.group(1) if title_match else modal_file.stem
+
+                # Extract destructured items from hook usage
+                destructure_match = re.search(r'const\s*{\s*([^}]+)\s*}\s*=\s*' + hook_name, content)
+                actions = []
+                if destructure_match:
+                    items = destructure_match.group(1)
+                    actions = [a.strip() for a in items.split(',') if a.strip()]
+
+                # Generate the hook
+                modal_config = {
+                    'modal_id': modal_file.stem,
+                    'hook_name': hook_name,
+                    'story_id': story_id,
+                    'title': title,
+                    'actions': actions,
+                    'primary_entity': self.app_config.get('file_entity', 'files')
+                }
+
+                if template:
+                    hook_content = template.render(
+                        modal=modal_config,
+                        timestamp=datetime.now().isoformat()
+                    )
+                else:
+                    # Inline generation if template not available
+                    hook_content = self._generate_modal_hook_inline(modal_config)
+
+                # Write hook file
+                hook_filename = f"{hook_name}.ts"
+                output_path = self.hooks_dir / hook_filename
+
+                with open(output_path, 'w') as f:
+                    f.write(hook_content)
+
+                logger.info(f"Generated modal hook: {hook_name} for {story_id}")
+                generated.append(str(output_path))
+
+            except Exception as e:
+                logger.error(f"Failed to generate hook for modal {modal_file.name}: {e}")
+                import traceback
+                traceback.print_exc()
+
+        return generated
+
+    def _generate_modal_hook_inline(self, modal: Dict[str, Any]) -> str:
+        """Generate modal hook content inline when template is not available."""
+        hook_name = modal['hook_name']
+        actions = modal.get('actions', [])
+
+        # Get config-driven values
+        primary_key = self.app_config.get('primary_key', 'id')
+        file_endpoint = self.app_config.get('file_endpoint', '/api/files')
+
+        # Build action handlers
+        action_handlers = []
+        action_returns = []
+
+        for action in actions:
+            if action in ['loading', 'documentGenerated', 'shipmentNumber', 'error']:
+                continue  # These are state, not handlers
+            if action in ['generateDocument', 'printDocument']:
+                continue  # Built-in handlers
+
+            action_handlers.append(f'''
+  const {action} = useCallback(async () => {{
+    setLoading(true);
+    try {{
+      console.log('{action} called');
+      // TODO: Implement {action} logic
+    }} catch (err: any) {{
+      setError(err.message);
+    }} finally {{
+      setLoading(false);
+    }}
+  }}, [entityId, relatedId]);''')
+            action_returns.append(action)
+
+        handlers_code = '\n'.join(action_handlers)
+        returns_code = ',\n    '.join(['loading', 'documentGenerated', 'shipmentNumber', 'error',
+                                        'generateDocument', 'printDocument'] + action_returns)
+
+        return f'''/**
+ * Auto-generated modal hook for {modal['story_id']}
+ * Modal: {modal['title']}
+ */
+
+import {{ useState, useCallback }} from 'react';
+import {{ apiClient }} from '../services/api';
+
+export const {hook_name} = (entityId: number, relatedId: string) => {{
+  const [loading, setLoading] = useState(false);
+  const [documentGenerated, setDocumentGenerated] = useState(false);
+  const [shipmentNumber, setShipmentNumber] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const generateDocument = useCallback(async (category: string = 'default') => {{
+    setLoading(true);
+    try {{
+      const response = await apiClient.post('{file_endpoint}', {{
+        {primary_key}: entityId,
+        related_id: relatedId,
+        document_type: category
+      }});
+      setDocumentGenerated(true);
+      if (response.data?.shipment_number) {{
+        setShipmentNumber(response.data.shipment_number);
+      }}
+    }} catch (err: any) {{
+      setError(err.message);
+    }} finally {{
+      setLoading(false);
+    }}
+  }}, [entityId, relatedId]);
+
+  const printDocument = useCallback(async () => {{
+    window.print();
+  }}, []);
+{handlers_code}
+
+  return {{
+    {returns_code}
+  }};
+}};
+'''
+
+    def render_service(self) -> str:
+        """
+        Render the API service template.
+        """
+        template = self.env.get_template('service_template.ts.j2')
+
+        entities = self.wiring_config.get('entity_services', [])
+
+        content = template.render(
+            base_url='',
+            entities=entities,
+            timestamp=datetime.now().isoformat()
+        )
+
+        output_path = self.services_dir / 'api.ts'
+        with open(output_path, 'w') as f:
+            f.write(content)
+
+        logger.info(f"Generated service: {output_path}")
+        return str(output_path)
+
+    def render_handlers(self) -> List[str]:
+        """
+        Render handler wrapper templates.
+        """
+        generated = []
+        handler_wirings = self.wiring_config.get('handler_wirings', [])
+        entity_services = self.wiring_config.get('entity_services', [])
+        form_wirings = self.wiring_config.get('form_wirings', [])
+
+        # Build entity lookup
+        entity_by_name = {e['entity_name']: e for e in entity_services}
+
+        template = self.env.get_template('handler_wrapper.ts.j2')
+
+        for handler in handler_wirings:
+            if handler.get('crud_operation') == 'UNKNOWN':
+                continue
+
+            try:
+                primary_entity = self.app_config.get('primary_entity', 'items')
+                entity = entity_by_name.get(handler.get('target_entity', primary_entity), {})
+
+                # Find form fields for this handler
+                form_fields = []
+                for form in form_wirings:
+                    form_fields.extend(form.get('fields', []))
+
+                content = template.render(
+                    handler=handler,
+                    entity=entity,
+                    form_fields=form_fields,
+                    timestamp=datetime.now().isoformat()
+                )
+
+                filename = f"{handler['handler_name']}Wrapper.ts"
+                output_path = self.hooks_dir / filename
+
+                with open(output_path, 'w') as f:
+                    f.write(content)
+
+                logger.info(f"Generated handler wrapper: {output_path}")
+                generated.append(str(output_path))
+
+            except Exception as e:
+                logger.error(f"Failed to render handler {handler.get('handler_name')}: {e}")
+
+        return generated
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Render TypeScript templates from wiring configuration'
+    )
+    parser.add_argument(
+        '-w', '--wiring',
+        default='config_output/wired_ui_ast.json',
+        help='Path to wiring configuration JSON'
+    )
+    parser.add_argument(
+        '-o', '--output',
+        default='Generated/frontend/src',
+        help='Output directory for generated files'
+    )
+    parser.add_argument(
+        '-v', '--verbose',
+        action='store_true',
+        help='Enable verbose logging'
+    )
+
+    args = parser.parse_args()
+
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    try:
+        renderer = FrontendTemplateRenderer(args.wiring, args.output)
+        summary = renderer.render_all()
+
+        # Print summary
+        print("\n" + "=" * 60)
+        print("TEMPLATE RENDERING COMPLETE")
+        print("=" * 60)
+        print(f"Wiring Config: {args.wiring}")
+        print(f"Output Dir: {args.output}")
+        print("-" * 60)
+        print(f"Files Generated: {len(summary['files_generated'])}")
+        for f in summary['files_generated']:
+            print(f"  - {f}")
+        if summary['errors']:
+            print(f"\nErrors: {len(summary['errors'])}")
+            for e in summary['errors']:
+                print(f"  - {e}")
+        print("-" * 60)
+        print(f"Success: {summary['success']}")
+        print("=" * 60)
+
+    except Exception as e:
+        logger.error(f"Rendering failed: {e}")
+        exit(1)
+
+
+if __name__ == '__main__':
+    main()
+"
