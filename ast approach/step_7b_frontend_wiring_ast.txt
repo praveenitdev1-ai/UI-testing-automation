@@ -1,0 +1,1563 @@
+"#!/usr/bin/env python3
+"""
+Step 7b: AST-Based Frontend Wiring
+==================================
+Enhanced wiring using AST metadata for reliable field matching.
+
+Key improvements over regex-based wiring:
+1. Uses AST-extracted state variable bindings (not label guessing)
+2. Leverages handler CRUD operation detection
+3. Builds form hierarchy from actual JSX structure
+4. Provides full field lineage: state -> input -> API field
+
+Usage:
+    python step_7b_frontend_wiring_ast.py -a <app_config.json> -t <tsx_ast_metadata.json> -o <wired_ui_ast.json>
+
+Example:
+    python step_7b_frontend_wiring_ast.py -a config_output/application_config.json -t config_output/tsx_ast_metadata.json -o config_output/wired_ui_ast.json
+"""
+
+import json
+import re
+import argparse
+import logging
+from pathlib import Path
+from typing import Dict, List, Any, Optional, Tuple
+from dataclasses import dataclass, field, asdict
+from datetime import datetime
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class StateFieldBinding:
+    """Represents a state variable bound to form fields."""
+    state_name: str
+    setter_name: str
+    inferred_type: str
+    initial_value: Any
+    bound_inputs: List[Dict[str, Any]]
+    config_field: Optional[str] = None
+    api_field: Optional[str] = None
+    binding_strength: str = "UNKNOWN"  # STRONG, MEDIUM, WEAK
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+def get_tsx_input_id(config_field: str, ast_metadata: Dict = None) -> str:
+    """
+    Convert config field name to TSX input ID - CONFIG-DRIVEN.
+
+    Strategy (in order of priority):
+    1. Look up in AST metadata if available (extracted from actual TSX)
+    2. Apply naming convention pattern matching
+    3. Fallback to snake_case → newCamelCase conversion
+
+    The TSX inputs typically follow the pattern 'new' + PascalCase(field_name).
+    E.g., 'tracking_number' -> 'newTrackingNumber'
+         '<entity>_id' -> 'new<Entity>Id'
+    """
+    # Strategy 1: Look up in AST metadata if available
+    if ast_metadata and 'form_elements' in ast_metadata:
+        # Build mapping from AST-extracted input IDs
+        for element in ast_metadata.get('form_elements', []):
+            input_id = element.get('id')
+            if not input_id:
+                continue
+            # Match by checking if config_field appears in the input_id (case-insensitive)
+            # e.g., 'tracking_number' matches 'newTrackingNumber'
+            config_parts = config_field.lower().replace('_', '')
+            input_lower = input_id.lower().replace('new', '')
+            if config_parts == input_lower:
+                return input_id
+
+    # Strategy 2: Apply naming convention patterns based on suffixes
+    # Pattern: Determine input ID based on field suffix patterns
+    #
+    # Fields ending in '_id' (except user_id fields) → typically FK dropdowns, keep as-is
+    # Fields ending in '_number' → typically text inputs with 'new' prefix
+    # Single word fields → typically simple inputs, keep as-is
+    # Other compound fields → apply newCamelCase pattern
+
+    if '_' not in config_field:
+        # Single word field (description, disposition, quantity, status)
+        return config_field
+
+    # User-facing ID field patterns - these are NOT foreign keys but entity identifiers
+    # Pattern: fields that end with _id but represent the entity's own user-visible code
+    user_facing_id_suffixes = ['_id']  # Generic pattern - any *_id that's not a FK
+    is_user_facing_id = config_field.endswith('_id') and not any(
+        fk in config_field for fk in ['vendor_id', 'location_id', 'user_id', 'parent_id']
+    )
+    if config_field.endswith('_id') and not is_user_facing_id:
+        # Foreign key reference (vendor_id, location_id) - used in dropdowns
+        return config_field
+
+    # Strategy 3: Default - convert snake_case to newCamelCase
+    # This covers: tracking_number → newTrackingNumber, <entity>_id → new<Entity>Id
+    parts = config_field.split('_')
+    camel_case = parts[0] + ''.join(word.title() for word in parts[1:])
+    return f'new{camel_case[0].upper()}{camel_case[1:]}'
+
+
+@dataclass
+class FieldMapping:
+    """Represents a mapping between TSX field and config field."""
+    tsx_id: str
+    tsx_label: Optional[str]
+    config_field_id: str
+    config_label: str
+    config_binding: str
+    confidence: str
+    match_reason: str
+    validations: List[Dict[str, Any]] = field(default_factory=list)
+    error_messages: Dict[str, str] = field(default_factory=dict)
+    is_filter: bool = False
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class HandlerMapping:
+    """Represents a mapping between TSX handler and config action."""
+    tsx_function_name: str
+    tsx_button_text: Optional[str]
+    story_id: str
+    config_action: str
+    target_api_endpoint: str
+    target_api_method: str
+    target_entity: str
+    confidence: str
+    match_reason: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class ScreenMapping:
+    """Represents a complete screen mapping for a user story."""
+    tsx_screen_name: str
+    story_id: str
+    story_title: str
+    screen_name: str
+    field_mappings: List[FieldMapping]
+    handler_mappings: List[HandlerMapping]
+    primary_entity: str
+    workflow_definition: Optional[Dict[str, Any]] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'tsx_screen_name': self.tsx_screen_name,
+            'story_id': self.story_id,
+            'story_title': self.story_title,
+            'screen_name': self.screen_name,
+            'field_mappings': [f.to_dict() for f in self.field_mappings],
+            'handler_mappings': [h.to_dict() for h in self.handler_mappings],
+            'primary_entity': self.primary_entity,
+            'workflow_definition': self.workflow_definition
+        }
+
+
+@dataclass
+class HandlerWiring:
+    """Represents a handler wired to an API operation."""
+    handler_name: str
+    crud_operation: str  # CREATE, READ, UPDATE, DELETE
+    target_entity: str
+    target_api: Optional[str]
+    target_method: str
+    state_updates: List[str]
+    form_fields: List[str]
+    event_bindings: List[str]
+    confidence: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class FormWiring:
+    """Represents a form wired to an entity."""
+    form_id: Optional[str]
+    target_entity: str
+    fields: List[Dict[str, Any]]
+    submit_handler: Optional[str]
+    crud_operation: str
+    api_endpoint: Optional[str]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+class AstWiringPlanner:
+    """
+    Enhanced wiring planner using AST metadata.
+
+    Improvements over label-based matching:
+    1. State binding analysis - tracks actual React state flow
+    2. Handler operation detection - understands what handlers do
+    3. Form structure awareness - knows which fields belong together
+    4. Full lineage tracking - state → input → config → API
+    """
+
+    def __init__(self, app_config: Dict[str, Any], ast_metadata: Dict[str, Any]):
+        self.config = app_config
+        self.ast = ast_metadata.get('ast', ast_metadata)  # Support both raw and semantic
+        self.semantic = ast_metadata.get('semantic', {})
+
+        # Build lookup maps
+        self.entities = {e['name']: e for e in app_config.get('entities', [])}
+        self.apis = app_config.get('apis', [])
+        self.screen_layouts = app_config.get('screen_layouts', [])
+        self.validation_rules = app_config.get('validation_rules', [])
+        self.workflow_definitions = app_config.get('workflow_definitions', [])
+        self.field_validations = app_config.get('field_validations', [])
+
+        # Build field name to config mapping
+        self.config_field_map = self._build_config_field_map()
+
+        # Build workflow lookup by story_id
+        self.workflow_by_story = {
+            wf.get('story_id'): wf for wf in self.workflow_definitions
+        }
+
+        # Load wiring config
+        self.wiring_config = self._load_wiring_config()
+
+    def _load_wiring_config(self) -> Dict[str, Any]:
+        """Load wiring configuration from file or use defaults."""
+        config_path = Path(__file__).parent / 'config_output' / 'wiring_config.json'
+
+        defaults = {
+            "version": "2.0-ast",
+            # field_name_mappings is now auto-generated from AST metadata
+            # No hardcoded mappings - uses naming convention patterns instead:
+            # - newXxxYyy → xxx_yyy (strip 'new' prefix, convert camelCase to snake_case)
+            # - editXxxYyy → xxx_yyy (strip 'edit' prefix)
+            # - filterXxxYyy → xxx_yyy (strip 'filter' prefix)
+            "field_name_mappings": {},  # Auto-populated from AST
+            "state_prefix_strip": ["new", "edit", "filter", "selected"],
+            "handler_operation_keywords": {
+                "create": ["add", "create", "new", "insert", "save"],
+                "update": ["update", "edit", "modify", "change"],
+                "delete": ["delete", "remove", "clear"]
+            },
+            "entity_detection_patterns": {
+                # Generic patterns for common entity types - actual entities come from config
+                "primary": ["item", "entry", "record", "list"],
+                "secondary": ["stock", "supply", "material"],
+                "files": ["document", "doc", "file", "attachment"],
+                "audit": ["workflow", "history", "stage", "log"]
+            }
+        }
+
+        if config_path.exists():
+            try:
+                with open(config_path, 'r') as f:
+                    loaded = json.load(f)
+                    logger.info(f"Loaded wiring config v{loaded.get('version', 'unknown')}")
+                    return {**defaults, **loaded}
+            except Exception as e:
+                logger.warning(f"Failed to load wiring config: {e}")
+
+        return defaults
+
+    def _get_config_value(self, key: str, default_value: str = None) -> str:
+        """
+        Get a configuration value safely without hardcoding.
+
+        Args:
+            key: The config key to retrieve (e.g., 'default_status', 'default_disposition')
+            default_value: Fallback value if key not found
+
+        Returns:
+            The config value or default_value
+        """
+        if not self.app_config:
+            return default_value or ''
+        return self.app_config.get(key, default_value or '')
+
+    def _build_config_field_map(self) -> Dict[str, Dict[str, Any]]:
+        """Build a map of field names to their config definitions.
+
+        This map is derived entirely from application_config.json entities.
+        No hardcoded field names - all mappings come from config.
+        """
+        field_map = {}
+
+        for entity_name, entity_def in self.entities.items():
+            for field in entity_def.get('fields', []):
+                field_name = field.get('name', '')
+                if field_name:
+                    key = f"{entity_name}.{field_name}"
+                    field_info = {
+                        'entity': entity_name,
+                        'field': field,
+                        'binding': key
+                    }
+                    field_map[key] = field_info
+                    # Also add just the field name for simpler lookup
+                    field_map[field_name] = field_info
+
+                    # Add common variations (camelCase, with underscores removed)
+                    # This allows convention-based matching without hardcoding
+                    camel_case = self._to_camel_case(field_name)
+                    if camel_case != field_name:
+                        field_map[camel_case] = field_info
+
+                    # Add with common prefixes for automatic matching
+                    for prefix in ['new', 'edit', 'filter', 'selected']:
+                        prefixed = prefix + camel_case[0].upper() + camel_case[1:]
+                        field_map[prefixed] = field_info
+
+        return field_map
+
+    def _to_camel_case(self, snake_str: str) -> str:
+        """Convert snake_case to camelCase."""
+        components = snake_str.split('_')
+        return components[0] + ''.join(x.title() for x in components[1:])
+
+    def generate_wiring_plan(self) -> Dict[str, Any]:
+        """Generate comprehensive wiring plan from AST metadata."""
+        logger.info("Generating AST-based wiring plan...")
+
+        # Extract core data
+        state_bindings = self._analyze_state_bindings()
+        handler_wirings = self._analyze_handlers()
+        form_wirings = self._analyze_forms(state_bindings, handler_wirings)
+
+        # Build entity services
+        entity_services = self._build_entity_services()
+
+        # Generate screen mappings (for user story hooks)
+        screen_mappings = self._build_screen_mappings(state_bindings, handler_wirings)
+
+        # Generate injection points
+        injection_points = self._generate_injection_points(
+            state_bindings, handler_wirings, form_wirings
+        )
+
+        # Calculate coverage
+        coverage_report = self._calculate_coverage(
+            state_bindings, handler_wirings, form_wirings
+        )
+
+        # Get app metadata from application_config (no hardcoding)
+        config_metadata = self.config.get('metadata', {})
+
+        return {
+            'metadata': {
+                'version': '2.0-ast',
+                'generated_at': datetime.now().isoformat(),
+                'source_file': self.ast.get('file', ''),
+                'approach': 'ast-based',
+                'app_name': config_metadata.get('app_name', 'App'),
+                'project_name': config_metadata.get('project_name', 'Application')
+            },
+            'state_bindings': [b.to_dict() for b in state_bindings],
+            'handler_wirings': [h.to_dict() for h in handler_wirings],
+            'form_wirings': [f.to_dict() for f in form_wirings],
+            'screen_mappings': [sm.to_dict() for sm in screen_mappings],
+            'entity_services': entity_services,
+            'injection_points': injection_points,
+            'coverage_report': coverage_report,
+            'wiring_summary': self._build_summary(
+                state_bindings, handler_wirings, form_wirings, screen_mappings
+            )
+        }
+
+    def _analyze_state_bindings(self) -> List[StateFieldBinding]:
+        """Analyze state variables and their bindings to inputs."""
+        bindings = []
+        state_vars = self.ast.get('stateVariables', [])
+        inputs = self.ast.get('jsxStructure', {}).get('inputs', [])
+
+        # Use semantic analysis if available
+        semantic_bindings = self.semantic.get('state_field_bindings', [])
+
+        for state in state_vars:
+            value_name = state.get('valueName', '')
+            setter_name = state.get('setterName', '')
+            inferred_type = state.get('inferredType', 'unknown')
+            initial_value = state.get('initialValue', '')
+
+            # Find inputs bound to this state
+            bound_inputs = []
+            for inp in inputs:
+                inp_value = str(inp.get('value', ''))
+                inp_onChange = str(inp.get('onChange', ''))
+
+                # Check if state is used in value or onChange
+                if value_name and (value_name in inp_value or setter_name in inp_onChange):
+                    bound_inputs.append({
+                        'input_id': inp.get('id'),
+                        'input_name': inp.get('name'),
+                        'input_type': inp.get('type'),
+                        'value_binding': value_name in inp_value,
+                        'onChange_binding': setter_name in inp_onChange,
+                        'line': inp.get('line')
+                    })
+
+            # Map state name to config field
+            config_field = self._map_state_to_config_field(value_name)
+            api_field = config_field  # Same for now
+
+            # Determine binding strength
+            if bound_inputs and config_field:
+                binding_strength = "STRONG"
+            elif bound_inputs or config_field:
+                binding_strength = "MEDIUM"
+            else:
+                binding_strength = "WEAK"
+
+            bindings.append(StateFieldBinding(
+                state_name=value_name,
+                setter_name=setter_name,
+                inferred_type=inferred_type,
+                initial_value=initial_value,
+                bound_inputs=bound_inputs,
+                config_field=config_field,
+                api_field=api_field,
+                binding_strength=binding_strength
+            ))
+
+        # Also analyze direct DOM input bindings (inputs with IDs but no state)
+        dom_bindings = self._analyze_dom_input_bindings(inputs)
+        bindings.extend(dom_bindings)
+
+        return bindings
+
+    def _analyze_dom_input_bindings(self, inputs: List[Dict]) -> List[StateFieldBinding]:
+        """Analyze inputs that use direct DOM access instead of React state."""
+        bindings = []
+
+        for inp in inputs:
+            inp_id = inp.get('id')
+            if not inp_id:
+                continue
+
+            # Map input ID to config field
+            config_field = self._map_input_id_to_config_field(inp_id)
+
+            if config_field:
+                bindings.append(StateFieldBinding(
+                    state_name=inp_id,  # Use input ID as pseudo-state
+                    setter_name=f"set_{inp_id}",  # Synthetic setter
+                    inferred_type=self._infer_type_from_input(inp),
+                    initial_value='',
+                    bound_inputs=[{
+                        'input_id': inp_id,
+                        'input_name': inp.get('name'),
+                        'input_type': inp.get('type'),
+                        'value_binding': True,
+                        'onChange_binding': False,
+                        'line': inp.get('line'),
+                        'dom_access': True  # Flag as DOM-based
+                    }],
+                    config_field=config_field,
+                    api_field=config_field,
+                    binding_strength="STRONG"
+                ))
+
+        return bindings
+
+    def _map_input_id_to_config_field(self, input_id: str) -> Optional[str]:
+        """Map an input ID to a config field name."""
+        if not input_id:
+            return None
+
+        # Direct mapping from config
+        mappings = self.wiring_config.get('field_name_mappings', {})
+        if input_id in mappings:
+            return mappings[input_id]
+
+        # Normalize and check
+        normalized = self._normalize_field_name(input_id)
+
+        if normalized in self.config_field_map:
+            return normalized
+
+        return None
+
+    def _normalize_field_name(self, name: str) -> str:
+        """Normalize a field name to snake_case config format."""
+        if not name:
+            return ''
+
+        result = name
+
+        # Strip common prefixes
+        for prefix in self.wiring_config.get('state_prefix_strip', []):
+            if result.lower().startswith(prefix):
+                result = result[len(prefix):]
+                if result and result[0].isupper():
+                    result = result[0].lower() + result[1:]
+                break
+
+        # Convert camelCase to snake_case
+        snake_case = re.sub(r'([A-Z])', r'_\1', result).lower().strip('_')
+
+        return snake_case
+
+    def _infer_type_from_input(self, inp: Dict) -> str:
+        """Infer field type from input element."""
+        inp_type = inp.get('type', 'text')
+
+        type_mapping = {
+            'text': 'string',
+            'number': 'number',
+            'email': 'string',
+            'password': 'string',
+            'checkbox': 'boolean',
+            'date': 'date',
+            'datetime-local': 'datetime',
+            'select': 'enum'
+        }
+
+        return type_mapping.get(inp_type, 'string')
+
+    def _map_state_to_config_field(self, state_name: str) -> Optional[str]:
+        """Map a state variable name to a config field."""
+        if not state_name:
+            return None
+
+        # Direct mapping from config
+        mappings = self.wiring_config.get('field_name_mappings', {})
+        if state_name in mappings:
+            return mappings[state_name]
+
+        # Strip common prefixes
+        normalized = state_name
+        for prefix in self.wiring_config.get('state_prefix_strip', []):
+            if normalized.lower().startswith(prefix):
+                normalized = normalized[len(prefix):]
+                # Handle camelCase
+                if normalized and normalized[0].isupper():
+                    normalized = normalized[0].lower() + normalized[1:]
+                break
+
+        # Convert to snake_case
+        snake_case = re.sub(r'([A-Z])', r'_\1', normalized).lower().strip('_')
+
+        # Check if it exists in config
+        if snake_case in self.config_field_map:
+            return snake_case
+
+        return None
+
+    def _analyze_handlers(self) -> List[HandlerWiring]:
+        """Analyze handlers and wire them to API operations."""
+        wirings = []
+        handlers = self.ast.get('handlers', [])
+
+        for handler in handlers:
+            name = handler.get('name', '')
+            analysis = handler.get('analysis', {})
+
+            # Get CRUD operation from AST analysis
+            crud_op = analysis.get('crudOperation', 'UNKNOWN')
+            if crud_op == 'UNKNOWN':
+                crud_op = self._detect_crud_operation(name, analysis)
+
+            # Detect target entity
+            entity = self._detect_target_entity(name, analysis)
+
+            # Find matching API
+            api, method = self._find_api_for_handler(crud_op, entity)
+
+            # Get state updates
+            state_updates = analysis.get('stateUpdates', [])
+
+            # Get form fields this handler processes
+            form_fields = self._extract_handler_form_fields(analysis)
+
+            # Get event bindings
+            event_bindings = handler.get('usedInEvents', [])
+
+            # Determine confidence
+            confidence = "HIGH" if api and entity else "MEDIUM" if entity else "LOW"
+
+            wirings.append(HandlerWiring(
+                handler_name=name,
+                crud_operation=crud_op,
+                target_entity=entity or 'unknown',
+                target_api=api,
+                target_method=method,
+                state_updates=state_updates,
+                form_fields=form_fields,
+                event_bindings=event_bindings,
+                confidence=confidence
+            ))
+
+        return wirings
+
+    def _detect_crud_operation(self, handler_name: str, analysis: Dict) -> str:
+        """Detect CRUD operation from handler name and body."""
+        name_lower = handler_name.lower()
+
+        keywords = self.wiring_config.get('handler_operation_keywords', {})
+
+        for operation, kw_list in keywords.items():
+            for kw in kw_list:
+                if kw in name_lower:
+                    return operation.upper()
+
+        # Check for API calls in analysis
+        api_calls = analysis.get('apiCalls', [])
+        for call in api_calls:
+            if 'post' in str(call).lower():
+                return 'CREATE'
+            if 'put' in str(call).lower():
+                return 'UPDATE'
+            if 'delete' in str(call).lower():
+                return 'DELETE'
+
+        return 'UNKNOWN'
+
+    def _detect_target_entity(self, handler_name: str, analysis: Dict) -> Optional[str]:
+        """Detect target entity from handler context."""
+        name_lower = handler_name.lower()
+
+        patterns = self.wiring_config.get('entity_detection_patterns', {})
+
+        for entity, keywords in patterns.items():
+            for kw in keywords:
+                if kw in name_lower:
+                    return entity
+
+        # Check state updates for entity hints
+        state_updates = analysis.get('stateUpdates', [])
+        for update in state_updates:
+            update_lower = str(update).lower()
+            for entity, keywords in patterns.items():
+                for kw in keywords:
+                    if kw in update_lower:
+                        return entity
+
+        return None
+
+    def _find_api_for_handler(self, crud_op: str, entity: Optional[str]) -> Tuple[Optional[str], str]:
+        """Find the API endpoint for a handler's operation."""
+        method_map = {
+            'CREATE': 'POST',
+            'READ': 'GET',
+            'UPDATE': 'PUT',
+            'DELETE': 'DELETE'
+        }
+
+        target_method = method_map.get(crud_op, 'POST')
+
+        if not entity:
+            return None, target_method
+
+        # Find API for this entity and method
+        for api in self.apis:
+            if api.get('entity') == entity and api.get('method') == target_method:
+                return api.get('endpoint'), target_method
+
+        return None, target_method
+
+    def _extract_handler_form_fields(self, analysis: Dict) -> List[str]:
+        """Extract form fields accessed by a handler."""
+        fields = []
+
+        # Check DOM access
+        dom_access = analysis.get('domAccess', [])
+        for access in dom_access:
+            if isinstance(access, dict):
+                field_id = access.get('elementId')
+                if field_id:
+                    fields.append(field_id)
+
+        return fields
+
+    def _analyze_forms(
+        self,
+        state_bindings: List[StateFieldBinding],
+        handler_wirings: List[HandlerWiring]
+    ) -> List[FormWiring]:
+        """Analyze forms and wire them to entities."""
+        form_wirings = []
+        jsx = self.ast.get('jsxStructure', {})
+        forms = jsx.get('forms', [])
+        inputs = jsx.get('inputs', [])
+
+        # Create binding lookup: both state name and input ID to config field
+        id_to_config = {}
+        for b in state_bindings:
+            if b.config_field:
+                id_to_config[b.state_name] = b.config_field
+                # Also add any bound input IDs
+                for inp in b.bound_inputs:
+                    if inp.get('input_id'):
+                        id_to_config[inp['input_id']] = b.config_field
+
+        # Create handler lookup
+        handler_by_name = {h.handler_name: h for h in handler_wirings}
+
+        # If no explicit forms, create implicit form
+        if not forms and inputs:
+            forms = [{'id': None, 'onSubmit': None}]
+
+        for form in forms:
+            form_id = form.get('id')
+            on_submit = form.get('onSubmit', '')
+
+            # Find submit handler
+            submit_handler = None
+            for name, wiring in handler_by_name.items():
+                if name in str(on_submit) or 'submit' in name.lower():
+                    submit_handler = name
+                    break
+
+            # Get form fields with enhanced mapping
+            form_fields = []
+            for inp in inputs:
+                inp_id = inp.get('id')
+                inp_name = inp.get('name')
+                inp_value = str(inp.get('value', ''))
+
+                # Try multiple strategies to find config field
+                config_field = None
+
+                # Strategy 1: Direct ID mapping
+                if inp_id and inp_id in id_to_config:
+                    config_field = id_to_config[inp_id]
+
+                # Strategy 2: Check if state name is in value
+                if not config_field:
+                    for state_name, cfg_field in id_to_config.items():
+                        if state_name in inp_value:
+                            config_field = cfg_field
+                            break
+
+                # Strategy 3: Try to map input ID directly
+                if not config_field and inp_id:
+                    config_field = self._map_input_id_to_config_field(inp_id)
+
+                form_fields.append({
+                    'input_id': inp_id,
+                    'input_name': inp_name,
+                    'input_type': inp.get('type'),
+                    'config_field': config_field,
+                    'line': inp.get('line'),
+                    'mapped': config_field is not None
+                })
+
+            # Determine target entity and CRUD operation
+            target_entity = self.app_config.get('primary_entity', 'items')  # From config
+            crud_op = 'CREATE'
+            api_endpoint = None
+
+            if submit_handler and submit_handler in handler_by_name:
+                hw = handler_by_name[submit_handler]
+                target_entity = hw.target_entity
+                crud_op = hw.crud_operation
+                api_endpoint = hw.target_api
+
+            form_wirings.append(FormWiring(
+                form_id=form_id,
+                target_entity=target_entity,
+                fields=form_fields,
+                submit_handler=submit_handler,
+                crud_operation=crud_op,
+                api_endpoint=api_endpoint
+            ))
+
+        return form_wirings
+
+    def _build_entity_services(self) -> List[Dict[str, Any]]:
+        """Build service definitions for entities.
+
+        Generates config-driven mappings for:
+        - table_column_mappings: API field → table display column name
+        - field_defaults: Default values for fields when creating new items
+        - display_field: Primary field to show when displaying an item
+
+        These are auto-generated from entity field definitions, eliminating hardcoding.
+        """
+        services = []
+
+        for entity_name, entity_def in self.entities.items():
+            # Get APIs for this entity
+            entity_apis = [
+                api for api in self.apis
+                if api.get('entity') == entity_name
+            ]
+
+            fields = entity_def.get('fields', [])
+            primary_key = entity_def.get('primary_key', 'id')
+
+            # Auto-generate table column mappings from field definitions
+            # Maps api_field (snake_case) → display_column (camelCase or short name)
+            table_column_mappings = self._generate_table_column_mappings(fields, primary_key)
+
+            # Auto-generate field defaults from field definitions
+            field_defaults = self._generate_field_defaults(fields, entity_def)
+
+            # Determine the best display field for this entity
+            display_field = self._determine_display_field(fields, primary_key)
+
+            services.append({
+                'entity_name': entity_name,
+                'service_name': self._to_pascal_case(entity_name) + 'Service',
+                'hook_name': f"use{self._to_pascal_case(entity_name)}",
+                'primary_key': primary_key,
+                'primary_key_type': entity_def.get('primary_key_type', 'int'),
+                'display_field': display_field,
+                'fields': fields,
+                'table_column_mappings': table_column_mappings,
+                'field_defaults': field_defaults,
+                'apis': entity_apis,
+                'crud_operations': self._get_crud_operations(entity_apis)
+            })
+
+        return services
+
+    def _generate_table_column_mappings(self, fields: List[Dict], primary_key: str) -> Dict[str, str]:
+        """
+        Auto-generate table column mappings from field definitions.
+
+        Maps API field names (snake_case) to display column names (short/camelCase).
+        Rules:
+        - <entity>_id → 'id' (this is typically the user-facing identifier)
+        - Auto-increment PK (like <pk>_id) → keep as camelCase (internal ID)
+        - *_number fields → remove '_number' suffix (e.g., tracking_number → tracking)
+        - *_name fields → remove '_name' suffix (e.g., vendor_name → vendor)
+        - *_date fields → add 'Added' suffix for created (e.g., created_date → dateAdded)
+        - *_status fields → camelCase (e.g., audit_status → auditStatus)
+        - Other fields → camelCase
+        """
+        mappings = {}
+
+        # Check if primary key is auto-increment (internal) vs user-facing
+        pk_field = next((f for f in fields if f.get('name') == primary_key), None)
+        pk_is_auto_increment = pk_field and pk_field.get('auto_increment', False)
+
+        # User-facing identifier detection - fields ending in _id that are NOT foreign keys
+        fk_indicators = ['vendor_', 'location_', 'user_', 'parent_', 'created_by', 'modified_by']
+
+        def is_user_facing_id(fname):
+            """Check if field is a user-facing identifier (not a foreign key)."""
+            if not fname.endswith('_id'):
+                return False
+            # If it contains a known FK prefix, it's not user-facing
+            return not any(fk in fname for fk in fk_indicators)
+
+        for field in fields:
+            field_name = field.get('name', '')
+            if not field_name:
+                continue
+
+            # Determine display column name based on field patterns
+            if is_user_facing_id(field_name) and field_name != primary_key:
+                # User-facing identifier field → maps to 'id'
+                display_name = 'id'
+            elif field_name == primary_key and pk_is_auto_increment:
+                # Auto-increment PK → internal ID, keep as camelCase
+                display_name = self._to_camel_case(field_name)
+            elif field_name == primary_key:
+                # Non-auto-increment PK → maps to 'id' for table display
+                display_name = 'id' if '_id' in field_name else self._to_camel_case(field_name)
+            elif field_name.endswith('_id') and field_name not in user_facing_id_patterns:
+                # Foreign keys for display: vendor_id → vendor, location_id → location
+                # The table shows short display names, not the full _id suffix
+                display_name = field_name.replace('_id', '')
+            elif field_name.endswith('_number'):
+                # Number fields: tracking_number → tracking
+                display_name = field_name.replace('_number', '')
+            elif field_name.endswith('_name'):
+                # Name fields: vendor_name → vendor
+                display_name = field_name.replace('_name', '')
+            elif field_name == 'created_date':
+                # Special case: created_date → dateAdded
+                display_name = 'dateAdded'
+            elif field_name == 'modified_date':
+                display_name = 'modifiedDate'
+            elif field_name == 'created_by':
+                display_name = 'createdBy'
+            elif field_name == 'modified_by':
+                display_name = 'modifiedBy'
+            elif '_' in field_name:
+                # Other snake_case → camelCase
+                display_name = self._to_camel_case(field_name)
+            else:
+                # Already simple name, keep as-is
+                display_name = field_name
+
+            mappings[field_name] = display_name
+
+        return mappings
+
+    def _generate_field_defaults(self, fields: List[Dict], entity_def: Dict) -> Dict[str, str]:
+        """
+        Auto-generate field defaults from field definitions.
+
+        Returns JavaScript expressions for default values.
+        Rules:
+        - Fields with 'default' in definition → use that default
+        - status fields → get from config.default_status or 'Pending'
+        - disposition fields → get from config.default_disposition or 'Pending'
+        - stage fields → derived from entity name + ' Entry'
+        - quantity fields → 1
+        - created_by → localStorage user
+        - Boolean fields → false
+        - Auto-increment PKs → skip (server-generated)
+        - Other fields → formData.field_name (from lookup)
+        """
+        defaults = {}
+        entity_name = entity_def.get('name', 'Item')
+        primary_key = entity_def.get('primary_key')
+
+        for field in fields:
+            field_name = field.get('name', '')
+            field_type = field.get('type', '').upper()
+            is_auto_increment = field.get('auto_increment', False)
+
+            if not field_name:
+                continue
+
+            # Skip auto-increment primary keys (server-generated)
+            if field_name == primary_key and is_auto_increment:
+                continue
+
+            # Check if field has explicit default in definition
+            if 'default' in field and field['default'] is not None:
+                default_val = field['default']
+                if isinstance(default_val, str):
+                    # Handle SQL defaults like CURRENT_TIMESTAMP
+                    if 'CURRENT_TIMESTAMP' in default_val.upper() or 'NOW()' in default_val.upper():
+                        defaults[field_name] = 'new Date().toISOString()'
+                    elif 'gen_random_uuid' in default_val.lower():
+                        defaults[field_name] = 'crypto.randomUUID()'
+                    else:
+                        defaults[field_name] = f"'{default_val}'"
+                elif isinstance(default_val, bool):
+                    defaults[field_name] = 'true' if default_val else 'false'
+                elif default_val is not None:
+                    defaults[field_name] = str(default_val)
+                continue
+
+            # Auto-generate defaults based on field name/type patterns
+            # All defaults come from config to avoid hardcoding
+            if field_name == 'status':
+                # Get default status from config, fallback to 'Pending'
+                default_status = self._get_config_value('default_status', 'Pending')
+                defaults[field_name] = f"'{default_status}'"
+            elif field_name == 'disposition':
+                # Get default disposition from config, fallback to 'Pending'
+                default_disposition = self._get_config_value('default_disposition', 'Pending')
+                defaults[field_name] = f"'{default_disposition}'"
+            elif field_name == 'stage':
+                # Derive stage from entity name (e.g., <entity>_items → '<ENTITY> Entry')
+                stage_prefix = entity_name.replace('_items', '').replace('_', ' ').upper()
+                defaults[field_name] = f"'{stage_prefix} Entry'"
+            elif field_name == 'quantity':
+                defaults[field_name] = 'formData.quantity || 1'
+            elif field_name == 'created_by':
+                defaults[field_name] = "localStorage.getItem('user_id') || 'current_user'"
+            elif field_name == 'created_date' or field_name.endswith('_date'):
+                defaults[field_name] = 'new Date().toISOString()'
+            elif field_type == 'BOOLEAN':
+                defaults[field_name] = 'false'
+            else:
+                # Default: get from formData (populated by lookup)
+                defaults[field_name] = f'formData.{field_name}'
+
+        return defaults
+
+    def _determine_display_field(self, fields: List[Dict], primary_key: str) -> str:
+        """
+        Determine the best field to display when showing an item.
+
+        Priority:
+        1. User-facing identifier (if exists and not PK)
+        2. name field
+        3. title field
+        4. Primary key
+        """
+        field_names = [f.get('name', '') for f in fields]
+
+        # Priority list of display fields - generic patterns that apply to any domain
+        display_priorities = ['_id', 'name', 'title', 'code', 'number', 'label']
+
+        for priority in display_priorities:
+            for field_name in field_names:
+                if priority in field_name and field_name != primary_key:
+                    return field_name
+
+        # Fall back to primary key
+        return primary_key
+
+    def _to_camel_case(self, snake_str: str) -> str:
+        """Convert snake_case to camelCase."""
+        components = snake_str.split('_')
+        return components[0] + ''.join(x.title() for x in components[1:])
+
+    def _build_screen_mappings(
+        self,
+        state_bindings: List[StateFieldBinding],
+        handler_wirings: List[HandlerWiring]
+    ) -> List[ScreenMapping]:
+        """
+        Build screen mappings from screen_layouts configuration.
+
+        Each screen_layout maps to a user story and contains:
+        - Field mappings with validations
+        - Handler mappings for actions
+        - Workflow definitions for state transitions
+        """
+        screen_mappings = []
+
+        # Build state binding lookup
+        state_binding_map = {b.state_name: b for b in state_bindings}
+
+        # Build handler lookup
+        handler_map = {h.handler_name: h for h in handler_wirings}
+
+        # Get TSX inputs for matching
+        tsx_inputs = self.ast.get('jsxStructure', {}).get('inputs', [])
+        tsx_buttons = self.ast.get('jsxStructure', {}).get('buttons', [])
+
+        for screen_layout in self.screen_layouts:
+            story_id = screen_layout.get('story_id', '')
+            story_title = screen_layout.get('story_title', '')
+            screen_name = screen_layout.get('screen_name', '')
+
+            # Determine TSX screen name (normalize for matching)
+            tsx_screen_name = self._to_pascal_case(screen_name.replace(' ', ''))
+
+            # Extract field mappings from layout sections
+            field_mappings = self._extract_field_mappings_from_layout(
+                screen_layout, tsx_inputs, state_binding_map
+            )
+
+            # Extract handler mappings
+            handler_mappings = self._extract_handler_mappings_from_layout(
+                screen_layout, tsx_buttons, handler_map, story_id
+            )
+
+            # Determine primary entity
+            primary_entity = self._determine_primary_entity_from_layout(screen_layout)
+
+            # Get workflow definition for this story
+            workflow_def = self.workflow_by_story.get(story_id)
+
+            screen_mappings.append(ScreenMapping(
+                tsx_screen_name=tsx_screen_name,
+                story_id=story_id,
+                story_title=story_title,
+                screen_name=screen_name,
+                field_mappings=field_mappings,
+                handler_mappings=handler_mappings,
+                primary_entity=primary_entity,
+                workflow_definition=workflow_def
+            ))
+
+            logger.info(f"Built screen mapping: {story_id} -> {screen_name} ({len(field_mappings)} fields, {len(handler_mappings)} handlers)")
+
+        return screen_mappings
+
+    def _extract_field_mappings_from_layout(
+        self,
+        screen_layout: Dict[str, Any],
+        tsx_inputs: List[Dict],
+        state_binding_map: Dict[str, StateFieldBinding]
+    ) -> List[FieldMapping]:
+        """Extract field mappings from screen layout sections."""
+        field_mappings = []
+
+        layout_sections = screen_layout.get('layout_sections', [])
+
+        for section in layout_sections:
+            section_fields = section.get('fields', [])
+
+            for config_field in section_fields:
+                field_id = config_field.get('id', '')
+                field_label = config_field.get('label', '')
+                field_binding = config_field.get('binding', '')
+
+                # Try to find matching TSX input
+                tsx_match = self._find_tsx_input_match(
+                    field_id, field_label, tsx_inputs, state_binding_map
+                )
+
+                # Extract validations
+                validation_config = config_field.get('validation', {})
+                validations = []
+                error_messages = validation_config.get('error_messages', {})
+
+                for rule in validation_config.get('rules', []):
+                    validations.append({
+                        'rule': rule,
+                        'required': rule == 'required',
+                        'error_message': error_messages.get(rule, f'{field_label} validation failed')
+                    })
+
+                # Check if this is a filter field
+                is_filter = 'filter' in field_id.lower() or 'filter' in field_label.lower()
+
+                field_mappings.append(FieldMapping(
+                    tsx_id=tsx_match.get('id', get_tsx_input_id(field_id)) if tsx_match else get_tsx_input_id(field_id),
+                    tsx_label=tsx_match.get('label', field_label) if tsx_match else field_label,
+                    config_field_id=field_id,
+                    config_label=field_label,
+                    config_binding=field_binding,
+                    confidence=tsx_match.get('confidence', 'LOW') if tsx_match else 'INFERRED',
+                    match_reason=tsx_match.get('reason', 'config-defined') if tsx_match else 'no-tsx-match',
+                    validations=validations,
+                    error_messages=error_messages,
+                    is_filter=is_filter
+                ))
+
+        return field_mappings
+
+    def _find_tsx_input_match(
+        self,
+        field_id: str,
+        field_label: str,
+        tsx_inputs: List[Dict],
+        state_binding_map: Dict[str, StateFieldBinding]
+    ) -> Optional[Dict[str, Any]]:
+        """Find matching TSX input for a config field."""
+
+        # Strategy 1: Exact ID match
+        for inp in tsx_inputs:
+            inp_id = inp.get('id', '')
+            if inp_id and inp_id.lower() == field_id.lower():
+                return {
+                    'id': inp_id,
+                    'label': inp.get('placeholder', field_label),
+                    'confidence': 'HIGH',
+                    'reason': 'exact-id-match'
+                }
+
+        # Strategy 2: Check state bindings
+        for state_name, binding in state_binding_map.items():
+            normalized_state = self._normalize_field_name(state_name)
+            if normalized_state == field_id or field_id in state_name.lower():
+                return {
+                    'id': state_name,
+                    'label': field_label,
+                    'confidence': 'MEDIUM',
+                    'reason': 'state-binding-match'
+                }
+
+        # Strategy 3: Label-based matching
+        field_label_lower = field_label.lower().replace(' ', '')
+        for inp in tsx_inputs:
+            placeholder = inp.get('placeholder') or ''
+            placeholder = placeholder.lower().replace(' ', '')
+            if placeholder and (field_label_lower in placeholder or placeholder in field_label_lower):
+                return {
+                    'id': inp.get('id', ''),
+                    'label': inp.get('placeholder', field_label),
+                    'confidence': 'MEDIUM',
+                    'reason': 'label-match'
+                }
+
+        return None
+
+    def _extract_handler_mappings_from_layout(
+        self,
+        screen_layout: Dict[str, Any],
+        tsx_buttons: List[Dict],
+        handler_map: Dict[str, HandlerWiring],
+        story_id: str
+    ) -> List[HandlerMapping]:
+        """Extract handler mappings from screen layout."""
+        handler_mappings = []
+
+        # Get actions from layout sections
+        layout_sections = screen_layout.get('layout_sections', [])
+
+        for section in layout_sections:
+            section_fields = section.get('fields', [])
+
+            for config_field in section_fields:
+                events = config_field.get('events', {})
+
+                for event_name, handler_name in events.items():
+                    # Try to find matching TSX handler
+                    handler_wiring = handler_map.get(handler_name)
+
+                    # Find button that triggers this
+                    tsx_button = self._find_tsx_button_for_handler(
+                        handler_name, tsx_buttons
+                    )
+
+                    # Determine API endpoint
+                    data_source = config_field.get('data_source', '')
+                    api_method = 'POST' if 'add' in handler_name.lower() or 'create' in handler_name.lower() else 'GET'
+
+                    handler_mappings.append(HandlerMapping(
+                        tsx_function_name=handler_name,
+                        tsx_button_text=tsx_button.get('text', '') if tsx_button else None,
+                        story_id=story_id,
+                        config_action=event_name,
+                        target_api_endpoint=data_source,
+                        target_api_method=api_method,
+                        target_entity=self._extract_entity_from_binding(config_field.get('binding', '')),
+                        confidence='HIGH' if handler_wiring else 'MEDIUM',
+                        match_reason='handler-wiring-match' if handler_wiring else 'config-defined'
+                    ))
+
+        # Also check for workflow-related handlers (Start Workflow, etc.)
+        workflow_def = self.workflow_by_story.get(story_id)
+        if workflow_def:
+            handler_mappings.append(HandlerMapping(
+                tsx_function_name=f"startWorkflow{self._to_pascal_case(story_id.replace(' ', ''))}",
+                tsx_button_text='Start Workflow',
+                story_id=story_id,
+                config_action='workflow_transition',
+                target_api_endpoint='',
+                target_api_method='PUT',
+                target_entity=self._determine_primary_entity_from_layout(screen_layout),
+                confidence='HIGH',
+                match_reason='workflow-definition'
+            ))
+
+        return handler_mappings
+
+    def _find_tsx_button_for_handler(
+        self,
+        handler_name: str,
+        tsx_buttons: List[Dict]
+    ) -> Optional[Dict[str, Any]]:
+        """Find TSX button that triggers a handler."""
+        handler_lower = handler_name.lower()
+
+        for button in tsx_buttons:
+            on_click = button.get('onClick') or ''
+            on_click = on_click.lower()
+            if handler_lower in on_click or handler_name in on_click:
+                return button
+
+            # Also check button text
+            text = button.get('text') or ''
+            text = text.lower()
+            if any(kw in handler_lower for kw in ['add', 'submit', 'save', 'create']):
+                if any(kw in text for kw in ['add', 'submit', 'save', 'create']):
+                    return button
+
+        return None
+
+    def _determine_primary_entity_from_layout(self, screen_layout: Dict[str, Any]) -> str:
+        """Determine primary entity from screen layout bindings."""
+        entity_counts = {}
+
+        for section in screen_layout.get('layout_sections', []):
+            for field in section.get('fields', []):
+                binding = field.get('binding', '')
+                entity = self._extract_entity_from_binding(binding)
+                if entity:
+                    entity_counts[entity] = entity_counts.get(entity, 0) + 1
+
+        if entity_counts:
+            return max(entity_counts, key=entity_counts.get)
+
+        # Get default from config, or use generic 'items' as fallback
+        return self.app_config.get('primary_entity', 'items')
+
+    def _extract_entity_from_binding(self, binding: str) -> str:
+        """Extract entity name from binding like 'entity.field_name'."""
+        if '.' in binding:
+            return binding.split('.')[0].lower()
+        return ''
+
+    def _get_crud_operations(self, apis: List[Dict]) -> Dict[str, str]:
+        """Get CRUD operations available for an entity."""
+        operations = {}
+
+        for api in apis:
+            method = api.get('method', '')
+            endpoint = api.get('endpoint', '')
+
+            if method == 'POST':
+                operations['create'] = endpoint
+            elif method == 'GET' and '{' not in endpoint:
+                operations['list'] = endpoint
+            elif method == 'GET':
+                operations['read'] = endpoint
+            elif method == 'PUT':
+                operations['update'] = endpoint
+            elif method == 'DELETE':
+                operations['delete'] = endpoint
+
+        return operations
+
+    def _generate_injection_points(
+        self,
+        state_bindings: List[StateFieldBinding],
+        handler_wirings: List[HandlerWiring],
+        form_wirings: List[FormWiring]
+    ) -> Dict[str, Any]:
+        """Generate code injection points for the frontend generator."""
+
+        # Import injections
+        import_injections = [
+            {
+                'module': 'services/api',
+                'imports': ['apiClient']
+            }
+        ]
+
+        # Add entity hook imports
+        entities_used = set()
+        for hw in handler_wirings:
+            if hw.target_entity and hw.target_entity != 'unknown':
+                entities_used.add(hw.target_entity)
+
+        for entity in entities_used:
+            import_injections.append({
+                'module': f"hooks/use{self._to_pascal_case(entity)}",
+                'imports': [f"use{self._to_pascal_case(entity)}"]
+            })
+
+        # Hook call injections
+        hook_injections = []
+        for entity in entities_used:
+            hook_injections.append({
+                'hook_name': f"use{self._to_pascal_case(entity)}",
+                'call': f"const {{ create{self._to_pascal_case(entity)}, update{self._to_pascal_case(entity)}, delete{self._to_pascal_case(entity)} }} = use{self._to_pascal_case(entity)}();"
+            })
+
+        # Handler wrapper injections
+        handler_injections = []
+        for hw in handler_wirings:
+            if hw.crud_operation != 'UNKNOWN' and hw.target_api:
+                handler_injections.append({
+                    'handler_name': hw.handler_name,
+                    'operation': hw.crud_operation,
+                    'entity': hw.target_entity,
+                    'api': hw.target_api,
+                    'form_fields': hw.form_fields
+                })
+
+        return {
+            'imports': import_injections,
+            'hooks': hook_injections,
+            'handlers': handler_injections
+        }
+
+    def _calculate_coverage(
+        self,
+        state_bindings: List[StateFieldBinding],
+        handler_wirings: List[HandlerWiring],
+        form_wirings: List[FormWiring]
+    ) -> Dict[str, Any]:
+        """Calculate wiring coverage metrics."""
+
+        # State binding coverage
+        total_states = len(state_bindings)
+        bound_states = sum(1 for b in state_bindings if b.binding_strength == "STRONG")
+
+        # Handler coverage
+        total_handlers = len(handler_wirings)
+        wired_handlers = sum(1 for h in handler_wirings if h.confidence == "HIGH")
+
+        # Form field coverage
+        total_fields = sum(len(f.fields) for f in form_wirings)
+        mapped_fields = sum(
+            1 for f in form_wirings
+            for field in f.fields
+            if field.get('mapped') or field.get('config_field')
+        )
+
+        return {
+            'state_bindings': {
+                'total': total_states,
+                'strong': bound_states,
+                'coverage_percent': round(bound_states / total_states * 100) if total_states else 100
+            },
+            'handlers': {
+                'total': total_handlers,
+                'wired': wired_handlers,
+                'coverage_percent': round(wired_handlers / total_handlers * 100) if total_handlers else 100
+            },
+            'form_fields': {
+                'total': total_fields,
+                'mapped': mapped_fields,
+                'coverage_percent': round(mapped_fields / total_fields * 100) if total_fields else 100
+            },
+            'overall_score': self._calculate_overall_score(
+                bound_states, total_states,
+                wired_handlers, total_handlers,
+                mapped_fields, total_fields
+            )
+        }
+
+    def _calculate_overall_score(
+        self,
+        bound_states: int, total_states: int,
+        wired_handlers: int, total_handlers: int,
+        mapped_fields: int, total_fields: int
+    ) -> str:
+        """Calculate overall wiring quality score."""
+        scores = []
+
+        if total_states:
+            scores.append(bound_states / total_states)
+        if total_handlers:
+            scores.append(wired_handlers / total_handlers)
+        if total_fields:
+            scores.append(mapped_fields / total_fields)
+
+        if not scores:
+            return "N/A"
+
+        avg = sum(scores) / len(scores)
+
+        if avg >= 0.9:
+            return "EXCELLENT"
+        elif avg >= 0.7:
+            return "GOOD"
+        elif avg >= 0.5:
+            return "FAIR"
+        else:
+            return "NEEDS_WORK"
+
+    def _build_summary(
+        self,
+        state_bindings: List[StateFieldBinding],
+        handler_wirings: List[HandlerWiring],
+        form_wirings: List[FormWiring],
+        screen_mappings: List[ScreenMapping] = None
+    ) -> Dict[str, Any]:
+        """Build wiring summary for logging."""
+        screen_mappings = screen_mappings or []
+
+        return {
+            'total_state_bindings': len(state_bindings),
+            'strong_bindings': sum(1 for b in state_bindings if b.binding_strength == "STRONG"),
+            'total_handlers': len(handler_wirings),
+            'handlers_by_operation': {
+                'CREATE': sum(1 for h in handler_wirings if h.crud_operation == 'CREATE'),
+                'READ': sum(1 for h in handler_wirings if h.crud_operation == 'READ'),
+                'UPDATE': sum(1 for h in handler_wirings if h.crud_operation == 'UPDATE'),
+                'DELETE': sum(1 for h in handler_wirings if h.crud_operation == 'DELETE'),
+                'UNKNOWN': sum(1 for h in handler_wirings if h.crud_operation == 'UNKNOWN')
+            },
+            'total_forms': len(form_wirings),
+            'total_form_fields': sum(len(f.fields) for f in form_wirings),
+            'total_screen_mappings': len(screen_mappings),
+            'screen_mappings_detail': [
+                {
+                    'story_id': sm.story_id,
+                    'screen_name': sm.screen_name,
+                    'field_count': len(sm.field_mappings),
+                    'handler_count': len(sm.handler_mappings),
+                    'has_workflow': sm.workflow_definition is not None
+                }
+                for sm in screen_mappings
+            ]
+        }
+
+    def _to_pascal_case(self, name: str) -> str:
+        """Convert name to PascalCase."""
+        return ''.join(
+            word.capitalize()
+            for word in re.split(r'[^a-zA-Z0-9]+', name)
+            if word
+        )
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Generate AST-based frontend wiring plan'
+    )
+    parser.add_argument(
+        '-a', '--app-config',
+        required=True,
+        help='Path to application config JSON'
+    )
+    parser.add_argument(
+        '-t', '--tsx-metadata',
+        required=True,
+        help='Path to TSX AST metadata JSON'
+    )
+    parser.add_argument(
+        '-o', '--output',
+        default='config_output/wired_ui_ast.json',
+        help='Output path for wiring plan'
+    )
+    parser.add_argument(
+        '-v', '--verbose',
+        action='store_true',
+        help='Enable verbose logging'
+    )
+
+    args = parser.parse_args()
+
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    print("=" * 70)
+    print("STEP 7b: AST-BASED FRONTEND WIRING")
+    print("=" * 70)
+    print(f"App Config: {args.app_config}")
+    print(f"TSX Metadata: {args.tsx_metadata}")
+    print(f"Output: {args.output}")
+    print("-" * 70)
+
+    # Load inputs
+    with open(args.app_config, 'r', encoding='utf-8') as f:
+        app_config = json.load(f)
+
+    with open(args.tsx_metadata, 'r', encoding='utf-8') as f:
+        tsx_metadata = json.load(f)
+
+    # Generate wiring plan
+    planner = AstWiringPlanner(app_config, tsx_metadata)
+    wiring_plan = planner.generate_wiring_plan()
+
+    # Write output
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(output_path, 'w', encoding='utf-8') as f:
+        json.dump(wiring_plan, f, indent=2)
+
+    # Print summary
+    summary = wiring_plan['wiring_summary']
+    coverage = wiring_plan['coverage_report']
+
+    print("\n" + "=" * 70)
+    print("WIRING COMPLETE")
+    print("=" * 70)
+    print(f"\nState Bindings: {summary['total_state_bindings']} total, {summary['strong_bindings']} strong")
+    print(f"Handlers: {summary['total_handlers']} total")
+    print(f"  - CREATE: {summary['handlers_by_operation']['CREATE']}")
+    print(f"  - UPDATE: {summary['handlers_by_operation']['UPDATE']}")
+    print(f"  - DELETE: {summary['handlers_by_operation']['DELETE']}")
+    print(f"  - UNKNOWN: {summary['handlers_by_operation']['UNKNOWN']}")
+    print(f"Forms: {summary['total_forms']} with {summary['total_form_fields']} fields")
+
+    print(f"\n--- Screen Mappings (User Story Hooks) ---")
+    print(f"Total: {summary.get('total_screen_mappings', 0)}")
+    for sm in summary.get('screen_mappings_detail', []):
+        workflow_str = " [WORKFLOW]" if sm['has_workflow'] else ""
+        print(f"  - {sm['story_id']}: {sm['screen_name']} ({sm['field_count']} fields, {sm['handler_count']} handlers){workflow_str}")
+
+    print("\n--- Coverage Report ---")
+    print(f"State Bindings: {coverage['state_bindings']['coverage_percent']}%")
+    print(f"Handlers: {coverage['handlers']['coverage_percent']}%")
+    print(f"Form Fields: {coverage['form_fields']['coverage_percent']}%")
+    print(f"Overall Score: {coverage['overall_score']}")
+
+    print("\n" + "=" * 70)
+    print(f"Output: {output_path}")
+    print("=" * 70)
+
+
+if __name__ == '__main__':
+    main()
+"
