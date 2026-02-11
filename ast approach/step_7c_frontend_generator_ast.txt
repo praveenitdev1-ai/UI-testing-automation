@@ -1,0 +1,1813 @@
+"#!/usr/bin/env python3
+"""
+Frontend Generator AST - Phase 2 Task 3
+========================================
+Generates transformed TSX code using AST-based analysis and wiring.
+
+This script:
+1. Runs the AST extractor (step_7a) to get metadata
+2. Runs the wiring analyzer (step_7b) to get wiring config
+3. Calls the Node.js AST transformer to apply transformations
+4. Outputs the transformed TSX file
+
+Usage:
+    python step_7c_frontend_generator_ast.py -i Inputs/ui_react_component.tsx -o Generated/frontend/src/components/NSIManagement.tsx
+"""
+
+import subprocess
+import json
+import argparse
+import logging
+import shutil
+import sys
+from pathlib import Path
+from datetime import datetime
+from typing import Dict, Any, Optional, List
+
+# Add Templates to path for ui_capabilities import
+sys.path.insert(0, str(Path(__file__).parent / 'Templates'))
+
+# Import UI Capability Renderer for config-driven code generation
+try:
+    from ui_capabilities.pattern_matcher import UIPatternMatcher
+    from ui_capabilities.renderer import UICapabilityRenderer, RenderedCapability
+    UI_CAPABILITIES_AVAILABLE = True
+except ImportError:
+    UI_CAPABILITIES_AVAILABLE = False
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+
+class FrontendGeneratorAST:
+    """
+    Orchestrates the AST-based frontend generation pipeline.
+
+    Pipeline:
+    1. AST Extraction (tsx_ast_extractor.js)
+    2. Wiring Analysis (step_7b_frontend_wiring_ast.py)
+    3. AST Transformation (tsx_ast_transformer.js)
+    """
+
+    def __init__(self, tsx_input: str, output_path: str):
+        self.tsx_input = Path(tsx_input)
+        self.output_path = Path(output_path)
+        self.script_dir = Path(__file__).parent
+
+        # Tool paths
+        self.ast_tools_dir = self.script_dir / 'ast_tools'
+        self.config_output_dir = self.script_dir / 'config_output'
+
+        # Intermediate files
+        self.ast_metadata_path = self.config_output_dir / 'tsx_ast_metadata.json'
+        self.wiring_config_path = self.config_output_dir / 'wired_ui_ast.json'
+
+        # Validate input
+        if not self.tsx_input.exists():
+            raise FileNotFoundError(f"TSX input file not found: {self.tsx_input}")
+
+        # Ensure output directory exists
+        self.output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # CONFIG-DRIVEN: Load application config for entity information
+        self.app_config = self._load_application_config()
+        self.primary_entity = self._get_primary_entity()
+        self.app_metadata = self.app_config.get('metadata', {})
+        logger.info(f"Config-driven mode: primary_entity={self.primary_entity}")
+
+    def _load_application_config(self) -> Dict[str, Any]:
+        """Load application_config.json for entity and app metadata."""
+        config_path = self.config_output_dir / 'application_config.json'
+        if config_path.exists():
+            with open(config_path) as f:
+                return json.load(f)
+        logger.warning("application_config.json not found - using defaults")
+        return {}
+
+    def _get_primary_entity(self) -> str:
+        """
+        Determine the primary entity from config.
+
+        The primary entity is the main entity that drives the UI.
+        Determined by:
+        1. Explicit primary_entity in config
+        2. First entity in database_schema.tables with most columns
+        3. Fallback to first entity in schema
+        """
+        # Check for explicit primary_entity
+        if 'primary_entity' in self.app_config:
+            return self.app_config['primary_entity']
+
+        # Get from database_schema
+        db_schema = self.app_config.get('database_schema', {})
+        tables = db_schema.get('tables', [])
+
+        if not tables:
+            logger.warning("No tables found in config - using default entity")
+            return 'items'  # Generic fallback
+
+        # Find table with most columns (likely the main entity)
+        primary_table = max(tables, key=lambda t: len(t.get('columns', [])))
+        return primary_table.get('name', 'items')
+
+    def _get_entity_fields(self, entity_name: str) -> List[Dict[str, Any]]:
+        """Get field definitions for an entity from config."""
+        db_schema = self.app_config.get('database_schema', {})
+        for table in db_schema.get('tables', []):
+            if table.get('name') == entity_name:
+                return table.get('columns', [])
+        return []
+
+    def _get_primary_key(self, entity_name: str) -> str:
+        """Get primary key field name for an entity."""
+        db_schema = self.app_config.get('database_schema', {})
+        for table in db_schema.get('tables', []):
+            if table.get('name') == entity_name:
+                pks = table.get('primary_keys', [])
+                if pks:
+                    return pks[0]
+                # Fallback: find column with primary_key=True
+                for col in table.get('columns', []):
+                    if col.get('primary_key'):
+                        return col.get('name')
+        return 'id'  # Generic fallback
+
+    def run_pipeline(self, skip_extraction: bool = False, skip_wiring: bool = False) -> Dict[str, Any]:
+        """
+        Run the complete frontend generation pipeline.
+
+        Args:
+            skip_extraction: If True, use existing AST metadata
+            skip_wiring: If True, use existing wiring config
+
+        Returns:
+            Pipeline execution summary
+        """
+        summary = {
+            'started_at': datetime.now().isoformat(),
+            'steps': [],
+            'success': False
+        }
+
+        try:
+            # Step 1: AST Extraction
+            if not skip_extraction:
+                logger.info("Step 1: Running AST extraction...")
+                extraction_result = self._run_ast_extraction()
+                summary['steps'].append({
+                    'name': 'ast_extraction',
+                    'success': extraction_result['success'],
+                    'output': str(self.ast_metadata_path)
+                })
+                if not extraction_result['success']:
+                    raise RuntimeError(f"AST extraction failed: {extraction_result.get('error')}")
+            else:
+                logger.info("Step 1: Skipping AST extraction (using existing)")
+                summary['steps'].append({
+                    'name': 'ast_extraction',
+                    'success': True,
+                    'skipped': True
+                })
+
+            # Step 2: Wiring Analysis
+            if not skip_wiring:
+                logger.info("Step 2: Running wiring analysis...")
+                wiring_result = self._run_wiring_analysis()
+                summary['steps'].append({
+                    'name': 'wiring_analysis',
+                    'success': wiring_result['success'],
+                    'output': str(self.wiring_config_path)
+                })
+                if not wiring_result['success']:
+                    raise RuntimeError(f"Wiring analysis failed: {wiring_result.get('error')}")
+            else:
+                logger.info("Step 2: Skipping wiring analysis (using existing)")
+                summary['steps'].append({
+                    'name': 'wiring_analysis',
+                    'success': True,
+                    'skipped': True
+                })
+
+            # Step 3: AST Transformation
+            logger.info("Step 3: Running AST transformation...")
+            transform_result = self._run_ast_transformation()
+            summary['steps'].append({
+                'name': 'ast_transformation',
+                'success': transform_result['success'],
+                'output': str(self.output_path),
+                'modifications': transform_result.get('modifications', {})
+            })
+
+            if not transform_result['success']:
+                raise RuntimeError(f"AST transformation failed: {transform_result.get('error')}")
+
+            # Step 4: Post-process App.tsx (add TypeScript types, fix imports)
+            logger.info("Step 4: Post-processing App.tsx...")
+            postprocess_result = self._postprocess_app_tsx()
+            summary['steps'].append({
+                'name': 'postprocess_app_tsx',
+                'success': postprocess_result['success'],
+                'fixes': postprocess_result.get('fixes', [])
+            })
+
+            # Step 5: Clean up orphan components (modals from LLM version, etc.)
+            logger.info("Step 5: Cleaning up orphan components...")
+            cleanup_result = self._cleanup_orphan_components()
+            summary['steps'].append({
+                'name': 'cleanup_orphans',
+                'success': cleanup_result['success'],
+                'removed': cleanup_result.get('removed', [])
+            })
+
+            # Step 6: Generate supporting files (index.tsx, etc.)
+            logger.info("Step 6: Generating supporting files...")
+            support_result = self._generate_supporting_files()
+            summary['steps'].append({
+                'name': 'supporting_files',
+                'success': support_result['success'],
+                'files': support_result.get('files', [])
+            })
+
+            summary['success'] = True
+            summary['output_file'] = str(self.output_path)
+
+        except Exception as e:
+            logger.error(f"Pipeline failed: {e}")
+            summary['error'] = str(e)
+
+        summary['completed_at'] = datetime.now().isoformat()
+        return summary
+
+    def _run_ast_extraction(self) -> Dict[str, Any]:
+        """Run the Node.js AST extractor."""
+        try:
+            # Ensure dependencies are installed
+            self._ensure_node_dependencies()
+
+            # Run the extractor
+            extractor_script = self.ast_tools_dir / 'tsx_ast_extractor.js'
+            result = subprocess.run(
+                ['node', str(extractor_script), str(self.tsx_input)],
+                capture_output=True,
+                text=True,
+                cwd=str(self.script_dir)
+            )
+
+            if result.returncode != 0:
+                return {
+                    'success': False,
+                    'error': result.stderr
+                }
+
+            # Parse and save metadata
+            metadata = json.loads(result.stdout)
+            with open(self.ast_metadata_path, 'w') as f:
+                json.dump(metadata, f, indent=2)
+
+            logger.info(f"AST metadata saved to {self.ast_metadata_path}")
+            return {'success': True, 'metadata': metadata}
+
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+
+    def _run_wiring_analysis(self) -> Dict[str, Any]:
+        """Run the wiring analysis script."""
+        try:
+            # Import and run the wiring script
+            wiring_script = self.script_dir / 'step_7b_frontend_wiring_ast.py'
+
+            result = subprocess.run(
+                [
+                    'python3', str(wiring_script),
+                    '-a', str(self.config_output_dir / 'application_config.json'),  # -a is app-config
+                    '-t', str(self.ast_metadata_path),  # -t is tsx-metadata
+                    '-o', str(self.wiring_config_path)
+                ],
+                capture_output=True,
+                text=True,
+                cwd=str(self.script_dir)
+            )
+
+            if result.returncode != 0:
+                return {
+                    'success': False,
+                    'error': result.stderr
+                }
+
+            logger.info(f"Wiring config saved to {self.wiring_config_path}")
+            return {'success': True}
+
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+
+    def _run_ast_transformation(self) -> Dict[str, Any]:
+        """Run the Node.js AST transformer."""
+        try:
+            transformer_script = self.ast_tools_dir / 'tsx_ast_transformer.js'
+
+            result = subprocess.run(
+                [
+                    'node', str(transformer_script),
+                    str(self.tsx_input),
+                    str(self.wiring_config_path),
+                    str(self.output_path)
+                ],
+                capture_output=True,
+                text=True,
+                cwd=str(self.script_dir)
+            )
+
+            if result.returncode != 0:
+                return {
+                    'success': False,
+                    'error': result.stderr
+                }
+
+            # Parse modification summary from stderr
+            modifications = self._parse_modification_summary(result.stderr)
+
+            logger.info(f"Transformed TSX saved to {self.output_path}")
+            return {
+                'success': True,
+                'modifications': modifications
+            }
+
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+
+    def _ensure_node_dependencies(self):
+        """Ensure Node.js dependencies are installed."""
+        node_modules = self.ast_tools_dir / 'node_modules'
+        if not node_modules.exists():
+            logger.info("Installing Node.js dependencies...")
+            result = subprocess.run(
+                ['npm', 'install'],
+                capture_output=True,
+                text=True,
+                cwd=str(self.ast_tools_dir)
+            )
+            if result.returncode != 0:
+                logger.warning(f"npm install warning: {result.stderr}")
+
+    def _parse_modification_summary(self, stderr: str) -> Dict[str, int]:
+        """Parse modification counts from transformer stderr output."""
+        modifications = {}
+
+        lines = stderr.split('\n')
+        for line in lines:
+            if 'Imports added:' in line:
+                modifications['imports'] = int(line.split(':')[1].strip())
+            elif 'Hooks injected:' in line:
+                modifications['hooks'] = int(line.split(':')[1].strip())
+            elif 'Handlers wrapped:' in line:
+                modifications['handlers'] = int(line.split(':')[1].strip())
+            elif 'IDs injected:' in line:
+                modifications['ids'] = int(line.split(':')[1].strip())
+
+        return modifications
+
+    def _postprocess_app_tsx(self) -> Dict[str, Any]:
+        """
+        Post-process the generated App.tsx to:
+        - Add type annotations to function parameters
+        - Wire useNsiItems hook for API integration (shared data between screens)
+        - Fix any import path issues
+        """
+        import re
+
+        try:
+            fixes = []
+
+            # Read the generated App.tsx
+            with open(self.output_path, 'r') as f:
+                content = f.read()
+
+            original_content = content
+
+            # Fix 1: Add types to common callback parameters
+            # Pattern: (message, type) => or (message,type)=>
+            type_fixes = [
+                # showNotification(message, type)
+                (r'const showNotification = \(message, type\)',
+                 'const showNotification = (message: string, type: string)'),
+                (r'const showNotification=\(message,type\)',
+                 'const showNotification = (message: string, type: string)'),
+
+                # showModal(content)
+                (r'const showModal = \(content\)',
+                 'const showModal = (content: string)'),
+                (r'const showModal=\(content\)',
+                 'const showModal = (content: string)'),
+
+                # showScreen(screenId)
+                (r'const showScreen = \(screenId\)',
+                 'const showScreen = (screenId: string)'),
+                (r'const showScreen=\(screenId\)',
+                 'const showScreen = (screenId: string)'),
+
+                # Generic event handlers
+                (r'\(e\) =>', '(e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>) =>'),
+                (r'\(event\) =>', '(event: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>) =>'),
+
+                # onClick handlers with event
+                (r'onClick=\{\(e\) =>', 'onClick={(e: React.MouseEvent) =>'),
+                (r'onClick=\{\(event\) =>', 'onClick={(event: React.MouseEvent) =>'),
+
+                # onChange with specific target value access - be more careful
+                (r'onChange=\{\(e\) => \{', 'onChange={(e: React.ChangeEvent<HTMLSelectElement>) => {'),
+
+                # item, index in map
+                (r'\.map\(\(item, index\) =>', '.map((item: any, index: number) =>'),
+                (r'\.map\(\(item\) =>', '.map((item: any) =>'),
+            ]
+
+            for pattern, replacement in type_fixes:
+                if re.search(pattern, content):
+                    content = re.sub(pattern, replacement, content)
+                    fixes.append(f"Applied type fix: {pattern[:40]}...")
+
+            # Fix 2: Wire API hook for data sharing between screens
+            # CONFIG-DRIVEN: Use primary_entity from application_config.json
+            if UI_CAPABILITIES_AVAILABLE:
+                logger.info(f"Using config-driven UI capability wiring for entity: {self.primary_entity}")
+                content = self._wire_api_data_sharing_v2(content, fixes, entity_name=self.primary_entity)
+            else:
+                logger.info("Using legacy hardcoded wiring (UI capabilities not available)")
+                content = self._wire_api_data_sharing(content, fixes)
+
+            # Write back if changed
+            if content != original_content:
+                with open(self.output_path, 'w') as f:
+                    f.write(content)
+                logger.info(f"Post-processed App.tsx with {len(fixes)} fixes")
+            else:
+                logger.info("No post-processing needed for App.tsx")
+
+            return {'success': True, 'fixes': fixes}
+
+        except Exception as e:
+            logger.error(f"Failed to post-process App.tsx: {e}")
+            return {'success': False, 'error': str(e), 'fixes': []}
+
+    def _wire_api_data_sharing(self, content: str, fixes: list) -> str:
+        """
+        DEPRECATED LEGACY FALLBACK: Wire the entity hook to provide shared data.
+
+        WARNING: This method is deprecated and should NOT be used.
+        The preferred path is _wire_api_data_sharing_v2 which uses config-driven templates.
+
+        This method only runs if:
+        1. UI_CAPABILITIES_AVAILABLE is False (templates not installed)
+        2. Or _wire_api_data_sharing_v2 throws an exception
+
+        TODO: Remove this method entirely once config-driven approach is stable.
+        """
+        import re
+
+        logger.warning("Using LEGACY hardcoded wiring - this should be avoided!")
+        logger.warning("Please ensure UI Capability templates are properly installed")
+
+        # Get entity name from config for dynamic hook naming
+        entity_name = self.app_config.get('primary_entity', 'items')
+        entity_pascal = ''.join(word.title() for word in entity_name.split('_'))
+        entity_camel = entity_pascal[0].lower() + entity_pascal[1:]
+
+        # Step 1: Update the entity hook destructure - MINIMAL version
+        # NOTE: Handlers should come from templates, not hardcoded here
+        old_destructure_pattern = rf"const \{{ create{entity_pascal}, update{entity_pascal}, delete{entity_pascal} \}} = use{entity_pascal}\(\);"
+        new_destructure = f"""const {{
+    data: {entity_camel},
+    loading: {entity_camel}Loading,
+    error: {entity_camel}Error,
+    fetch{entity_pascal}s,
+    create{entity_pascal},
+    update{entity_pascal},
+    delete{entity_pascal},
+    lookupByTracking,
+    checkDuplicate{entity_pascal},
+    create{entity_pascal}WithCheck,
+    setData: set{entity_pascal}
+  }} = use{entity_pascal}();
+
+  // State for auto-populated form fields (AC1, AC4)
+  const [formData, setFormData] = React.useState<any>({{}});
+  // Dynamic items list is now derived from entity API data (see getFilteredItems)
+  // NOTE: Handlers (handleScanLookup, addToList) should be generated from templates"""
+
+        if re.search(old_destructure_pattern, content):
+            content = re.sub(old_destructure_pattern, new_destructure, content)
+            fixes.append(f"Wired use{entity_pascal} hook (LEGACY fallback - no handlers)")
+
+        # Step 2: Remove the hardcoded worklistItems useState (it's now derived from API)
+        hardcoded_useState_pattern = r"const \[worklistItems, setWorklistItems\] = useState\(\[\s*\{[\s\S]*?\}\s*\]\);"
+        if re.search(hardcoded_useState_pattern, content):
+            content = re.sub(hardcoded_useState_pattern, "// worklistItems is now derived from useNsiItems hook data above", content)
+            fixes.append("Replaced hardcoded worklistItems with API-driven data")
+
+        # NOTE: addToWorklist replacement removed - should come from worklist_add.ts.j2 template
+        # NOTE: handleScanLookup removed - should come from lookup_handler.ts.j2 template
+
+        # Step 3: Wire Scan button to call handleScanLookup (AC1, AC4)
+        # This is safe - just wiring, not generating the handler
+        scan_button_pattern = r"onClick=\{\(\) => showNotification\('Scanning\.\.\.', 'success'\)\}"
+        scan_button_replacement = "onClick={handleScanLookup}"
+        if re.search(scan_button_pattern, content):
+            content = re.sub(scan_button_pattern, scan_button_replacement, content)
+            fixes.append("Wired Scan button to handleScanLookup for AC1/AC4 auto-populate")
+
+        return content
+
+    def _wire_api_data_sharing_v2(self, content: str, fixes: list, entity_name: str = None) -> str:
+        """
+        CONFIG-DRIVEN VERSION: Wire API data sharing using UI Capability Templates.
+
+        Instead of hardcoded strings, this method:
+        1. Reads entity_validations.json for lookup/validation config
+        2. Reads wired_ui_ast.json for field ID mappings
+        3. Uses UI Capability Templates to generate code
+
+        This is the scalable approach - new user stories only need config, not code changes.
+        """
+        # Get entity name from config if not provided
+        if entity_name is None:
+            entity_name = self.app_config.get('primary_entity', 'items')
+        import re
+
+        if not UI_CAPABILITIES_AVAILABLE:
+            logger.warning("UI Capabilities not available, falling back to hardcoded wiring")
+            return self._wire_api_data_sharing(content, fixes)
+
+        try:
+            # Initialize capability renderer with config paths
+            entity_validations_path = str(self.config_output_dir / 'entity_validations.json')
+            wired_ui_ast_path = str(self.wiring_config_path)
+
+            renderer = UICapabilityRenderer(entity_validations_path, wired_ui_ast_path)
+            pattern_matcher = UIPatternMatcher(entity_validations_path, wired_ui_ast_path)
+
+            # Discover patterns for this entity
+            patterns = pattern_matcher.discover_patterns(entity_name)
+            logger.info(f"Discovered {len(patterns)} UI patterns for {entity_name}: {[p.pattern_type for p in patterns]}")
+
+            # Render all capabilities
+            rendered_capabilities = renderer.render_entity(entity_name)
+
+            # Group by injection point
+            by_injection = {}
+            for cap in rendered_capabilities:
+                point = cap.injection_point
+                if point not in by_injection:
+                    by_injection[point] = []
+                by_injection[point].append(cap)
+
+            # Build the hook destructure dynamically from config
+            entity_service = pattern_matcher.get_entity_service(entity_name)
+            entity_pascal = entity_name.replace('_', ' ').title().replace(' ', '')
+
+            # Check what capabilities are needed
+            has_lookup = any(p.pattern_type == 'SCAN_LOOKUP' for p in patterns)
+            has_duplicate_check = any(p.pattern_type == 'DUPLICATE_CHECK' for p in patterns)
+
+            hook_functions = [
+                f'data: {entity_name.replace("_", "")}',
+                f'loading: {entity_name.replace("_", "")}Loading',
+                f'error: {entity_name.replace("_", "")}Error',
+                f'fetch{entity_pascal}s',
+                f'create{entity_pascal}',
+                f'update{entity_pascal}',
+                f'delete{entity_pascal}',
+            ]
+
+            if has_lookup:
+                lookup_entity = pattern_matcher.get_lookup_config(entity_name)
+                if lookup_entity:
+                    lookup_entity_name = lookup_entity.get('lookup_entity', 'source_data')
+                    lookup_pascal = lookup_entity_name.replace('_', ' ').title().replace(' ', '')
+                    hook_functions.append(f'lookup{lookup_pascal}ByTracking')
+
+            if has_duplicate_check:
+                hook_functions.append(f'checkDuplicate{entity_pascal}')
+                hook_functions.append(f'create{entity_pascal}WithCheck')
+
+            hook_functions.append(f'setData: set{entity_pascal}')
+
+            # Build the new destructure statement
+            hook_destructure = f"""const {{
+    {','.join(chr(10) + '    ' + f for f in hook_functions)}
+  }} = use{entity_pascal}();
+
+  // State for auto-populated form fields (from config-driven lookup)
+  const [formData, setFormData] = React.useState<any>({{}});"""
+
+            # Build handlers from rendered capabilities
+            # Indent each line by 2 spaces to be inside the component
+            # NOTE: Exclude worklist_add since we handle addToWorklist replacement separately
+            handlers_code = ""
+            for cap in by_injection.get('handlers', []):
+                # Skip worklist_add - it's replaced separately below using render_worklist_add()
+                if cap.capability_name == 'worklist_add':
+                    continue
+                # Skip duplicate_checker - worklist_add template already includes AC3 duplicate checking
+                # Having both creates duplicate functions (addToWorklist AND addToWorklistWithCheck)
+                if cap.capability_name == 'duplicate_checker':
+                    continue
+                # Indent each line of the handler code
+                indented_code = '\n'.join('  ' + line if line.strip() else line for line in cap.code.split('\n'))
+                handlers_code += f"\n\n{indented_code}"
+                fixes.append(f"Generated {cap.capability_name} from config (implements {', '.join(cap.ac_ids)})")
+
+            # Build utilities from rendered capabilities
+            # NOTE: Exclude worklist_filter since we handle getFilteredWorklistItems replacement separately
+            utilities_code = ""
+            for cap in by_injection.get('utilities', []):
+                # Skip worklist_filter - it's replaced separately via render_worklist_filter()
+                if cap.capability_name == 'worklist_filter':
+                    continue
+                # Indent each line of the utility code
+                indented_code = '\n'.join('  ' + line if line.strip() else line for line in cap.code.split('\n'))
+                utilities_code += f"\n\n{indented_code}"
+                fixes.append(f"Generated {cap.capability_name} utility from config")
+
+            # Build effects from rendered capabilities
+            effects_code = ""
+            for cap in by_injection.get('effects', []):
+                effects_code += f"\n\n  {cap.code}"
+                fixes.append(f"Generated {cap.capability_name} effect from config")
+
+            # IMPORTANT: Only inject hook destructure + formData at the hook location
+            # Handlers must be injected AFTER showNotification is defined to avoid reference errors
+            new_hook_block = hook_destructure
+
+            # Replace the old destructure pattern with new config-driven hook only
+            old_destructure_pattern = r"const \{ createNsiItems, updateNsiItems, deleteNsiItems \} = useNsiItems\(\);"
+            if re.search(old_destructure_pattern, content):
+                old_literal = "const { createNsiItems, updateNsiItems, deleteNsiItems } = useNsiItems();"
+                content = content.replace(old_literal, new_hook_block)
+                fixes.append(f"Wired use{entity_pascal} hook with config-driven capabilities")
+
+            # CRITICAL: Replace getFilteredWorklistItems BEFORE injecting handlers
+            # Otherwise the injected utilities contain a new getFilteredWorklistItems function
+            # and the regex below will match from the new one to the old one, capturing
+            # everything in between (including showModal, closeModal, etc.)
+            old_getFiltered_pattern = r"const getFilteredWorklistItems = \(\) => \{[\s\S]*?return worklistItems;[\s\S]*?\};"
+            new_getFiltered = renderer.render_worklist_filter(entity_name)
+            if re.search(old_getFiltered_pattern, content):
+                content = re.sub(old_getFiltered_pattern, new_getFiltered, content)
+                fixes.append("Updated getFilteredWorklistItems using config-driven worklist_filter template")
+
+            # Inject handlers AFTER showNotification is defined
+            # Find the showNotification function and inject handlers after it
+            # Pattern matches both JS and TS versions (with or without type annotations)
+            show_notification_pattern = r"(const showNotification = \([^)]*\) => \{[\s\S]*?setTimeout\([\s\S]*?\}, \d+\);\s*\};)"
+
+            # Build the combined handler code to inject
+            # NOTE: utilities_code may contain getFilteredWorklistItems but we already replaced
+            # the old one above, so the utilities one is a no-op duplicate that won't cause issues
+            all_handlers_code = handlers_code + utilities_code + effects_code
+
+            match = re.search(show_notification_pattern, content)
+            if match:
+                # Use string replace instead of re.sub to avoid escape issues
+                matched_text = match.group(0)
+                content = content.replace(matched_text, matched_text + all_handlers_code, 1)
+                fixes.append("Injected capability handlers after showNotification definition")
+            else:
+                # Fallback: inject after the formData useState if showNotification pattern not found
+                formdata_marker = "const [formData, setFormData] = React.useState<any>({});"
+                if formdata_marker in content:
+                    content = content.replace(formdata_marker, formdata_marker + all_handlers_code, 1)
+                    fixes.append("Injected capability handlers after formData state (fallback)")
+
+            # Wire button handlers from config
+            # Get trigger event from lookup_requirements
+            lookup_req = pattern_matcher.get_lookup_requirements()
+            if lookup_req:
+                trigger_event = lookup_req.get('trigger_event', 'onScan').replace('on', '')
+                handler_name = f'handle{trigger_event.capitalize()}Lookup'
+
+                # Wire Scan button dynamically
+                scan_button_pattern = r"onClick=\{\(\) => showNotification\('Scanning\.\.\.', 'success'\)\}"
+                scan_button_replacement = f"onClick={{{handler_name}}}"
+                if re.search(scan_button_pattern, content):
+                    content = re.sub(scan_button_pattern, scan_button_replacement, content)
+                    fixes.append(f"Wired Scan button to {handler_name} from config")
+
+            # Replace the hardcoded addToWorklist with config-driven template version
+            if has_duplicate_check:
+                # Generate new addToWorklist using the worklist_add template
+                # This is now CONFIG-DRIVEN - all field names come from entity_validations and wired_ui_ast
+                new_add_to_worklist = renderer.render_worklist_add(entity_name)
+
+                # Find and replace the old addToWorklist function
+                # Use lambda to avoid issues with backslashes in replacement string (e.g., \d in regex patterns)
+                # Get list entity name from config (default: 'list')
+                list_entity = self.app_config.get('list_entity', 'list')
+                # Get the item ID field name from config (default: 'entity_id')
+                item_id_field = self.app_config.get('item_id_field', 'entity_id')
+                old_add_pattern = rf"const addToWorklist = \(\) => \{{[\s\S]*?showNotification\(`Item \$\{{{item_id_field}\}} added to {list_entity}`, 'success'\);\s*\}};"
+                if re.search(old_add_pattern, content):
+                    content = re.sub(old_add_pattern, lambda m: new_add_to_worklist, content)
+                    fixes.append("Updated addToWorklist using config-driven worklist_add template (implements AC2, AC3)")
+
+            # NOTE: Removed onBlur handler from tracking number input
+            # onBlur causes issues when clicking Scan button (fires twice - onBlur then onClick)
+            # User should click "Scan" button to trigger lookup - cleaner UX
+            # The Scan button already has onClick={handleScanLookup} wired
+
+            # Step: Remove hardcoded worklistItems useState and replace with API-driven data
+            # This regex matches the full useState with hardcoded array spanning multiple lines
+            hardcoded_worklist_pattern = r"const \[worklistItems, setWorklistItems\] = useState\(\[[\s\S]*?\]\);"
+            if re.search(hardcoded_worklist_pattern, content):
+                content = re.sub(hardcoded_worklist_pattern, f"// worklistItems is now derived from {entity_name} API data (see getFilteredWorklistItems)", content)
+                fixes.append("Removed hardcoded worklistItems useState - now uses API data")
+
+            # Step: Replace setWorklistItems call in addToWorklist with API create call
+            # The old code uses local state: setWorklistItems(prev => [...prev, newItem]);
+            # New code should use the API hook: create{Entity}({...apiFields})
+            # Fields come from entity validation config
+            old_set_worklist_pattern = r"setWorklistItems\(prev => \[\.\.\.prev, newItem\]\);"
+            entity_pascal = entity_name.replace('_', ' ').title().replace(' ', '')
+            # CONFIG-DRIVEN: Get field names from config
+            item_id_field = self.app_config.get('item_id_field', 'entity_id')
+            tracking_number_field = self.app_config.get('tracking_number_field', 'tracking_number')
+            new_api_call = f"""// Use API to create new {entity_pascal} item
+    create{entity_pascal}({{
+      {item_id_field}: itemId,
+      {tracking_number_field}: trackingNumber,
+      description: 'New Item - Description Pending',
+      type: 'Standard',
+      status: 'Pending',
+      stage: 'Initial',
+      quantity: 1,
+      created_by: 'system'
+    }}).then(() => {{
+      fetch{entity_pascal}s(); // Refresh the list
+    }}).catch(err => {{
+      console.error('Failed to create item:', err);
+      showNotification('Failed to add item', 'warning');
+    }});"""
+            if re.search(old_set_worklist_pattern, content):
+                content = re.sub(old_set_worklist_pattern, new_api_call, content)
+                fixes.append(f"Replaced setWorklistItems with create{entity_pascal} API call")
+
+            # Step: Remove ONLY hardcoded string defaultValue attributes from input fields
+            # These were for demo purposes - UI should only show data from actual database
+            # PRESERVE: defaultValue={item.something} - these are dynamic values from data
+            # REMOVE: defaultValue="hardcoded string" - these are demo values
+            hardcoded_default_pattern = r'\s*defaultValue="[^"]*"'
+            default_value_count = len(re.findall(hardcoded_default_pattern, content))
+            if default_value_count > 0:
+                # Remove only hardcoded string defaultValue="..." patterns
+                # Keep defaultValue={...} as those reference actual data (item.disposition, item.quantity, etc.)
+                content = re.sub(hardcoded_default_pattern, '', content)
+                fixes.append(f"Removed {default_value_count} hardcoded defaultValue strings - preserved dynamic values from data")
+
+            # Step: Make inputs CONTROLLED using config-driven approach
+            # Reads wired_ui_ast.json → state_bindings → bound_inputs to find inputs that need
+            # value and onChange bindings. NO HARDCODING - all from config.
+            input_transformations = renderer.get_input_transformations()
+            for transform in input_transformations:
+                input_id = transform['input_id']
+                config_field = transform['config_field']
+                value_pattern = transform['value_pattern']
+                onChange_pattern = transform['onChange_pattern']
+
+                # Build regex pattern for this input
+                input_pattern = rf'(<input\s+[^>]*id="{input_id}"[^>]*)(/>)'
+                input_replacement = rf'\1 value={{{value_pattern}}} onChange={{{onChange_pattern}}}\2'
+
+                if re.search(input_pattern, content):
+                    content = re.sub(input_pattern, input_replacement, content)
+                    fixes.append(f"Made {input_id} input controlled (bound to formData.{config_field}) [config-driven]")
+
+            # NOTE: getFilteredWorklistItems replacement was moved EARLIER in the function
+            # (before handler injection) to avoid regex matching issues
+
+            # Step: Replace MaintenanceScreen hardcoded sample items with dynamic entity mapping
+            # The input TSX has hardcoded "Sample Item Cards" - replace with API-driven data
+            content = self._transform_maintenance_screen_to_dynamic(content, fixes, entity_name)
+
+            # Step: Transform DashboardScreen to use dynamic data from API
+            # Replace hardcoded stats (1,247, 3, 8, $127K) and Recent Activity table with API data
+            content = self._transform_dashboard_screen_to_dynamic(content, fixes)
+
+            logger.info(f"Config-driven wiring complete: {len(fixes)} changes applied")
+            return content
+
+        except Exception as e:
+            logger.error(f"Config-driven wiring failed: {e}, falling back to hardcoded version")
+            import traceback
+            traceback.print_exc()
+            return self._wire_api_data_sharing(content, fixes)
+
+    def _transform_maintenance_screen_to_dynamic(self, content: str, fixes: list, entity_name: str) -> str:
+        """
+        Transform the MaintenanceScreen hardcoded sample items into dynamic entity.map().
+
+        CONFIG-DRIVEN: Uses entity_name and database schema for field names.
+
+        The input TSX has:
+        - {/* Sample Item Cards */} with hardcoded Item #1, Item #2
+
+        This transforms it to:
+        - {/* Dynamic Items from API */}
+        - {entity_var.length === 0 ? (... no items message ...) : entity_var.map((item, index) => (... item card ...))}
+        """
+        import re
+
+        # CONFIG-DRIVEN: Generate entity variable name from entity_name
+        entity_var = entity_name.replace('_', '')  # e.g., my_items -> myitems
+        entity_label = entity_name.replace('_', ' ').title()  # e.g., my_items -> My Items
+        primary_key = self._get_primary_key(entity_name)  # Get from schema
+        fields = self._get_entity_fields(entity_name)
+
+        # Determine if entity has special fields (from schema)
+        # CONFIG-DRIVEN: Check for special handling flag field from config or common patterns
+        field_names = [f.get('name', '') for f in fields]
+        special_flag_field = self.app_config.get('special_flag_field')  # From config if specified
+        if not special_flag_field:
+            # Auto-detect common special flag field patterns
+            flag_patterns = ['is_special', 'flagged', 'priority_flag', 'requires_handling', 'special_handling']
+            special_flag_field = next((f for f in flag_patterns if f in field_names), None)
+        has_special_flag = special_flag_field is not None and special_flag_field in field_names
+        has_status = 'status' in field_names
+        has_description = 'description' in field_names
+        has_quantity = 'quantity' in field_names
+        has_disposition = 'disposition' in field_names
+
+        # Pattern to match the entire Sample Item Cards section
+        # From "{/* Sample Item Cards */}" to the closing of the wrapper div before Action Buttons
+        sample_items_pattern = r'\{/\* Sample Item Cards \*/\}\s*<div style=\{\{ display: \'flex\', flexDirection: \'column\', gap: \'30px\' \}\}>[\s\S]*?</div>\s*</div>\s*(?=\s*\{/\* Action Buttons \*/\})'
+
+        # CONFIG-DRIVEN: Build dynamic JSX using entity config
+        # All variable names and field references come from config, not hardcoded
+        dynamic_items = self._build_entity_list_jsx(
+            entity_var=entity_var,
+            entity_label=entity_label,
+            primary_key=primary_key,
+            has_special_flag=has_special_flag,
+            special_flag_field=special_flag_field,
+            has_status=has_status,
+            has_description=has_description,
+            has_quantity=has_quantity,
+            has_disposition=has_disposition,
+            fields=fields
+        )
+
+        if re.search(sample_items_pattern, content):
+            content = re.sub(sample_items_pattern, dynamic_items, content)
+            fixes.append(f"Transformed MaintenanceScreen to use dynamic {entity_var}.map() from API (config-driven)")
+        else:
+            logger.warning("Could not find Sample Item Cards pattern in MaintenanceScreen")
+
+        return content
+
+    def _build_entity_list_jsx(self, entity_var: str, entity_label: str, primary_key: str,
+                                has_special_flag: bool, special_flag_field: str, has_status: bool,
+                                has_description: bool, has_quantity: bool, has_disposition: bool,
+                                fields: List[Dict]) -> str:
+        """
+        Build entity list JSX dynamically from config.
+
+        CONFIG-DRIVEN: All field names and labels come from schema/config.
+        NO HARDCODED entity-specific values.
+
+        Uses string.Template to avoid f-string escaping issues with JSX {{ }}.
+        """
+        # CONFIG-DRIVEN: Get approved status value from config
+        approved_status = self.app_config.get('approved_status', 'Approved')
+
+        # Build special flag section only if entity has a special flag field (config-driven)
+        flag_badge = ''
+        flag_warning = ''
+        if has_special_flag and special_flag_field:
+            flag_badge = "{item." + special_flag_field + " && <span style={{ background: '#ffc107', color: '#000', padding: '4px 8px', borderRadius: '15px', fontSize: '12px', marginLeft: '8px' }}>⚠ Special Handling</span>}"
+            flag_warning = '''
+            {/* Special Handling Warning - only show for flagged items */}
+            {item.''' + special_flag_field + ''' && (
+              <div style={{ background: '#ffeaea', border: '1px solid #ffb3b3', borderLeft: '4px solid #dc3545', padding: '15px', margin: '15px 0', borderRadius: '5px' }}>
+                <div style={{ display: 'flex', alignItems: 'center', marginBottom: '10px' }}>
+                  <span style={{ background: '#dc3545', color: 'white', padding: '2px 6px', borderRadius: '3px', fontSize: '12px', marginRight: '8px' }}>⚠</span>
+                  <strong style={{ color: '#dc3545' }}>SPECIAL HANDLING INSTRUCTIONS</strong>
+                </div>
+                <ul style={{ margin: '10px 0', color: '#dc3545', lineHeight: 1.5, paddingLeft: '20px' }}>
+                  <li>Follow all safety protocols</li>
+                  <li>Use appropriate protective equipment</li>
+                  <li>Contact supervisor if unsure</li>
+                </ul>
+              </div>
+            )}'''
+
+        # Build field inputs dynamically from schema
+        field_inputs = []
+        for f in fields[:8]:  # Limit to 8 fields for grid layout
+            fname = f.get('name', '')
+            flabel = fname.replace('_', ' ').title()
+            ftype = f.get('data_type', 'VARCHAR')
+
+            if fname == primary_key:
+                field_inputs.append('''<div>
+                <label style={{ display: 'block', marginBottom: '5px', fontWeight: 'bold' }}>ID</label>
+                <input type="text" style={{ width: '100%', padding: '8px', border: '1px solid #ddd', borderRadius: '5px', background: '#f8f9fa', boxSizing: 'border-box' }} value={item.''' + fname + ''' || ''} readOnly />
+              </div>''')
+            elif fname == 'status' and has_status:
+                field_inputs.append('''<div>
+                <label style={{ display: 'block', marginBottom: '5px', fontWeight: 'bold' }}>Status</label>
+                <span style={{
+                  background: item.status === \'''' + approved_status + '''\' ? '#d1fae5' : '#fef3c7',
+                  color: item.status === \'''' + approved_status + '''\' ? '#065f46' : '#92400e',
+                  padding: '6px 12px', borderRadius: '15px', fontSize: '12px', display: 'inline-block', marginTop: '8px'
+                }}>{item.status || 'Pending'}</span>
+              </div>''')
+            elif fname == 'description':
+                field_inputs.append('''<div style={{ gridColumn: 'span 2' }}>
+                <label style={{ display: 'block', marginBottom: '5px', fontWeight: 'bold' }}>Description</label>
+                <input type="text" style={{ width: '100%', padding: '8px', border: '1px solid #ddd', borderRadius: '5px', boxSizing: 'border-box' }} value={item.description || ''} readOnly />
+              </div>''')
+            else:
+                # Exclude timestamp and special flag fields from regular inputs
+                excluded_fields = ['created_at', 'updated_at', 'created_by']
+                if special_flag_field:
+                    excluded_fields.append(special_flag_field)
+                if fname not in excluded_fields:
+                    input_type = 'number' if ftype in ['INTEGER', 'DECIMAL', 'SERIAL'] else 'text'
+                    field_inputs.append('<div>\n                <label style={{ display: \'block\', marginBottom: \'5px\', fontWeight: \'bold\' }}>' + flabel + '</label>\n                <input type="' + input_type + '" style={{ width: \'100%\', padding: \'8px\', border: \'1px solid #ddd\', borderRadius: \'5px\', boxSizing: \'border-box\' }} value={item.' + fname + ' || \'\'} readOnly />\n              </div>')
+
+        fields_jsx = '\n              '.join(field_inputs) if field_inputs else ''
+
+        # Build JSX template using simple string concatenation (avoid f-string escaping issues)
+        template = '''{/* Dynamic ''' + entity_label + ''' Items from API */}
+      <div style={{ display: 'flex', flexDirection: 'column', gap: '30px' }}>
+        {''' + entity_var + '''.length === 0 ? (
+          <div style={{
+            background: 'white',
+            padding: '40px',
+            borderRadius: '10px',
+            textAlign: 'center',
+            boxShadow: '0 2px 5px rgba(0,0,0,0.1)'
+          }}>
+            <p style={{ color: '#666', fontSize: '16px' }}>No items found. Add items via the entry screen.</p>
+          </div>
+        ) : ''' + entity_var + '''.map((item: any, index: number) => (
+          <div
+            key={item.''' + primary_key + ''' || index}
+            style={{
+              background: 'white',
+              padding: '20px',
+              borderRadius: '10px',
+              boxShadow: '0 2px 5px rgba(0,0,0,0.1)',
+              border: maintenanceMode === 'change' ? '2px solid #0D5DAB' : maintenanceMode === 'remove' ? '2px solid #dc3545' : 'none',
+              cursor: maintenanceMode !== 'view' ? 'pointer' : 'default'
+            }}
+          >
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px' }}>
+              <h3>
+                {item.description || 'No Description'} (ID: {item.''' + primary_key + '''})
+                ''' + flag_badge + '''
+              </h3>
+              <button
+                style={{ background: '#ff6b35', color: 'white', padding: '8px 12px', fontSize: '12px', border: 'none', borderRadius: '5px', cursor: 'pointer' }}
+                onClick={() => showNotification(`Reversing item ${item.''' + primary_key + '''}`, 'warning')}
+              >
+                🔄 Reverse
+              </button>
+            </div>
+''' + flag_warning + '''
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(8, 1fr)', gap: '20px', marginBottom: '15px' }}>
+              ''' + fields_jsx + '''
+            </div>
+
+            <div style={{ marginTop: '20px' }}>
+              <h4>Attachments</h4>
+              <div style={{ display: 'flex', gap: '10px', marginTop: '10px' }}>
+                <button
+                  style={{ background: '#6c757d', color: 'white', padding: '8px 12px', fontSize: '12px', border: 'none', borderRadius: '5px', cursor: 'pointer' }}
+                  onClick={() => showNotification(`Opening attachments for ${item.''' + primary_key + '''}`, 'success')}
+                >
+                  📄 View Attachments
+                </button>
+                <button
+                  style={{ background: '#dc3545', color: 'white', padding: '8px 12px', fontSize: '12px', border: 'none', borderRadius: '5px', cursor: 'pointer' }}
+                  onClick={() => showNotification(`Voiding item ${item.''' + primary_key + '''}`, 'danger')}
+                >
+                  ❌ Void
+                </button>
+              </div>
+            </div>
+          </div>
+        ))}
+      </div>
+
+'''
+        return template
+
+    def _transform_dashboard_screen_to_dynamic(self, content: str, fixes: list) -> str:
+        """
+        Transform the DashboardScreen hardcoded values into dynamic data from API.
+
+        The input TSX has:
+        - Hardcoded stats: "1,247", "3", "8", "$127K"
+        - Hardcoded activity table rows
+
+        This transforms it to:
+        - State variables for dashboard stats
+        - useEffect to fetch stats from API
+        - Dynamic rendering of stats and recent activity
+        """
+        import re
+
+        # Get config-driven values
+        primary_entity = self.app_config.get('primary_entity', 'items')
+        primary_key = self.app_config.get('primary_key', 'id')
+
+        # Get secondary entities from config (for fetching related data)
+        secondary_entities = self.app_config.get('secondary_entities', {})
+        recovery_entity = self.app_config.get('recovery_entity', self.app_config.get('return_entity', 'returns'))
+
+        # Get special flag field from config or detect from schema
+        special_flag_field = self.app_config.get('special_flag_field', '')
+        if not special_flag_field:
+            # Try to detect from entity fields - look for boolean flag fields
+            entities = self.app_config.get('entities', {})
+            if primary_entity in entities:
+                field_names = [f.get('name', '') for f in entities[primary_entity].get('fields', [])]
+                # Generic patterns for boolean flag fields (e.g., is_*, *_flag, flagged, requires_*)
+                flag_patterns = ['is_special', 'is_flagged', 'flagged', 'priority_flag', 'requires_handling', 'special_handling']
+                special_flag_field = next((f for f in flag_patterns if f in field_names), '')
+
+        # Get disposition field from config (e.g., 'disposition', 'item_type', 'category')
+        disposition_field = self.app_config.get('disposition_field', 'disposition')
+        default_disposition = self.app_config.get('default_disposition', 'Pending')
+
+        # Get approval status from config
+        approval_status = self.app_config.get('approval_status', 'Pending Approval')
+
+        # CONFIG-DRIVEN: Get recovery amount field names from config
+        recovery_amount_field = self.app_config.get('recovery_amount_field', 'recovery_amount')
+        estimated_value_field = self.app_config.get('estimated_value_field', 'estimated_value')
+
+        # Step 1: Add dashboard state variables after existing state declarations
+        # Find the last useState declaration and add dashboard state after it
+        flag_field = special_flag_field if special_flag_field else 'is_flagged'
+        # Get approval entity name from config for dashboard
+        approval_entity = self.app_config.get('approval_entity', 'workflow')
+        dashboard_state = f'''
+  // Dashboard stats state
+  const [dashboardStats, setDashboardStats] = useState({{
+    totalItems: 0,
+    pending{approval_entity.replace('_', ' ').title().replace(' ', '')}: 0,
+    flaggedItems: 0,
+    monthlyRecovery: 0
+  }});
+  const [recentActivity, setRecentActivity] = useState<any[]>([]);
+  const [pending{approval_entity.replace('_', ' ').title().replace(' ', '')}List, setPending{approval_entity.replace('_', ' ').title().replace(' ', '')}List] = useState<any[]>([]);
+  const [dashboardLoading, setDashboardLoading] = useState(true);
+
+  // Fetch dashboard stats
+  const fetchDashboardStats = async () => {{
+    try {{
+      setDashboardLoading(true);
+
+      // Fetch primary entity items count, flagged count, and pending {approval_entity}
+      const itemsResponse = await fetch('/api/v1/{primary_entity}/');
+      const items = itemsResponse.ok ? await itemsResponse.json() : [];
+      const totalItems = items.length;
+      const flaggedItems = items.filter((item: any) => item.{flag_field} === true || item.{flag_field} === 'true').length;
+
+      // Pending {approval_entity} = items with status from config (default: 'Pending Approval')
+      const {approval_entity}Statuses = ['{approval_status}', 'Pending Approval', 'Pending'];
+      const pendingList = items.filter((item: any) =>
+        {approval_entity}Statuses.includes(item.status)
+      );
+      const pending{approval_entity.replace('_', ' ').title().replace(' ', '')} = pendingList.length;
+      setPending{approval_entity.replace('_', ' ').title().replace(' ', '')}List(pendingList);
+
+      // Fetch secondary entity for monthly recovery (if exists) - from config
+      const recoveryEntity = '{recovery_entity}';
+      const returnsResponse = await fetch(`/api/v1/${{recoveryEntity}}/`);
+      const returns = returnsResponse.ok ? await returnsResponse.json() : [];
+      // CONFIG-DRIVEN: Recovery amount field names come from app config
+      const monthlyRecovery = returns.reduce((sum: number, r: any) => {{
+        const value = parseFloat(r['{recovery_amount_field}']) || parseFloat(r['{estimated_value_field}']) || 0;
+        return sum + value;
+      }}, 0);
+
+      setDashboardStats({{
+        totalItems,
+        pending{approval_entity.replace('_', ' ').title().replace(' ', '')},
+        flaggedItems,
+        monthlyRecovery
+      }});
+
+      // Set recent activity from primary items (last 5)
+      const sortedItems = [...items].sort((a: any, b: any) => {{
+        const dateA = new Date(a.updated_at || a.created_at || 0);
+        const dateB = new Date(b.updated_at || b.created_at || 0);
+        return dateB.getTime() - dateA.getTime();
+      }});
+      setRecentActivity(sortedItems.slice(0, 5));
+
+    }} catch (error) {{
+      console.error('Failed to fetch dashboard stats:', error);
+    }} finally {{
+      setDashboardLoading(false);
+    }}
+  }};
+
+  useEffect(() => {{
+    if (currentScreen === 'dashboard') {{
+      fetchDashboardStats();
+    }}
+  }}, [currentScreen]);
+
+  // Handle approval decision (Approve/Reject) - updates item status
+  const handleApprovalDecision = async (itemId: number, decision: 'Approved' | 'Rejected') => {{
+    try {{
+      const response = await fetch(`/api/v1/{primary_entity}/${{itemId}}`, {{
+        method: 'PUT',
+        headers: {{ 'Content-Type': 'application/json' }},
+        body: JSON.stringify({{
+          status: decision
+        }})
+      }});
+      if (response.ok) {{
+        showNotification(`Item ${{decision.toLowerCase()}} successfully`, 'success');
+        fetchDashboardStats(); // Refresh the list
+      }} else {{
+        showNotification(`Failed to ${{decision.toLowerCase()}} item`, 'warning');
+      }}
+    }} catch (error) {{
+      console.error('Approval decision failed:', error);
+      showNotification('Failed to process approval', 'warning');
+    }}
+  }};
+'''
+
+        # Find where to insert dashboard state - after the show{approval_entity}View useState (config-driven)
+        approval_entity_pascal = approval_entity.replace('_', ' ').title().replace(' ', '')
+        pending_approvals_pattern = rf"(const \[show{approval_entity_pascal}View, setShow{approval_entity_pascal}View\] = useState\(false\);)"
+        if re.search(pending_approvals_pattern, content):
+            content = re.sub(pending_approvals_pattern, r'\1' + dashboard_state, content)
+            fixes.append("Added dashboard stats state and useEffect for API fetching")
+        else:
+            # Fallback: look for any useState and add after it
+            logger.warning(f"Could not find show{approval_entity_pascal}View state, trying alternate insertion point")
+
+        # Step 2: Replace hardcoded stats in DashboardScreen
+        # Replace "1,247" with {dashboardStats.totalItems.toLocaleString()}
+        content = re.sub(
+            r">1,247</h2>",
+            r">{dashboardLoading ? '...' : dashboardStats.totalItems.toLocaleString()}</h2>",
+            content
+        )
+        fixes.append("Replaced hardcoded Total Items with dynamic value")
+
+        # Replace hardcoded pending {approval_entity} count with dynamic value (config-driven)
+        approval_entity_pascal = approval_entity.replace('_', ' ').title().replace(' ', '')
+        approval_entity_camel = approval_entity_pascal[0].lower() + approval_entity_pascal[1:] if approval_entity_pascal else approval_entity
+        content = re.sub(
+            r"'bold', color: '#ffc107' \}\}>\d+</h2>",
+            rf"'bold', color: '#ffc107' }}>" + "{dashboardLoading ? '...' : dashboardStats.pending" + approval_entity_pascal + "}</h2>",
+            content
+        )
+        fixes.append(f"Replaced hardcoded Pending {approval_entity_pascal} count with dynamic value")
+
+        # Replace hardcoded "8" for flagged items
+        content = re.sub(
+            r"'bold', color: '#dc3545' \}\}>8</h2>",
+            r"'bold', color: '#dc3545' }}>{dashboardLoading ? '...' : dashboardStats.flaggedItems}</h2>",
+            content
+        )
+        fixes.append("Replaced hardcoded Flagged Items with dynamic value")
+
+        # Replace hardcoded "$127K" for monthly recovery
+        content = re.sub(
+            r"'bold', color: '#28a745' \}\}>\$127K</h2>",
+            r"'bold', color: '#28a745' }}>{dashboardLoading ? '...' : `$${(dashboardStats.monthlyRecovery / 1000).toFixed(0)}K`}</h2>",
+            content
+        )
+        fixes.append("Replaced hardcoded Monthly Recovery with dynamic value")
+
+        # Replace hardcoded "Last Updated: June 20, 2025" with dynamic date
+        content = re.sub(
+            r"Last Updated: June 20, 2025",
+            r"Last Updated: {new Date().toLocaleDateString()}",
+            content
+        )
+        fixes.append("Replaced hardcoded Last Updated date with dynamic date")
+
+        # Step 3: Replace hardcoded Recent Activity table rows with dynamic mapping
+        # This is a complex replacement - find the tbody with hardcoded rows and replace with map
+        # Use generic pattern to match any hardcoded sample IDs
+        hardcoded_activity_pattern = r'<tbody>\s*<tr>\s*<td[^>]*><strong>[A-Z]+-\d+</strong></td>[\s\S]*?</tr>\s*<tr>\s*<td[^>]*><strong>[A-Z]+-\d+</strong></td>[\s\S]*?</tr>\s*</tbody>'
+
+        # CONFIG-DRIVEN: Get approved status value from config
+        approved_status = self.app_config.get('approved_status', 'Approved')
+
+        dynamic_activity_rows = f'''<tbody>
+                {{recentActivity.length === 0 ? (
+                  <tr>
+                    <td colSpan={{5}} style={{{{ padding: '20px', textAlign: 'center', color: '#666' }}}}>
+                      {{dashboardLoading ? 'Loading...' : 'No recent activity'}}
+                    </td>
+                  </tr>
+                ) : recentActivity.map((item: any, index: number) => (
+                  <tr key={{item.{primary_key} || index}}>
+                    <td style={{{{ padding: '10px', borderBottom: '1px solid #eee' }}}}><strong>{{item.{primary_key} || `ITEM-${{index}}`}}</strong></td>
+                    <td style={{{{ padding: '10px', borderBottom: '1px solid #eee' }}}}>{{item.description || 'No description'}}</td>
+                    <td style={{{{ padding: '10px', borderBottom: '1px solid #eee' }}}}>
+                      <span style={{{{
+                        background: item.status === '{approved_status}' ? '#d1fae5' : '#fef3c7',
+                        color: item.status === '{approved_status}' ? '#065f46' : '#92400e',
+                        padding: '4px 8px',
+                        borderRadius: '10px',
+                        fontSize: '12px'
+                      }}}}>{{item.status || 'Pending'}}</span>
+                    </td>
+                    <td style={{{{ padding: '10px', borderBottom: '1px solid #eee' }}}}>{{item.updated_at ? new Date(item.updated_at).toLocaleString() : '-'}}</td>
+                    <td style={{{{ padding: '10px', borderBottom: '1px solid #eee' }}}}>
+                      <button
+                        style={{{{ background: '#0D5DAB', color: 'white', padding: '5px 10px', fontSize: '12px', border: 'none', borderRadius: '5px', cursor: 'pointer' }}}}
+                        onClick={{() => showNotification(`Opening review for ${{item.{primary_key}}}`, 'success')}}
+                      >
+                        Review
+                      </button>
+                    </td>
+                  </tr>
+                ))}})
+              </tbody>'''
+
+        if re.search(hardcoded_activity_pattern, content):
+            content = re.sub(hardcoded_activity_pattern, dynamic_activity_rows, content)
+            fixes.append("Replaced hardcoded Recent Activity table with dynamic recentActivity.map()")
+        else:
+            logger.warning("Could not find hardcoded Recent Activity pattern in DashboardScreen")
+
+        # Step 4: Replace hardcoded Pending {approval_entity} detail view with dynamic data (config-driven)
+        # Find hardcoded "Total: N items awaiting approval" pattern and replace
+        content = re.sub(
+            r"Total: \d+ items awaiting approval\.",
+            rf"Total: {{pending{approval_entity_pascal}List.length}} items awaiting approval.",
+            content
+        )
+        fixes.append(f"Replaced hardcoded pending {approval_entity} count in detail view")
+
+        # Replace hardcoded pending {approval_entity} table body with dynamic mapping (config-driven)
+        # Use generic pattern to match any hardcoded sample IDs
+        hardcoded_approvals_pattern = r'<tbody>\s*<tr style=\{\{ borderBottom: \'1px solid #eee\' \}\}>\s*<td[^>]*><input type="checkbox" /></td>\s*<td[^>]*><strong>[A-Z]+-\d+</strong></td>[\s\S]*?</tr>\s*</tbody>'
+
+        dynamic_approvals_rows = f'''<tbody>
+                {{pending{approval_entity_pascal}List.length === 0 ? (
+                  <tr>
+                    <td colSpan={{7}} style={{{{ padding: '20px', textAlign: 'center', color: '#666' }}}}>
+                      {{dashboardLoading ? 'Loading...' : 'No pending {approval_entity}'}}
+                    </td>
+                  </tr>
+                ) : pending{approval_entity_pascal}List.map((item: any, index: number) => (
+                  <tr key={{item.{primary_key} || index}} style={{{{ borderBottom: '1px solid #eee' }}}}>
+                    <td style={{{{ padding: '12px' }}}}><input type="checkbox" /></td>
+                    <td style={{{{ padding: '12px' }}}}><strong>{{item.{primary_key} || `ITEM-${{index + 1}}`}}</strong></td>
+                    <td style={{{{ padding: '12px' }}}}>
+                      <span style={{{{ background: '#fff3cd', color: '#856404', padding: '4px 8px', borderRadius: '15px', fontSize: '12px' }}}}>{{item.{disposition_field} || '{default_disposition}'}}</span>
+                    </td>
+                    <td style={{{{ padding: '12px' }}}}>{{item.description || 'Pending review'}}</td>
+                    <td style={{{{ padding: '12px' }}}}>{{item.stage || 'Not set'}}</td>
+                    <td style={{{{ padding: '12px' }}}}>{{item.created_date ? new Date(item.created_date).toLocaleDateString() : '-'}}<br /><span style={{{{ fontSize: '11px', color: '#666' }}}}>{{item.created_date ? new Date(item.created_date).toLocaleTimeString() : ''}}</span></td>
+                    <td style={{{{ padding: '12px' }}}}>
+                      <button
+                        style={{{{ background: '#28a745', color: 'white', padding: '6px 12px', fontSize: '12px', border: 'none', borderRadius: '5px', cursor: 'pointer', marginRight: '5px' }}}}
+                        onClick={{() => handleApprovalDecision(item.{primary_key}, 'Approved')}}
+                      >
+                        ✓ Approve
+                      </button>
+                      <button
+                        style={{{{ background: '#dc3545', color: 'white', padding: '6px 12px', fontSize: '12px', border: 'none', borderRadius: '5px', cursor: 'pointer' }}}}
+                        onClick={{() => handleApprovalDecision(item.{primary_key}, 'Rejected')}}
+                      >
+                        ✗ Reject
+                      </button>
+                    </td>
+                  </tr>
+                ))}}
+              </tbody>'''
+
+        if re.search(hardcoded_approvals_pattern, content):
+            content = re.sub(hardcoded_approvals_pattern, dynamic_approvals_rows, content)
+            fixes.append(f"Replaced hardcoded Pending {approval_entity_pascal} table with dynamic pending{approval_entity_pascal}List.map()")
+        else:
+            logger.warning(f"Could not find hardcoded Pending {approval_entity_pascal} table pattern in DashboardScreen")
+
+        return content
+
+    def _cleanup_orphan_components(self) -> Dict[str, Any]:
+        """
+        Clean up orphan components that are not used and don't have valid hooks.
+        Note: Modals are kept as they are needed for user stories (US3, US4, US5).
+        Modal hooks will be generated by step_7d.
+        """
+        try:
+            removed = []
+            src_dir = self.output_path.parent  # e.g., Generated/frontend/src
+            components_dir = src_dir / 'components'
+
+            # Read App.tsx to find what's actually imported
+            with open(self.output_path, 'r') as f:
+                app_content = f.read()
+
+            # Keep modals - they are needed for user stories and hooks will be generated by step_7d
+            # Only clean up non-modal orphan components
+            if components_dir.exists():
+                for component_file in components_dir.glob('*.tsx'):
+                    component_name = component_file.stem
+                    # Skip index files and modal-related components
+                    if component_name == 'index':
+                        continue
+                    # Keep component if it's imported in App.tsx
+                    if component_name in app_content:
+                        continue
+                    # Don't remove - just log for now
+                    logger.info(f"Note: Component {component_name} not directly imported in App.tsx (may be used by modals)")
+
+            return {'success': True, 'removed': removed}
+
+        except Exception as e:
+            logger.error(f"Failed to cleanup orphan components: {e}")
+            return {'success': False, 'error': str(e), 'removed': []}
+
+    def _generate_api_service(self) -> str:
+        """Generate the services/api.ts file for API calls."""
+        return '''/**
+ * API Client Service
+ * Provides a centralized HTTP client for API calls
+ */
+
+const API_BASE_URL = process.env.REACT_APP_API_URL || '/api/v1';
+
+interface ApiResponse<T = any> {
+  data: T;
+  status: number;
+  ok: boolean;
+}
+
+class ApiClient {
+  private baseUrl: string;
+
+  constructor(baseUrl: string = API_BASE_URL) {
+    this.baseUrl = baseUrl;
+  }
+
+  private async request<T>(
+    endpoint: string,
+    options: RequestInit = {}
+  ): Promise<ApiResponse<T>> {
+    const url = `${this.baseUrl}${endpoint}`;
+
+    const defaultHeaders: HeadersInit = {
+      'Content-Type': 'application/json',
+    };
+
+    const config: RequestInit = {
+      ...options,
+      headers: {
+        ...defaultHeaders,
+        ...options.headers,
+      },
+    };
+
+    try {
+      const response = await fetch(url, config);
+      const data = response.ok ? await response.json() : null;
+
+      return {
+        data,
+        status: response.status,
+        ok: response.ok,
+      };
+    } catch (error) {
+      console.error('API request failed:', error);
+      throw error;
+    }
+  }
+
+  async get<T>(endpoint: string): Promise<ApiResponse<T>> {
+    return this.request<T>(endpoint, { method: 'GET' });
+  }
+
+  async post<T>(endpoint: string, data: any): Promise<ApiResponse<T>> {
+    return this.request<T>(endpoint, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    });
+  }
+
+  async put<T>(endpoint: string, data: any): Promise<ApiResponse<T>> {
+    return this.request<T>(endpoint, {
+      method: 'PUT',
+      body: JSON.stringify(data),
+    });
+  }
+
+  async patch<T>(endpoint: string, data: any): Promise<ApiResponse<T>> {
+    return this.request<T>(endpoint, {
+      method: 'PATCH',
+      body: JSON.stringify(data),
+    });
+  }
+
+  async delete<T>(endpoint: string): Promise<ApiResponse<T>> {
+    return this.request<T>(endpoint, { method: 'DELETE' });
+  }
+}
+
+export const apiClient = new ApiClient();
+export default apiClient;
+'''
+
+    def _generate_entity_hook(self, entity_name: str) -> str:
+        """Generate a CRUD hook for the given entity."""
+        # Convert to various case formats
+        entity_lower = entity_name.lower()
+        entity_pascal = ''.join(word.capitalize() for word in entity_name.replace('_', ' ').split())
+        entity_camel = entity_pascal[0].lower() + entity_pascal[1:] if entity_pascal else entity_name
+
+        # Pluralize for API endpoint (simple pluralization)
+        entity_plural = entity_lower if entity_lower.endswith('s') else entity_lower + 's'
+
+        return f'''/**
+ * Custom hook for {entity_pascal} CRUD operations
+ * Auto-generated by step_7c_frontend_generator_ast.py
+ */
+import {{ useState, useCallback }} from 'react';
+
+interface {entity_pascal} {{
+  id?: number;
+  [key: string]: any;
+}}
+
+interface Use{entity_pascal}Return {{
+  data: {entity_pascal}[];
+  loading: boolean;
+  error: string | null;
+  fetch{entity_pascal}s: () => Promise<void>;
+  create{entity_pascal}: (item: Partial<{entity_pascal}>) => Promise<{entity_pascal} | null>;
+  update{entity_pascal}: (id: number, item: Partial<{entity_pascal}>) => Promise<{entity_pascal} | null>;
+  delete{entity_pascal}: (id: number) => Promise<boolean>;
+  setData: React.Dispatch<React.SetStateAction<{entity_pascal}[]>>;
+}}
+
+export function use{entity_pascal}(): Use{entity_pascal}Return {{
+  const [data, setData] = useState<{entity_pascal}[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const fetch{entity_pascal}s = useCallback(async () => {{
+    setLoading(true);
+    setError(null);
+    try {{
+      const response = await fetch('/api/v1/{entity_plural}/');
+      if (!response.ok) throw new Error('Failed to fetch {entity_plural}');
+      const result = await response.json();
+      setData(result);
+    }} catch (err) {{
+      setError(err instanceof Error ? err.message : 'Unknown error');
+    }} finally {{
+      setLoading(false);
+    }}
+  }}, []);
+
+  const create{entity_pascal} = useCallback(async (item: Partial<{entity_pascal}>): Promise<{entity_pascal} | null> => {{
+    setLoading(true);
+    setError(null);
+    try {{
+      const response = await fetch('/api/v1/{entity_plural}/', {{
+        method: 'POST',
+        headers: {{ 'Content-Type': 'application/json' }},
+        body: JSON.stringify(item),
+      }});
+      if (!response.ok) throw new Error('Failed to create {entity_name}');
+      const result = await response.json();
+      setData(prev => [...prev, result]);
+      return result;
+    }} catch (err) {{
+      setError(err instanceof Error ? err.message : 'Unknown error');
+      return null;
+    }} finally {{
+      setLoading(false);
+    }}
+  }}, []);
+
+  const update{entity_pascal} = useCallback(async (id: number, item: Partial<{entity_pascal}>): Promise<{entity_pascal} | null> => {{
+    setLoading(true);
+    setError(null);
+    try {{
+      const response = await fetch(`/api/v1/{entity_plural}/${{id}}`, {{
+        method: 'PUT',
+        headers: {{ 'Content-Type': 'application/json' }},
+        body: JSON.stringify(item),
+      }});
+      if (!response.ok) throw new Error('Failed to update {entity_name}');
+      const result = await response.json();
+      setData(prev => prev.map(item => item.id === id ? result : item));
+      return result;
+    }} catch (err) {{
+      setError(err instanceof Error ? err.message : 'Unknown error');
+      return null;
+    }} finally {{
+      setLoading(false);
+    }}
+  }}, []);
+
+  const delete{entity_pascal} = useCallback(async (id: number): Promise<boolean> => {{
+    setLoading(true);
+    setError(null);
+    try {{
+      const response = await fetch(`/api/v1/{entity_plural}/${{id}}`, {{
+        method: 'DELETE',
+      }});
+      if (!response.ok) throw new Error('Failed to delete {entity_name}');
+      setData(prev => prev.filter(item => item.id !== id));
+      return true;
+    }} catch (err) {{
+      setError(err instanceof Error ? err.message : 'Unknown error');
+      return false;
+    }} finally {{
+      setLoading(false);
+    }}
+  }}, []);
+
+  return {{
+    data,
+    loading,
+    error,
+    fetch{entity_pascal}s,
+    create{entity_pascal},
+    update{entity_pascal},
+    delete{entity_pascal},
+    setData,
+  }};
+}}
+
+export default use{entity_pascal};
+'''
+
+    def _generate_supporting_files(self) -> Dict[str, Any]:
+        """
+        Generate supporting files like index.tsx that tie the app together.
+        """
+        try:
+            files_generated = []
+            src_dir = self.output_path.parent  # e.g., Generated/frontend/src
+
+            # Generate index.tsx that imports App.tsx
+            # NOTE: StrictMode removed - it causes double-rendering in development
+            # which can interfere with DOM manipulation in uncontrolled inputs
+            index_tsx = '''import React from 'react';
+import ReactDOM from 'react-dom/client';
+import App from './App';
+
+const root = ReactDOM.createRoot(
+  document.getElementById('root') as HTMLElement
+);
+
+root.render(
+  <App />
+);
+'''
+            index_path = src_dir / 'index.tsx'
+            with open(index_path, 'w') as f:
+                f.write(index_tsx)
+            logger.info(f"Generated: {index_path}")
+            files_generated.append(str(index_path))
+
+            # Generate react-app-env.d.ts
+            react_env = '/// <reference types="react-scripts" />'
+            react_env_path = src_dir / 'react-app-env.d.ts'
+            with open(react_env_path, 'w') as f:
+                f.write(react_env)
+            files_generated.append(str(react_env_path))
+
+            # Generate/update tsconfig.json with baseUrl for absolute imports
+            frontend_dir = src_dir.parent  # Generated/frontend
+            tsconfig = '''{
+  "compilerOptions": {
+    "target": "es5",
+    "lib": ["dom", "dom.iterable", "esnext"],
+    "allowJs": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "strict": false,
+    "forceConsistentCasingInFileNames": true,
+    "noFallthroughCasesInSwitch": true,
+    "module": "esnext",
+    "moduleResolution": "node",
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "noEmit": true,
+    "jsx": "react-jsx",
+    "baseUrl": "src"
+  },
+  "include": ["src"]
+}
+'''
+            tsconfig_path = frontend_dir / 'tsconfig.json'
+            with open(tsconfig_path, 'w') as f:
+                f.write(tsconfig)
+            logger.info(f"Generated: {tsconfig_path}")
+            files_generated.append(str(tsconfig_path))
+
+            # Create or update package.json for API forwarding during development
+            package_json_path = frontend_dir / 'package.json'
+            import json
+
+            if package_json_path.exists():
+                with open(package_json_path, 'r') as f:
+                    pkg = json.load(f)
+            else:
+                # Create default package.json - CONFIG-DRIVEN app name
+                app_name = self.app_metadata.get('app_name', 'Application')
+                # Convert app name to valid npm package name (lowercase, no spaces)
+                npm_name = app_name.lower().replace(' ', '-').replace('_', '-')
+                pkg = {
+                    "name": npm_name,
+                    "version": "1.0.0",
+                    "private": True,
+                    "dependencies": {
+                        "axios": "^1.6.0",
+                        "react": "^18.2.0",
+                        "react-dom": "^18.2.0",
+                        "react-scripts": "5.0.1",
+                        "typescript": "^4.9.5"
+                    },
+                    "devDependencies": {
+                        "@playwright/test": "^1.58.0",
+                        "@types/react": "^18.2.0",
+                        "@types/react-dom": "^18.2.0"
+                    },
+                    "scripts": {
+                        "start": "react-scripts start",
+                        "build": "react-scripts build",
+                        "test": "react-scripts test"
+                    },
+                    "browserslist": [
+                        ">0.2%",
+                        "not dead",
+                        "not op_mini all"
+                    ]
+                }
+                logger.info(f"Created: {package_json_path}")
+
+            # Always ensure proxy is set
+            if 'proxy' not in pkg:
+                pkg['proxy'] = 'http://localhost:8000'
+
+            with open(package_json_path, 'w') as f:
+                json.dump(pkg, f, indent=2)
+            logger.info(f"Updated package.json with proxy")
+            files_generated.append(str(package_json_path))
+
+            # Create public/index.html if not exists
+            public_dir = frontend_dir / 'public'
+            public_dir.mkdir(parents=True, exist_ok=True)
+            index_html_path = public_dir / 'index.html'
+            if not index_html_path.exists():
+                # CONFIG-DRIVEN: Use app metadata for HTML content
+                project_name = self.app_metadata.get('project_name', 'Application')
+                app_name = self.app_metadata.get('app_name', 'Application')
+                index_html = f'''<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#000000" />
+    <meta name="description" content="{project_name}" />
+    <title>{app_name}</title>
+  </head>
+  <body>
+    <noscript>You need to enable JavaScript to run this app.</noscript>
+    <div id="root"></div>
+  </body>
+</html>
+'''
+                with open(index_html_path, 'w') as f:
+                    f.write(index_html)
+                logger.info(f"Created: {index_html_path}")
+                files_generated.append(str(index_html_path))
+
+            # Create .env if not exists
+            env_path = frontend_dir / '.env'
+            if not env_path.exists():
+                with open(env_path, 'w') as f:
+                    f.write('PORT=3001\nREACT_APP_API_URL=http://localhost:8000\n')
+                logger.info(f"Created: {env_path}")
+                files_generated.append(str(env_path))
+
+            # Generate services/api.ts
+            services_dir = src_dir / 'services'
+            services_dir.mkdir(parents=True, exist_ok=True)
+            api_ts_path = services_dir / 'api.ts'
+            api_ts_content = self._generate_api_service()
+            with open(api_ts_path, 'w') as f:
+                f.write(api_ts_content)
+            logger.info(f"Generated: {api_ts_path}")
+            files_generated.append(str(api_ts_path))
+
+            # Generate hooks for primary entity
+            hooks_dir = src_dir / 'hooks'
+            hooks_dir.mkdir(parents=True, exist_ok=True)
+            hook_content = self._generate_entity_hook(self.primary_entity)
+            # Convert entity name to PascalCase for hook name
+            entity_pascal = ''.join(word.capitalize() for word in self.primary_entity.replace('_', ' ').split())
+            hook_path = hooks_dir / f'use{entity_pascal}.ts'
+            with open(hook_path, 'w') as f:
+                f.write(hook_content)
+            logger.info(f"Generated: {hook_path}")
+            files_generated.append(str(hook_path))
+
+            return {'success': True, 'files': files_generated}
+
+        except Exception as e:
+            logger.error(f"Failed to generate supporting files: {e}")
+            return {'success': False, 'error': str(e)}
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Generate transformed frontend TSX using AST-based analysis'
+    )
+    parser.add_argument(
+        '-i', '--input',
+        required=True,
+        help='Path to the source TSX file'
+    )
+    parser.add_argument(
+        '-o', '--output',
+        required=True,
+        help='Path for the transformed TSX output'
+    )
+    parser.add_argument(
+        '--skip-extraction',
+        action='store_true',
+        help='Skip AST extraction (use existing metadata)'
+    )
+    parser.add_argument(
+        '--skip-wiring',
+        action='store_true',
+        help='Skip wiring analysis (use existing config)'
+    )
+    parser.add_argument(
+        '-v', '--verbose',
+        action='store_true',
+        help='Enable verbose logging'
+    )
+
+    args = parser.parse_args()
+
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    try:
+        generator = FrontendGeneratorAST(args.input, args.output)
+        summary = generator.run_pipeline(
+            skip_extraction=args.skip_extraction,
+            skip_wiring=args.skip_wiring
+        )
+
+        # Print summary
+        print("\n" + "=" * 60)
+        print("FRONTEND GENERATION COMPLETE")
+        print("=" * 60)
+        print(f"Input:  {args.input}")
+        print(f"Output: {args.output}")
+        print("-" * 60)
+
+        for step in summary['steps']:
+            status = "SKIPPED" if step.get('skipped') else ("OK" if step['success'] else "FAILED")
+            print(f"{step['name']}: {status}")
+            if 'modifications' in step:
+                mods = step['modifications']
+                print(f"  - Imports: {mods.get('imports', 0)}")
+                print(f"  - Hooks: {mods.get('hooks', 0)}")
+                print(f"  - Handlers: {mods.get('handlers', 0)}")
+                print(f"  - IDs: {mods.get('ids', 0)}")
+
+        print("-" * 60)
+        print(f"Success: {summary['success']}")
+        print("=" * 60)
+
+        if not summary['success']:
+            print(f"\nError: {summary.get('error', 'Unknown error')}")
+            exit(1)
+
+    except Exception as e:
+        logger.error(f"Generation failed: {e}")
+        exit(1)
+
+
+if __name__ == '__main__':
+    main()
+"
