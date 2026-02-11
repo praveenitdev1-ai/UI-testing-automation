@@ -1,0 +1,807 @@
+"#!/usr/bin/env python3
+"""
+Capability Resolver - Step 7b2
+==============================
+Resolves capability gaps before frontend generation.
+
+Pipeline Position: After step_7b (wiring), before step_7c (generation)
+
+Responsibilities:
+1. Parse capability metadata headers from existing templates
+2. Build capability catalog with full metadata
+3. Load required capabilities from user stories / acceptance criteria
+4. Identify gaps (required but missing capabilities)
+5. Auto-generate missing capability templates using meta-templates
+
+This ensures ALL required capabilities have templates before step_7c runs.
+
+Usage:
+    python step_7b2_capability_resolver.py -c config_output -o config_output/capability_manifest.json
+"""
+
+import json
+import re
+import argparse
+import logging
+import yaml
+from pathlib import Path
+from typing import Dict, List, Any, Optional, Set
+from dataclasses import dataclass, field, asdict
+from datetime import datetime
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class CapabilityMetadata:
+    """Parsed metadata from a capability template header."""
+    id: str
+    name: str
+    pattern_type: str
+    implements_acs: List[str]
+    injection_point: str
+    template_path: str
+    version: str = "1.0.0"
+    description: str = ""
+    ac_titles: Dict[str, str] = field(default_factory=dict)
+    triggers: Dict[str, Any] = field(default_factory=dict)
+    dependencies: List[str] = field(default_factory=list)
+    variables: Dict[str, List[Dict]] = field(default_factory=dict)
+
+
+@dataclass
+class CapabilityRequirement:
+    """A capability requirement extracted from user stories."""
+    capability_id: str
+    pattern_type: str
+    source_ac: str
+    source_user_story: str
+    description: str
+    priority: str = "required"  # required, optional
+
+
+@dataclass
+class CapabilityManifest:
+    """Output manifest showing capability resolution status."""
+    generated_at: str
+    available_capabilities: List[str]
+    required_capabilities: List[str]
+    matched_capabilities: Dict[str, str]  # requirement -> template
+    missing_capabilities: List[str]
+    generated_capabilities: List[str]
+    ready: bool
+    errors: List[str] = field(default_factory=list)
+
+
+class CapabilityResolver:
+    """
+    Resolves capability gaps before frontend generation.
+
+    NO HARDCODING - all capability discovery is config-driven.
+    """
+
+    # Standard capability pattern types (domain-agnostic)
+    STANDARD_PATTERN_TYPES = {
+        'SCAN_LOOKUP': 'Lookup/search functionality triggered by scan or input',
+        'DUPLICATE_CHECK': 'Prevent duplicate entries with warning',
+        'FORM_SUBMIT': 'Form submission with validation',
+        'WORKLIST_ADD': 'Add item to a list/queue/cart',
+        'WORKLIST_FILTER': 'Filter/transform list data',
+        'APPROVAL_WORKFLOW': 'Approve/reject workflow actions',
+        'DOCUMENT_ACTION': 'Document generation, printing, management',
+        'VENDOR_RETURN': 'Return to vendor processing',
+        'DATA_FETCH': 'Fetch data from API on component mount',
+        'ERROR_DISPLAY': 'Error message display handling',
+        'WARNING_MODAL': 'Warning/confirmation modal display',
+        'AUDIO_FEEDBACK': 'Audio feedback for actions',
+        'STATS_DASHBOARD': 'Dashboard statistics display',
+        'CRUD_LIST': 'CRUD operations on entity list',
+        'STATUS_UPDATE': 'Update status/state of an entity',
+    }
+
+    def __init__(self, config_dir: str, templates_dir: str = None):
+        """
+        Initialize the capability resolver.
+
+        Args:
+            config_dir: Path to config_output directory
+            templates_dir: Path to Templates/ui_capabilities (auto-detected if None)
+        """
+        self.config_dir = Path(config_dir)
+
+        # Auto-detect templates directory
+        if templates_dir:
+            self.templates_dir = Path(templates_dir)
+        else:
+            # Look relative to this script
+            script_dir = Path(__file__).parent
+            self.templates_dir = script_dir / 'Templates' / 'ui_capabilities'
+
+        # Capability catalog (populated by scanning templates)
+        self.capability_catalog: Dict[str, CapabilityMetadata] = {}
+
+        # Pattern type to capability mapping
+        self.pattern_to_capability: Dict[str, List[str]] = {}
+
+        # AC to capability mapping
+        self.ac_to_capability: Dict[str, List[str]] = {}
+
+    def resolve(self) -> CapabilityManifest:
+        """
+        Main resolution process.
+
+        Returns:
+            CapabilityManifest with resolution status
+        """
+        errors = []
+
+        # Step 1: Scan and parse all available capability templates
+        logger.info("Step 1: Scanning available capability templates...")
+        self._scan_capability_templates()
+        available = list(self.capability_catalog.keys())
+        logger.info(f"  Found {len(available)} capability templates")
+
+        # Step 2: Load required capabilities from user stories
+        logger.info("Step 2: Loading required capabilities from config...")
+        requirements = self._load_required_capabilities()
+        required = [r.capability_id for r in requirements]
+        logger.info(f"  Found {len(required)} required capabilities")
+
+        # Step 3: Match requirements to available capabilities
+        logger.info("Step 3: Matching requirements to available templates...")
+        matched, missing = self._match_capabilities(requirements)
+        logger.info(f"  Matched: {len(matched)}, Missing: {len(missing)}")
+
+        # Step 4: Generate missing capabilities
+        generated = []
+        if missing:
+            logger.info("Step 4: Generating missing capability templates...")
+            for req in requirements:
+                if req.capability_id in missing:
+                    try:
+                        self._generate_capability(req)
+                        generated.append(req.capability_id)
+                        logger.info(f"  Generated: {req.capability_id}")
+                    except Exception as e:
+                        error_msg = f"Failed to generate {req.capability_id}: {e}"
+                        errors.append(error_msg)
+                        logger.error(f"  {error_msg}")
+        else:
+            logger.info("Step 4: No missing capabilities - skipping generation")
+
+        # Step 5: Build manifest
+        manifest = CapabilityManifest(
+            generated_at=datetime.now().isoformat(),
+            available_capabilities=available + generated,
+            required_capabilities=required,
+            matched_capabilities=matched,
+            missing_capabilities=[m for m in missing if m not in generated],
+            generated_capabilities=generated,
+            ready=len([m for m in missing if m not in generated]) == 0,
+            errors=errors
+        )
+
+        return manifest
+
+    def _scan_capability_templates(self):
+        """Scan Templates/ui_capabilities/ and parse all capability metadata."""
+        if not self.templates_dir.exists():
+            logger.warning(f"Templates directory not found: {self.templates_dir}")
+            return
+
+        for template_file in self.templates_dir.glob('*.j2'):
+            try:
+                metadata = self._parse_capability_metadata(template_file)
+                if metadata:
+                    self.capability_catalog[metadata.id] = metadata
+
+                    # Build pattern type index
+                    if metadata.pattern_type not in self.pattern_to_capability:
+                        self.pattern_to_capability[metadata.pattern_type] = []
+                    self.pattern_to_capability[metadata.pattern_type].append(metadata.id)
+
+                    # Build AC index
+                    for ac in metadata.implements_acs:
+                        if ac not in self.ac_to_capability:
+                            self.ac_to_capability[ac] = []
+                        self.ac_to_capability[ac].append(metadata.id)
+
+            except Exception as e:
+                logger.warning(f"Failed to parse {template_file.name}: {e}")
+
+    def _parse_capability_metadata(self, template_path: Path) -> Optional[CapabilityMetadata]:
+        """
+        Parse the @capability_metadata header from a template file.
+
+        Header format:
+        {#
+        @capability_metadata
+        id: capability_id
+        name: Human Readable Name
+        ...
+        @end_metadata
+        #}
+        """
+        content = template_path.read_text()
+
+        # Extract metadata block
+        metadata_pattern = r'\{#\s*@capability_metadata\s*(.*?)\s*@end_metadata\s*#\}'
+        match = re.search(metadata_pattern, content, re.DOTALL)
+
+        if not match:
+            # Try simpler pattern for templates without @end_metadata
+            simple_pattern = r'\{#\s*@capability_metadata\s*(.*?)\s*#\}'
+            match = re.search(simple_pattern, content, re.DOTALL)
+
+        if not match:
+            logger.debug(f"No metadata found in {template_path.name}")
+            return None
+
+        metadata_text = match.group(1).strip()
+
+        # Parse YAML-like metadata
+        try:
+            # Handle the metadata as YAML
+            metadata_dict = yaml.safe_load(metadata_text)
+
+            if not metadata_dict or not isinstance(metadata_dict, dict):
+                return None
+
+            # Extract fields with defaults
+            return CapabilityMetadata(
+                id=metadata_dict.get('id', template_path.stem),
+                name=metadata_dict.get('name', template_path.stem),
+                pattern_type=metadata_dict.get('pattern_type', 'UNKNOWN'),
+                implements_acs=metadata_dict.get('implements_acs', []),
+                injection_point=metadata_dict.get('injection_point', 'handlers'),
+                template_path=str(template_path),
+                version=metadata_dict.get('version', '1.0.0'),
+                description=metadata_dict.get('description', ''),
+                ac_titles=metadata_dict.get('ac_titles', {}),
+                triggers=metadata_dict.get('triggers', {}),
+                dependencies=metadata_dict.get('dependencies', []),
+                variables=metadata_dict.get('variables', {})
+            )
+
+        except yaml.YAMLError as e:
+            logger.warning(f"Failed to parse YAML metadata in {template_path.name}: {e}")
+            return None
+
+    def _load_required_capabilities(self) -> List[CapabilityRequirement]:
+        """
+        Load required capabilities from config files.
+
+        Sources:
+        1. ac_requirements.json → Primary source with all capability requirements
+        2. entity_validations.json → Additional validation-based requirements
+        3. screen_config.json → explicit capability requirements (if exists)
+        """
+        requirements = []
+
+        # Source 1: ac_requirements.json (PRIMARY SOURCE)
+        ac_requirements_path = self.config_dir / 'ac_requirements.json'
+        if ac_requirements_path.exists():
+            requirements.extend(self._extract_requirements_from_ac_requirements(ac_requirements_path))
+
+        # Source 2: entity_validations.json (additional requirements)
+        entity_validations_path = self.config_dir / 'entity_validations.json'
+        if entity_validations_path.exists():
+            requirements.extend(self._extract_requirements_from_validations(entity_validations_path))
+
+        # Source 3: screen_config.json (if exists - for hybrid approach)
+        screen_config_path = self.config_dir / 'screen_config.json'
+        if screen_config_path.exists():
+            requirements.extend(self._extract_requirements_from_screen_config(screen_config_path))
+
+        # Deduplicate by capability_id
+        seen = set()
+        unique_requirements = []
+        for req in requirements:
+            if req.capability_id not in seen:
+                seen.add(req.capability_id)
+                unique_requirements.append(req)
+
+        return unique_requirements
+
+    def _extract_requirements_from_ac_requirements(self, path: Path) -> List[CapabilityRequirement]:
+        """
+        Extract capability requirements from ac_requirements.json.
+
+        This is the PRIMARY source for capability requirements as it directly
+        maps acceptance criteria to required capabilities.
+        """
+        requirements = []
+
+        with open(path) as f:
+            ac_data = json.load(f)
+
+        # Check for lookup_requirements → SCAN_LOOKUP capability
+        lookup_reqs = ac_data.get('lookup_requirements', [])
+        if lookup_reqs:
+            for lr in lookup_reqs:
+                requirements.append(CapabilityRequirement(
+                    capability_id='lookup_handler',
+                    pattern_type='SCAN_LOOKUP',
+                    source_ac=lr.get('ac_id', 'AC1'),
+                    source_user_story='US1',
+                    description=f"Lookup by {lr.get('trigger_field', 'tracking_number')}"
+                ))
+
+        # Check for validation_rules with type=unique → DUPLICATE_CHECK
+        validation_rules = ac_data.get('validation_rules', [])
+        has_unique = any(v.get('type') == 'unique' for v in validation_rules)
+        if has_unique:
+            unique_rule = next((v for v in validation_rules if v.get('type') == 'unique'), {})
+            requirements.append(CapabilityRequirement(
+                capability_id='duplicate_checker',
+                pattern_type='DUPLICATE_CHECK',
+                source_ac=unique_rule.get('ac_id', 'AC3'),
+                source_user_story='US1',
+                description=f"Duplicate check on {unique_rule.get('field', 'item')}"
+            ))
+
+        # Check for workflow_transitions → APPROVAL_WORKFLOW
+        workflow_transitions = ac_data.get('workflow_transitions', [])
+        if workflow_transitions:
+            requirements.append(CapabilityRequirement(
+                capability_id='workflow_action',
+                pattern_type='APPROVAL_WORKFLOW',
+                source_ac='AC7',
+                source_user_story='US2',
+                description='Workflow state transitions'
+            ))
+
+        # Check for document_actions → DOCUMENT_ACTION
+        document_actions = ac_data.get('document_actions', [])
+        if document_actions:
+            requirements.append(CapabilityRequirement(
+                capability_id='document_action',
+                pattern_type='DOCUMENT_ACTION',
+                source_ac='AC10',
+                source_user_story='US3',
+                description='Document generation and printing'
+            ))
+
+        # Check for vendor_return_actions → VENDOR_RETURN
+        vendor_return_actions = ac_data.get('vendor_return_actions', [])
+        if vendor_return_actions:
+            requirements.append(CapabilityRequirement(
+                capability_id='vendor_return_action',
+                pattern_type='VENDOR_RETURN',
+                source_ac='AC15',
+                source_user_story='US5',
+                description='Vendor return processing'
+            ))
+
+        # Check for ui_behaviors → various capabilities
+        ui_behaviors = ac_data.get('ui_behaviors', [])
+        for behavior in ui_behaviors:
+            behavior_type = behavior.get('behavior_type', '')
+            if behavior_type == 'auto_populate':
+                # Already covered by lookup_handler
+                pass
+            elif behavior_type == 'audio_feedback':
+                requirements.append(CapabilityRequirement(
+                    capability_id='audio_feedback',
+                    pattern_type='AUDIO_FEEDBACK',
+                    source_ac=behavior.get('ac_id', 'AC6'),
+                    source_user_story='US1',
+                    description='Audio feedback for scan events'
+                ))
+
+        # ALWAYS require list capabilities if we have the primary entity
+        # This is inferred from the presence of validation rules for the primary entity
+        entities_with_validations = set(v.get('entity') for v in validation_rules)
+        primary_entity = self.app_config.get('primary_entity', 'items')
+        list_capability = self.app_config.get('list_capability', 'list_add')
+        list_filter_capability = self.app_config.get('list_filter_capability', 'list_filter')
+        if primary_entity in entities_with_validations or entities_with_validations:
+            requirements.append(CapabilityRequirement(
+                capability_id=list_capability,
+                pattern_type='LIST_ADD',
+                source_ac='AC2',
+                source_user_story='US1',
+                description=f'Add items to {primary_entity} list'
+            ))
+            requirements.append(CapabilityRequirement(
+                capability_id=list_filter_capability,
+                pattern_type='LIST_FILTER',
+                source_ac='AC5',
+                source_user_story='US1',
+                description=f'Filter {primary_entity} list items'
+            ))
+
+        return requirements
+
+    def _extract_requirements_from_validations(self, path: Path) -> List[CapabilityRequirement]:
+        """Extract capability requirements from entity_validations.json."""
+        requirements = []
+
+        with open(path) as f:
+            data = json.load(f)
+
+        # Handle nested structure: { "entity_validations": { ... } }
+        validations = data.get('entity_validations', data)
+
+        # Skip metadata key
+        if 'metadata' in validations:
+            validations = {k: v for k, v in validations.items() if k != 'metadata'}
+
+        for entity_name, entity_config in validations.items():
+            if not isinstance(entity_config, dict):
+                continue
+
+            # Check for lookup_endpoints → requires SCAN_LOOKUP capability
+            if entity_config.get('lookup_endpoints'):
+                requirements.append(CapabilityRequirement(
+                    capability_id='lookup_handler',
+                    pattern_type='SCAN_LOOKUP',
+                    source_ac='AC1',
+                    source_user_story='US1',
+                    description=f'Lookup handler for {entity_name}'
+                ))
+
+            # Check for create_validations with type=unique → requires DUPLICATE_CHECK
+            create_validations = entity_config.get('create_validations', [])
+            has_unique = any(v.get('type') == 'unique' for v in create_validations)
+            if has_unique:
+                requirements.append(CapabilityRequirement(
+                    capability_id='duplicate_checker',
+                    pattern_type='DUPLICATE_CHECK',
+                    source_ac='AC3',
+                    source_user_story='US1',
+                    description=f'Duplicate check for {entity_name}'
+                ))
+
+            # Check for list_config → requires LIST_ADD and LIST_FILTER (from config, not hardcoded)
+            if entity_config.get('list_config'):
+                list_capability = self.app_config.get('list_capability', 'list_add')
+                list_filter_capability = self.app_config.get('list_filter_capability', 'list_filter')
+                requirements.append(CapabilityRequirement(
+                    capability_id=list_capability,
+                    pattern_type='LIST_ADD',
+                    source_ac='AC2',
+                    source_user_story='US1',
+                    description=f'List add for {entity_name}'
+                ))
+                requirements.append(CapabilityRequirement(
+                    capability_id=list_filter_capability,
+                    pattern_type='LIST_FILTER',
+                    source_ac='AC5',
+                    source_user_story='US1',
+                    description=f'List filter for {entity_name}'
+                ))
+
+        return requirements
+
+    def _extract_requirements_from_user_stories(self, path: Path) -> List[CapabilityRequirement]:
+        """Extract capability requirements from user_story_analysis_llm.json."""
+        requirements = []
+
+        with open(path) as f:
+            analysis = json.load(f)
+
+        user_stories = analysis.get('user_stories', [])
+
+        # Pattern detection for capabilities (domain-agnostic, not hardcoded entity names)
+        patterns = {
+            'APPROVAL_WORKFLOW': [
+                r'approv(e|al)',
+                r'reject',
+                r'workflow',
+                r'authorize'
+            ],
+            'DOCUMENT_ACTION': [
+                r'document',
+                r'print',
+                r'label',
+                r'generate.*report'
+            ],
+            'SECONDARY_RETURN': [
+                r'return',
+                r'reverse',
+                r'recovery',
+                r'ship.*back'
+            ],
+            'STATS_DASHBOARD': [
+                r'dashboard',
+                r'statistic',
+                r'summary',
+                r'overview',
+                r'metric'
+            ],
+            'STATUS_UPDATE': [
+                r'update.*status',
+                r'change.*status',
+                r'mark.*as',
+                r'set.*status'
+            ]
+        }
+
+        for us in user_stories:
+            us_id = us.get('id', 'US?')
+            us_text = us.get('user_story', '')
+
+            for ac in us.get('acceptance_criteria', []):
+                ac_id = ac.get('id', 'AC?')
+                ac_text = ac.get('text', '')
+                combined_text = f"{us_text} {ac_text}".lower()
+
+                # Check each pattern type
+                for pattern_type, regex_list in patterns.items():
+                    for regex in regex_list:
+                        if re.search(regex, combined_text, re.IGNORECASE):
+                            # Generate capability ID from pattern type
+                            capability_id = pattern_type.lower()
+                            requirements.append(CapabilityRequirement(
+                                capability_id=capability_id,
+                                pattern_type=pattern_type,
+                                source_ac=ac_id,
+                                source_user_story=us_id,
+                                description=f'{pattern_type} from {us_id}/{ac_id}'
+                            ))
+                            break  # Only match once per pattern type per AC
+
+        return requirements
+
+    def _extract_requirements_from_screen_config(self, path: Path) -> List[CapabilityRequirement]:
+        """Extract capability requirements from screen_config.json (hybrid approach)."""
+        requirements = []
+
+        with open(path) as f:
+            screen_config = json.load(f)
+
+        for screen in screen_config.get('screens', []):
+            screen_name = screen.get('name', 'Unknown')
+            for capability_id in screen.get('capabilities', []):
+                # Infer pattern type from capability ID
+                pattern_type = capability_id.upper().replace('_HANDLER', '').replace('_ACTION', '')
+                requirements.append(CapabilityRequirement(
+                    capability_id=capability_id,
+                    pattern_type=pattern_type,
+                    source_ac='CONFIG',
+                    source_user_story=screen_name,
+                    description=f'{capability_id} for {screen_name}'
+                ))
+
+        return requirements
+
+    def _match_capabilities(self, requirements: List[CapabilityRequirement]) -> tuple:
+        """
+        Match requirements to available capabilities.
+
+        Returns:
+            (matched: Dict[str, str], missing: List[str])
+        """
+        matched = {}
+        missing = []
+
+        for req in requirements:
+            # Try exact match first
+            if req.capability_id in self.capability_catalog:
+                matched[req.capability_id] = self.capability_catalog[req.capability_id].template_path
+                continue
+
+            # Try pattern type match
+            if req.pattern_type in self.pattern_to_capability:
+                candidates = self.pattern_to_capability[req.pattern_type]
+                if candidates:
+                    matched[req.capability_id] = self.capability_catalog[candidates[0]].template_path
+                    continue
+
+            # Try AC match
+            if req.source_ac in self.ac_to_capability:
+                candidates = self.ac_to_capability[req.source_ac]
+                if candidates:
+                    matched[req.capability_id] = self.capability_catalog[candidates[0]].template_path
+                    continue
+
+            # No match found
+            missing.append(req.capability_id)
+
+        return matched, missing
+
+    def _generate_capability(self, requirement: CapabilityRequirement):
+        """
+        Generate a missing capability template using meta-template.
+
+        Uses Templates/ui_capabilities/meta_capability.ts.j2 to generate
+        new capability templates based on pattern type.
+        """
+        meta_template_path = self.templates_dir / 'meta_capability.ts.j2'
+
+        if not meta_template_path.exists():
+            # Create basic capability template
+            self._generate_basic_capability(requirement)
+            return
+
+        # Use Jinja2 to render meta-template
+        from jinja2 import Environment, FileSystemLoader
+
+        env = Environment(loader=FileSystemLoader(str(self.templates_dir)))
+        template = env.get_template('meta_capability.ts.j2')
+
+        # Build context from requirement
+        context = {
+            'capability_id': requirement.capability_id,
+            'capability_name': requirement.capability_id.replace('_', ' ').title(),
+            'pattern_type': requirement.pattern_type,
+            'implements_acs': [requirement.source_ac],
+            'description': requirement.description,
+            'injection_point': self._infer_injection_point(requirement.pattern_type)
+        }
+
+        # Render and save
+        output = template.render(**context)
+        output_path = self.templates_dir / f'{requirement.capability_id}.ts.j2'
+        output_path.write_text(output)
+
+        logger.info(f"Generated capability template: {output_path}")
+
+    def _generate_basic_capability(self, requirement: CapabilityRequirement):
+        """Generate a basic capability template when meta-template doesn't exist."""
+        injection_point = self._infer_injection_point(requirement.pattern_type)
+
+        template_content = f'''{{#
+@capability_metadata
+id: {requirement.capability_id}
+name: {requirement.capability_id.replace('_', ' ').title()}
+version: "1.0.0"
+pattern_type: {requirement.pattern_type}
+implements_acs: [{requirement.source_ac}]
+injection_point: {injection_point}
+description: >
+  Auto-generated capability template for {requirement.pattern_type}.
+  Generated from {requirement.source_user_story}/{requirement.source_ac}.
+  TODO: Customize this template for your specific requirements.
+variables:
+  required:
+    - name: entity_name
+      type: string
+      source: config
+@end_metadata
+#}}
+
+// {requirement.capability_id} - {requirement.source_ac}: {requirement.description}
+// TODO: Implement {requirement.pattern_type} capability
+
+const handle{requirement.capability_id.replace('_', ' ').title().replace(' ', '')} = async () => {{
+  try {{
+    // TODO: Add {requirement.pattern_type} implementation
+    console.log('{requirement.capability_id} called');
+    showNotification('{requirement.capability_id.replace("_", " ").title()} executed', 'success');
+  }} catch (error) {{
+    console.error('{requirement.capability_id} failed:', error);
+    showNotification('{requirement.capability_id.replace("_", " ").title()} failed', 'warning');
+  }}
+}};
+'''
+
+        output_path = self.templates_dir / f'{requirement.capability_id}.ts.j2'
+        output_path.write_text(template_content)
+
+        logger.info(f"Generated basic capability template: {output_path}")
+
+    def _infer_injection_point(self, pattern_type: str) -> str:
+        """Infer the injection point from pattern type."""
+        injection_mapping = {
+            'SCAN_LOOKUP': 'handlers',
+            'DUPLICATE_CHECK': 'handlers',
+            'FORM_SUBMIT': 'handlers',
+            'WORKLIST_ADD': 'handlers',
+            'WORKLIST_FILTER': 'utilities',
+            'APPROVAL_WORKFLOW': 'handlers',
+            'DOCUMENT_ACTION': 'handlers',
+            'VENDOR_RETURN': 'handlers',
+            'DATA_FETCH': 'effects',
+            'ERROR_DISPLAY': 'utilities',
+            'WARNING_MODAL': 'jsx',
+            'AUDIO_FEEDBACK': 'utilities',
+            'STATS_DASHBOARD': 'effects',
+            'CRUD_LIST': 'handlers',
+            'STATUS_UPDATE': 'handlers',
+        }
+        return injection_mapping.get(pattern_type, 'handlers')
+
+    def save_manifest(self, manifest: CapabilityManifest, output_path: str):
+        """Save the capability manifest to JSON."""
+        with open(output_path, 'w') as f:
+            json.dump(asdict(manifest), f, indent=2)
+        logger.info(f"Capability manifest saved to {output_path}")
+
+    def print_summary(self, manifest: CapabilityManifest):
+        """Print a human-readable summary of the resolution."""
+        print("\n" + "=" * 60)
+        print("CAPABILITY RESOLUTION SUMMARY")
+        print("=" * 60)
+
+        print(f"\nAvailable Templates: {len(manifest.available_capabilities)}")
+        for cap in sorted(manifest.available_capabilities):
+            print(f"  - {cap}")
+
+        print(f"\nRequired Capabilities: {len(manifest.required_capabilities)}")
+        for cap in sorted(manifest.required_capabilities):
+            status = "MATCHED" if cap in manifest.matched_capabilities else "MISSING"
+            if cap in manifest.generated_capabilities:
+                status = "GENERATED"
+            print(f"  - {cap}: {status}")
+
+        if manifest.generated_capabilities:
+            print(f"\nGenerated Templates: {len(manifest.generated_capabilities)}")
+            for cap in manifest.generated_capabilities:
+                print(f"  - {cap}")
+
+        if manifest.missing_capabilities:
+            print(f"\nSTILL MISSING (requires manual creation):")
+            for cap in manifest.missing_capabilities:
+                print(f"  - {cap}")
+
+        print(f"\n{'READY' if manifest.ready else 'NOT READY'} for frontend generation")
+
+        if manifest.errors:
+            print(f"\nErrors:")
+            for error in manifest.errors:
+                print(f"  - {error}")
+
+        print("=" * 60)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Resolve capability gaps before frontend generation'
+    )
+    parser.add_argument(
+        '-c', '--config-dir',
+        default='config_output',
+        help='Path to config_output directory'
+    )
+    parser.add_argument(
+        '-t', '--templates-dir',
+        default=None,
+        help='Path to Templates/ui_capabilities (auto-detected if not specified)'
+    )
+    parser.add_argument(
+        '-o', '--output',
+        default='config_output/capability_manifest.json',
+        help='Output path for capability manifest'
+    )
+    parser.add_argument(
+        '-v', '--verbose',
+        action='store_true',
+        help='Enable verbose logging'
+    )
+
+    args = parser.parse_args()
+
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    try:
+        resolver = CapabilityResolver(args.config_dir, args.templates_dir)
+        manifest = resolver.resolve()
+
+        # Save manifest
+        resolver.save_manifest(manifest, args.output)
+
+        # Print summary
+        resolver.print_summary(manifest)
+
+        # Exit with error if not ready
+        if not manifest.ready:
+            exit(1)
+
+    except Exception as e:
+        logger.error(f"Capability resolution failed: {e}")
+        import traceback
+        traceback.print_exc()
+        exit(1)
+
+
+if __name__ == '__main__':
+    main()
+"
