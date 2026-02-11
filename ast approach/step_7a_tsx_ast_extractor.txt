@@ -1,0 +1,396 @@
+"#!/usr/bin/env python3
+"""
+TSX AST Extractor - Python Wrapper
+==================================
+Wrapper for the Node.js AST extractor with semantic analysis capabilities.
+
+Usage:
+    python step_7a_tsx_ast_extractor.py -i Inputs/ui_react_component.tsx -o config_output/tsx_ast_metadata.json
+
+This script:
+1. Calls the Node.js AST extractor (ast_tools/tsx_ast_extractor.js)
+2. Performs semantic analysis on the extracted metadata
+3. Outputs enriched metadata for frontend wiring
+"""
+
+import subprocess
+import json
+import argparse
+import logging
+from pathlib import Path
+from typing import Dict, List, Any, Optional
+from datetime import datetime
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+
+class TsxAstExtractor:
+    """
+    Python wrapper for Node.js TSX AST extractor with semantic analysis.
+    """
+
+    def __init__(self, tsx_path: str):
+        self.tsx_path = Path(tsx_path)
+        self.script_dir = Path(__file__).parent
+        self.node_script = self.script_dir / 'ast_tools' / 'tsx_ast_extractor.js'
+
+        if not self.tsx_path.exists():
+            raise FileNotFoundError(f"TSX file not found: {self.tsx_path}")
+
+    def extract(self) -> Dict[str, Any]:
+        """
+        Run Node.js AST extractor and return parsed metadata.
+        """
+        logger.info(f"Extracting AST metadata from: {self.tsx_path}")
+
+        # Check if Node.js is available
+        try:
+            subprocess.run(['node', '--version'], capture_output=True, check=True)
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            raise RuntimeError("Node.js is required but not found. Please install Node.js.")
+
+        # Check if dependencies are installed
+        node_modules = self.script_dir / 'ast_tools' / 'node_modules'
+        if not node_modules.exists():
+            logger.info("Installing Node.js dependencies...")
+            self._install_dependencies()
+
+        # Run the Node.js extractor
+        result = subprocess.run(
+            ['node', str(self.node_script), str(self.tsx_path)],
+            capture_output=True,
+            text=True,
+            cwd=str(self.script_dir)
+        )
+
+        if result.returncode != 0:
+            raise RuntimeError(f"AST extraction failed: {result.stderr}")
+
+        try:
+            metadata = json.loads(result.stdout)
+            logger.info(f"Successfully extracted metadata")
+            return metadata
+        except json.JSONDecodeError as e:
+            raise RuntimeError(f"Failed to parse AST metadata: {e}\nOutput: {result.stdout[:500]}")
+
+    def _install_dependencies(self):
+        """Install Node.js dependencies."""
+        ast_tools_dir = self.script_dir / 'ast_tools'
+        result = subprocess.run(
+            ['npm', 'install'],
+            capture_output=True,
+            text=True,
+            cwd=str(ast_tools_dir)
+        )
+        if result.returncode != 0:
+            logger.warning(f"npm install warning: {result.stderr}")
+
+    def analyze_semantics(self, ast_metadata: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Analyze AST metadata for semantic understanding.
+
+        Returns enriched metadata with:
+        - State → Field bindings
+        - Handler → Operation mappings
+        - Form structure analysis
+        - CRUD operation detection
+        """
+        logger.info("Performing semantic analysis...")
+
+        return {
+            'version': '1.0',
+            'analyzedAt': datetime.now().isoformat(),
+            'sourceFile': ast_metadata.get('file', ''),
+            'state_field_bindings': self._trace_state_to_fields(ast_metadata),
+            'handler_operations': self._classify_handlers(ast_metadata),
+            'form_structure': self._build_form_hierarchy(ast_metadata),
+            'crud_operations': self._detect_crud(ast_metadata),
+            'component_summary': self._summarize_components(ast_metadata),
+            'wiring_suggestions': self._generate_wiring_suggestions(ast_metadata)
+        }
+
+    def _trace_state_to_fields(self, metadata: Dict) -> List[Dict]:
+        """
+        Trace which state variables control which form fields.
+        """
+        bindings = []
+        state_vars = metadata.get('stateVariables', [])
+        jsx_structure = metadata.get('jsxStructure', {})
+        inputs = jsx_structure.get('inputs', [])
+
+        for state in state_vars:
+            value_name = state.get('valueName', '')
+            setter_name = state.get('setterName', '')
+
+            # Find inputs that use this state
+            bound_inputs = []
+            for inp in inputs:
+                inp_value = inp.get('value', '')
+                inp_onChange = inp.get('onChange', '')
+
+                # Check if state is bound to input value
+                if value_name and value_name in str(inp_value):
+                    bound_inputs.append({
+                        'inputId': inp.get('id'),
+                        'inputName': inp.get('name'),
+                        'inputType': inp.get('type'),
+                        'bindingType': 'value'
+                    })
+
+                # Check if setter is used in onChange
+                if setter_name and setter_name in str(inp_onChange):
+                    # Find if already added, update binding type
+                    existing = next((bi for bi in bound_inputs
+                                   if bi.get('inputId') == inp.get('id')), None)
+                    if existing:
+                        existing['bindingType'] = 'two-way'
+                    else:
+                        bound_inputs.append({
+                            'inputId': inp.get('id'),
+                            'inputName': inp.get('name'),
+                            'inputType': inp.get('type'),
+                            'bindingType': 'onChange'
+                        })
+
+            bindings.append({
+                'stateName': value_name,
+                'setterName': setter_name,
+                'initialValue': state.get('initialValue'),
+                'inferredType': state.get('inferredType'),
+                'boundInputs': bound_inputs,
+                'isUsedInJsx': state.get('usedInJsx', False)
+            })
+
+        return bindings
+
+    def _classify_handlers(self, metadata: Dict) -> List[Dict]:
+        """
+        Classify handlers by their operation type.
+        """
+        classifications = []
+        handlers = metadata.get('handlers', [])
+
+        for handler in handlers:
+            analysis = handler.get('analysis', {})
+
+            classifications.append({
+                'name': handler.get('name'),
+                'operation': analysis.get('crudOperation', 'UNKNOWN'),
+                'isAsync': handler.get('isAsync', False),
+                'stateUpdates': analysis.get('stateUpdates', []),
+                'apiCalls': analysis.get('apiCalls', []),
+                'domAccess': analysis.get('domAccess', []),
+                'validations': analysis.get('validations', []),
+                'eventBindings': handler.get('usedInEvents', []),
+                'parameters': handler.get('parameters', [])
+            })
+
+        return classifications
+
+    def _build_form_hierarchy(self, metadata: Dict) -> Dict:
+        """
+        Build a hierarchical view of forms and their fields.
+        """
+        jsx = metadata.get('jsxStructure', {})
+        forms = jsx.get('forms', [])
+        inputs = jsx.get('inputs', [])
+        buttons = jsx.get('buttons', [])
+        selects = jsx.get('selects', [])
+
+        # If no explicit forms, create an implicit form from inputs
+        if not forms and (inputs or buttons):
+            forms = [{
+                'tagName': 'implicit_form',
+                'attributes': {},
+                'line': min([i.get('line', 0) for i in inputs] or [0]),
+                'onSubmit': None
+            }]
+
+        form_hierarchy = []
+        for form in forms:
+            # Associate inputs/buttons with forms (by line proximity)
+            form_line = form.get('line', 0)
+
+            form_inputs = [i for i in inputs]  # For now, assign all inputs to forms
+            form_buttons = [b for b in buttons]
+            form_selects = [s for s in selects]
+
+            form_hierarchy.append({
+                'formId': form.get('attributes', {}).get('id'),
+                'onSubmit': form.get('onSubmit'),
+                'line': form_line,
+                'inputs': form_inputs,
+                'buttons': form_buttons,
+                'selects': form_selects
+            })
+
+        return {
+            'forms': form_hierarchy,
+            'totalInputs': len(inputs),
+            'totalButtons': len(buttons),
+            'totalSelects': len(selects)
+        }
+
+    def _detect_crud(self, metadata: Dict) -> Dict:
+        """
+        Detect CRUD operations from handlers.
+        """
+        handlers = metadata.get('handlers', [])
+
+        crud_map = {
+            'CREATE': [],
+            'READ': [],
+            'UPDATE': [],
+            'DELETE': [],
+            'UNKNOWN': []
+        }
+
+        for handler in handlers:
+            operation = handler.get('analysis', {}).get('crudOperation', 'UNKNOWN')
+            crud_map[operation].append(handler.get('name'))
+
+        return crud_map
+
+    def _summarize_components(self, metadata: Dict) -> Dict:
+        """
+        Summarize components found in the file.
+        """
+        components = metadata.get('components', [])
+
+        return {
+            'total': len(components),
+            'components': [
+                {
+                    'name': c.get('name'),
+                    'type': c.get('type'),
+                    'hasProps': c.get('hasProps'),
+                    'stateCount': len(c.get('stateUsage', [])),
+                    'handlerCount': len(c.get('handlerUsage', []))
+                }
+                for c in components
+            ]
+        }
+
+    def _generate_wiring_suggestions(self, metadata: Dict) -> List[Dict]:
+        """
+        Generate suggestions for wiring based on analysis.
+        """
+        suggestions = []
+        jsx = metadata.get('jsxStructure', {})
+        handlers = metadata.get('handlers', [])
+        state_vars = metadata.get('stateVariables', [])
+
+        # Check for inputs without IDs
+        for inp in jsx.get('inputs', []):
+            if not inp.get('id'):
+                suggestions.append({
+                    'type': 'missing_id',
+                    'element': 'input',
+                    'line': inp.get('line'),
+                    'suggestion': f"Add id attribute to input at line {inp.get('line')}"
+                })
+
+        # Check for handlers without event bindings
+        for handler in handlers:
+            if not handler.get('usedInEvents') and handler.get('isLikelyHandler'):
+                suggestions.append({
+                    'type': 'unused_handler',
+                    'handler': handler.get('name'),
+                    'line': handler.get('line'),
+                    'suggestion': f"Handler '{handler.get('name')}' is not bound to any event"
+                })
+
+        # Check for state without bindings
+        for state in state_vars:
+            if not state.get('boundToInputs'):
+                suggestions.append({
+                    'type': 'unbound_state',
+                    'state': state.get('valueName'),
+                    'line': state.get('line'),
+                    'suggestion': f"State '{state.get('valueName')}' is not bound to any input"
+                })
+
+        return suggestions
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Extract AST metadata from TSX files'
+    )
+    parser.add_argument(
+        '-i', '--input',
+        required=True,
+        help='Path to the TSX file to analyze'
+    )
+    parser.add_argument(
+        '-o', '--output',
+        default='config_output/tsx_ast_metadata.json',
+        help='Output path for the metadata JSON'
+    )
+    parser.add_argument(
+        '--semantic',
+        action='store_true',
+        help='Include semantic analysis in output'
+    )
+    parser.add_argument(
+        '-v', '--verbose',
+        action='store_true',
+        help='Enable verbose logging'
+    )
+
+    args = parser.parse_args()
+
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    try:
+        # Extract AST metadata
+        extractor = TsxAstExtractor(args.input)
+        ast_metadata = extractor.extract()
+
+        # Optionally add semantic analysis
+        if args.semantic:
+            semantic_metadata = extractor.analyze_semantics(ast_metadata)
+            output = {
+                'ast': ast_metadata,
+                'semantic': semantic_metadata
+            }
+        else:
+            output = ast_metadata
+
+        # Write output
+        output_path = Path(args.output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        with open(output_path, 'w') as f:
+            json.dump(output, f, indent=2)
+
+        logger.info(f"Metadata written to: {output_path}")
+
+        # Print summary
+        print("\n" + "=" * 60)
+        print("TSX AST EXTRACTION COMPLETE")
+        print("=" * 60)
+        print(f"Input:  {args.input}")
+        print(f"Output: {output_path}")
+        print("-" * 60)
+        print(f"Components: {len(ast_metadata.get('components', []))}")
+        print(f"State Variables: {len(ast_metadata.get('stateVariables', []))}")
+        print(f"Handlers: {len(ast_metadata.get('handlers', []))}")
+        print(f"Inputs: {len(ast_metadata.get('jsxStructure', {}).get('inputs', []))}")
+        print(f"Buttons: {len(ast_metadata.get('jsxStructure', {}).get('buttons', []))}")
+        print("=" * 60)
+
+    except Exception as e:
+        logger.error(f"Extraction failed: {e}")
+        raise
+
+
+if __name__ == '__main__':
+    main()
+"
